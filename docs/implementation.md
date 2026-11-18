@@ -6436,7 +6436,7 @@ written is.
   until nothing splits, as minimizing an automaton does. Starting from "all
   apart" and joining would never merge two copies of a recursion, each
   calling itself or its own copy of the other function. A target stands
-  only with targets. In goose-synth the split settles in a few rounds.
+  only with targets.
 * **Output.** The first function of a group is kept. In it, and in the rest
   of the C (calls, thunks, exports, `gs_init_globals`), a reference to any
   function of a group names the kept one, and a target's number becomes the
@@ -6452,16 +6452,15 @@ written is.
   `t`'s group would now catch it. Every specialization such a return passes
   records `t` in its `needs` (`AddNeed`, §3.12), so a function whose `needs`
   holds another function of its group is kept apart, and the groups are
-  found again without it. Neither the test suite nor goose-synth has such a
-  pair.
+  found again without it. No program in the test suite has such a pair.
 * **What stays apart.** Copies whose C differs in anything else: a loop
   that BCE bounds in one copy and not the other (§6.12), say, or a
   `GS_INLINE` on one (`FnSpec::cinline`, §4).
-* **Effect.** In goose-synth, `synth`'s C went from 873,034 lines in 1,815
-  functions to 587,968 in 1,011 (33% less), and the app's from 435,474 lines
-  in 1,195 functions to 339,774 in 898 (22%). `kind_worded`, 16,500 lines
-  of C, had 4 copies in `synth`, and the song reader `skein::read` with
-  everything under it 11; they now have 1 and 3.
+* **Effect.** `samples/18_json.goose` is a recursive descent parser whose
+  nested functions report an error with `return ... from parse`. `parse`
+  and the functions nested in it had two copies each, the target included;
+  they now have one, and the program's C went from 6,811 lines to 5,212
+  (23% less) at `-O2`.
 * **Tests.** `test/codegen/merged_specs.goose` (`docs/testing.md`).
 
 ---

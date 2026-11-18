@@ -5,9 +5,11 @@
 // counts one C function of each in the -O0 C, where nothing is inlined: a
 // plain function, two functions calling each other, a long-distance return
 // target, a target inside another that passes the outer one's returns on, a
-// simd function with its versions, and an element-run twin (C.3). The runs
-// check that the calls the merge redirected, and the long-distance returns
-// it renumbered, still land where they did.
+// simd function with its versions, and an element-run twin (C.3). A
+// function given two blocks is specialized for each, and those copies,
+// whose C differs in a constant, stay two. The runs check that the calls
+// the merge redirected, and the long-distance returns it renumbered, still
+// land where they did.
 var table: i64[>..] = [1, 2, 3, 4, 5];
 
 fn total(xs: i64[:]) -> i64 {
@@ -60,6 +62,12 @@ fn doubled(xs: i64[:]) -> i64[] {
     return out;
 }
 
+fn mapped<F>(xs: i64[:]) -> i64 {
+    var s = 0;
+    for x in xs { s += F(x); }
+    return s;
+}
+
 fn main() {
     // Built from the global, so that no copy knows a length the other
     // does not (BCE's loop bounds).
@@ -74,4 +82,5 @@ fn main() {
     all.append(doubled(table));
     all.append(doubled(local));
     print(all.len, " ", all[0], " ", all[all.len - 1]);
+    print(mapped(table) { x => x * 2 }, " ", mapped(local) { x => x * 5 });
 }

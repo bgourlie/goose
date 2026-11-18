@@ -32,16 +32,17 @@ inline void CodeGen::MergeSpecs() {
     auto n = (int)spectexts.size();
     // The functions' names, and the function catching each target number.
     unordered_map<string_view, pair<int, int>> names;
-    map<pair<FnSpec *, bool>, int> unitof;
+    vector<int> rfunits(fromids.size() + 1, -1);
     for (int u = 0; u < n; u++) {
         auto &st = spectexts[u];
         assert(!u || st.begin >= spectexts[u - 1].end);
-        unitof[{ st.sp, st.er }] = u;
         for (size_t k = 0; k < st.names.size(); k++) names[st.names[k]] = { u, (int)k };
+        if (auto it = fromids.find(st.sp); it != fromids.end() && !st.er) rfunits[it->second] = u;
     }
-    vector<int> rfunits(fromids.size() + 1, -1);
-    for (auto &[t, id] : fromids)
-        if (auto it = unitof.find({ t, false }); it != unitof.end()) rfunits[id] = it->second;
+    auto catcher = [&](FnSpec *t) {
+        auto it = fromids.find(t);
+        return it == fromids.end() ? -1 : rfunits[it->second];
+    };
     auto isid = [](char c) { return isalnum((unsigned char)c) || c == '_'; };
     auto digits = [](string_view s, size_t i) {
         auto j = i;
@@ -165,14 +166,17 @@ inline void CodeGen::MergeSpecs() {
         auto split = false;
         for (int u = 0; u < n; u++) {
             for (auto t : spectexts[u].sp->needs) {
-                auto it = unitof.find({ t, false });
-                if (it == unitof.end() || it->second == u || group[it->second] != group[u]) continue;
+                auto v = catcher(t);
+                if (v < 0 || v == u || group[v] != group[u]) continue;
                 apart[u] = true;
                 split = true;
             }
         }
         if (!split) break;
     }
+    // The text is grouped; what is written is rewritten from `code`.
+    vector<string>().swap(blanked);
+    vector<vector<int>>().swap(refs);
     if (ngroups == n) return;
     vector<int> kept(ngroups, -1);
     for (int u = 0; u < n; u++)
@@ -193,8 +197,14 @@ inline void CodeGen::MergeSpecs() {
         scan(s, [&](size_t at, size_t len, int v, int k, bool num) {
             out.append(s.substr(p, at - p));
             auto &kv = spectexts[kept[group[v]]];
-            if (num) Append(out, fromids.at(kv.sp));
-            else out += kv.names.at((size_t)k);
+            auto id = fromids.find(kv.sp);
+            // A target stands only with targets, and a name with functions
+            // that define the same names.
+            if (num ? id == fromids.end() : (size_t)k >= kv.names.size())
+                Fail(kv.sp->sf->line, cat("internal: ", kv.names[0], " stands for ",
+                                          spectexts[v].names[0], " but lacks its reference"));
+            if (num) Append(out, id->second);
+            else out += kv.names[(size_t)k];
             p = at + len;
         });
         out.append(s.substr(p));

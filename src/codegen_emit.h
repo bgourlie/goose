@@ -709,10 +709,12 @@ inline void CodeGen::EmitSpec(FnSpec *sp, bool er) {
         Append(fnbody, "    uint8_t *", p.second, " = ", gnames[p.first], ".base;\n");
     fnbody += bodyout;
     auto name = er ? ernames[sp] : curinfo->cname;
-    // Where the function lies in the C, for MergeSpecs.
+    // Where the function lies in the C, for MergeSpecs, taken once its
+    // result type is: nothing emitted for that belongs to the function.
+    auto ret = SigRet(sp);
     SpecText st { sp, er, code.size(), 0, { name } };
     if (sp->sf->issimd) EmitSimdVersions(sp, name, params, fnbody, st.names);
-    else Append(code, "static ", FnAttrs(sp), SigRet(sp), " ", name, "(", params, ") {\n", fnbody,
+    else Append(code, "static ", FnAttrs(sp), ret, " ", name, "(", params, ") {\n", fnbody,
                 "}\n\n");
     st.end = code.size();
     spectexts.push_back(std::move(st));

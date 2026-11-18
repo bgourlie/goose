@@ -1838,8 +1838,9 @@ def main():
     # they call and the numbers of their long-distance returns are written
     # once (CodeGen::MergeSpecs): every function of the fixture but main is
     # specialized twice (--specs), and has one C function, at -O0, which
-    # inlines nothing. Each target number thrown is one that a kept target
-    # catches, and only the kept targets' channels are declared.
+    # inlines nothing, but for mapped, whose copies differ in a constant and
+    # keep two. Each target number thrown is one that a kept target catches,
+    # and only the kept targets' channels are declared.
     def merged_specs():
         f = HERE / "codegen" / "merged_specs.goose"
         cfile = gendir / "merged_specs-merged.c"
@@ -1851,13 +1852,13 @@ def main():
         names = ["total", "ping", "pong", "reject", "check", "scan", "outer", "inner", "leaf",
                  "wide_sum", "doubled"]
         specs = re.findall(r"^// spec \d+:[^\n]*\nfn (\w+)\(", out, re.MULTILINE)
-        wrong = [f"{n}: {specs.count(n)} specializations" for n in names if specs.count(n) != 2]
-        for n in names + ["doubled_er"]:
-            base, er = (n[:-3], "_er") if n.endswith("_er") else (n, "")
-            defs = re.findall(rf"^static [^\n;]*\b{base}_g(?:_\d+)?{er}\([^\n]*\) \{{$",
+        wrong = [f"{n}: {specs.count(n)} specializations"
+                 for n in names + ["mapped"] if specs.count(n) != 2]
+        for n, er, want in [(n, "", 1) for n in names] + [("doubled", "_er", 1), ("mapped", "", 2)]:
+            defs = re.findall(rf"^static [^\n;]*\b{n}_g(?:_\d+)?{er}\([^\n]*\) \{{$",
                               text, re.MULTILINE)
-            if len(defs) != 1:
-                wrong.append(f"{n}: {len(defs)} C functions")
+            if len(defs) != want:
+                wrong.append(f"{n}{er}: {len(defs)} C functions, want {want}")
         caught = re.findall(r"\bgs_rf == (\d+)\)", text)
         thrown = set(re.findall(r"\bgs_rf = ([1-9]\d*);", text))
         declared = set(re.findall(r"^static GS_TLS [^\n]*\bgs_lret_(\d+)_0;$", text, re.MULTILINE))
