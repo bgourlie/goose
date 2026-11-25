@@ -1324,18 +1324,36 @@ inline bool TypeCheck::FitsAt(Val &v, TypeExpr *dt) {
             }
             if (dt->arr->akind == A_FIXED) return false;
             if (!TypeEq(selem, dt->arr->sub)) return false;
+            // Changing the outer layout moves or removes its header. Offsets
+            // within the element run survive, but an offset to the array
+            // itself would no longer address an array of its declared type.
+            if (t->kind == TY_ARRAY && v.elementlinks.All().arraytarget) {
+                vector<TypeExpr *> pointees;
+                SelfRelPointees(selem, pointees);
+                if (any_of(pointees.begin(), pointees.end(),
+                           [&](TypeExpr *p) { return TopConstEq(p, t); })) {
+                    fitfail = cat("cannot construct ", TypeStr(dt), " from ", TypeStr(t),
+                                  ": a self-relative link may name the source array itself, "
+                                  "whose layout the conversion changes (§3.9)");
+                    return false;
+                }
+            }
             if (dt->arr->akind == A_GROWSHRINK && v.elementlinks) {
                 fitfail = cat("cannot construct ", TypeStr(dt), " from ", TypeStr(t),
                               ": a shrink could remove an element that a self-relative "
                               "reference still names (§5.2)");
                 return false;
             }
-            if (IsArrayKind(t, A_LIMITED) && v.elementlinks == EL_ANY) {
+            if (IsArrayKind(t, A_LIMITED) && v.elementlinks.All().direction == EL_ANY) {
                 fitfail = cat("cannot construct ", TypeStr(dt), " from ", TypeStr(t),
                               ": a self-relative link may name a slot beyond the live length "
                               "that the conversion would discard (§5.3)");
                 return false;
             }
+            // All slots in the converted array now belong to its element run.
+            auto links = v.elementlinks.All();
+            v.elementlinks = {};
+            (IsArrayKind(dt, A_GROW) ? v.elementlinks.tail : v.elementlinks.other) = links;
             v.type = dt;
             return true;
         }
@@ -1385,8 +1403,9 @@ inline bool TypeCheck::FitsAt(Val &v, TypeExpr *dt) {
                 // bounds the pointee's lifetime will not do (§9.5).
                 auto want = dt->ref->pool ? dt->ref->pool : curdst.roots.Root();
                 auto have = dt->ref->pool ? PoolOf(links.Root()) : links.Root();
+                auto arraytarget = dt->ref->sub->kind == TY_ARRAY;
                 auto fits = dt->ref->pool ? want && links.Exact() && have == want
-                    : RelativeDestination(links, curdst, fitnode, recordingrelative);
+                    : RelativeDestination(links, curdst, fitnode, recordingrelative, false, arraytarget);
                 if (!fits) {
                     auto why = links.Exact() ? string() : ReadBackWhy(links);
                     auto vroot = links.Root() ? links.Root()->name : string_view("static data");
@@ -1403,8 +1422,8 @@ inline bool TypeCheck::FitsAt(Val &v, TypeExpr *dt) {
                     return false;
                 }
                 if (recordingrelative && !dt->ref->pool && !curdst.result)
-                    RecordElementLinks(curdst.roots, curdst.reached ? curdst.reached : dt,
-                                       curdst.appended ? EL_BACKWARD : EL_ANY, fitnode, curdst.intail);
+                    RecordLinkStore(curdst.roots, curdst.reached ? curdst.reached : dt,
+                                    { curdst.appended ? EL_BACKWARD : EL_ANY, arraytarget }, fitnode, curdst.intail);
                 v.type = dt;
                 return true;
             }
@@ -3157,6 +3176,7 @@ inline TypeCheck::LitDeep TypeCheck::CheckInits(StructLit *sl, vector<Field> &fi
         auto component = selft->kind == TY_STRUCT && selft->struc->st->isroot
                              ? RootComponent(rootowner, selft, sl->fieldindices[k]) : nullptr;
         DestScope ds(*this, component ? Dest(component) : curdst);
+        curdst.intail |= IsArrayKind(ft, A_GROW);
         if (Is<SelfRef>(fi.val)) CheckSelfInit(fi.val, ft, selft);
         else {
             SlotScope ss(*this, true);

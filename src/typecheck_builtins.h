@@ -269,7 +269,7 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
             c->rettypes.push_back(ast.booltype);
             Val first;
             first.type = t;
-            first.elementlinks = elementlinks;
+            first.elementlinks.other.direction = elementlinks;
             first.Set(TempRoot(), false);
             Val ok;
             ok.type = ast.booltype;
@@ -1263,26 +1263,26 @@ inline bool TypeCheck::RetainsRelativeSlot(TypeExpr *part, TypeExpr *array, Type
 
 // Consult only writes that reach this point. Captures and globals can
 // also carry links into a body from its caller, until a proven overwrite.
-inline ElementLinks TypeCheck::LiveElementLinks(VarDef *owner, TypeExpr *target, TypeExpr *replaced) {
-    if (!owner->elementlinks) return EL_NONE;
+inline ValueLinks TypeCheck::LiveElementLinks(VarDef *owner, TypeExpr *target, TypeExpr *replaced) {
+    if (!owner->elementlinks) return {};
     auto t = owner->type ? LoadType(owner->type) : target;
     auto arr = target ? ResizableArrayIn(target) : nullptr;
-    if (t && !RetainsRelativeSlot(t, arr, replaced)) return EL_NONE;
+    if (t && !RetainsRelativeSlot(t, arr, replaced)) return {};
     size_t since = 0;
     bool cleared = t && KilledFor(owner, owner, t, arr, since, true, replaced);
     auto emptiestail = replaced && ResizableArrayIn(replaced);
-    auto links = EL_NONE;
+    ValueLinks links;
     for (auto &[part, at] : cur.links.live) {
         if (part.owner != owner || (emptiestail && part.intail)) continue;
         if (owner->type && cleared && at < since) continue;
-        links = std::max(links, part.kind);
+        (part.intail ? links.tail : links.other).Include(part.kind);
     }
     auto spec = CurRealFrame().spec;
     if (!cleared && spec && (owner->isglobal || (owner->ownerspec && owner->ownerspec != spec))) {
         for (size_t i = 0; i < spec->record.eventstart; i++) {
             auto &e = storeevents[i];
             if (e.container == owner && !(emptiestail && e.intail))
-                links = std::max(links, e.elementlinks);
+                (e.intail ? links.tail : links.other).Include(e.elementlinks);
         }
     }
     return links;
@@ -1746,7 +1746,7 @@ inline void TypeCheck::CheckLinkShrink(const LinkShrink &s) {
         cur.deferring->shrinks.emplace_back(s, CurrentLinkEffects());
         return;
     }
-    if (LiveElementLinks(s.owner, s.array, s.replaced) == EL_ANY)
+    if (LiveElementLinks(s.owner, s.array, s.replaced).All().direction == EL_ANY)
         Error(s.at, cat(s.operation, ": retained storage may have a self-relative link "
                         "to a removed element (§5.1)"));
     if (s.viaclass) return;
@@ -1762,7 +1762,7 @@ inline void TypeCheck::CheckLinkShrink(const LinkShrink &s) {
 inline void TypeCheck::NoteLitElem(LitDeep &deep, Node *at, const Val &v, TypeExpr *t) {
     if (!t) return;
     auto isrs = IsRefOrSlice(t);
-    if (!isrs) deep.elementlinks = std::max(deep.elementlinks, v.elementlinks);
+    if (!isrs) deep.elementlinks.Include(v.elementlinks, IsArrayKind(t, A_GROW));
     if (!isrs && !HoldsPlainRef(t)) return;
     if (v.isnull) return;
     const Roots &roots = isrs ? v.AsRoots() : ContentsOf(v);
@@ -1774,7 +1774,7 @@ inline void TypeCheck::NoteLitElem(LitDeep &deep, Node *at, const Val &v, TypeEx
 }
 
 inline void TypeCheck::HolderFromLit(Val &v, const LitDeep &deep) {
-    v.elementlinks = std::max(v.elementlinks, deep.elementlinks);
+    v.elementlinks.Include(deep.elementlinks, IsArrayKind(v.type, A_GROW));
     if (!v.type || !HoldsPlainRef(v.type)) return;
     v.holderset = true;
     v.contents = deep.roots;
@@ -1787,11 +1787,13 @@ inline void TypeCheck::HolderFromLit(Val &v, const LitDeep &deep) {
 inline void TypeCheck::AddStoreEvent(const StoreEvent &e) {
     storeevents.push_back(e);
     if (e.elementlinks) {
-        if (e.container->elementlinks < e.elementlinks) {
-            e.container->elementlinks = e.elementlinks;
+        auto &all = e.intail ? e.container->elementlinks.tail : e.container->elementlinks.other;
+        auto before = all;
+        all.Include(e.elementlinks);
+        if (all != before) {
             // A backward link on a parameter class cannot invalidate a
             // shrink in this body. Its caller records the link on the owner.
-            if (e.elementlinks == EL_ANY || e.container->ownerspec || e.container->isglobal)
+            if (e.elementlinks.direction == EL_ANY || e.container->ownerspec || e.container->isglobal)
                 NoteFact(e.container, ActivationFloor(e.container));
         }
         // A variable being initialized may still be waiting for its type.
@@ -1843,7 +1845,13 @@ inline void TypeCheck::AddStoreEvent(const StoreEvent &e) {
 // Internal links move with the complete element run. The destination alone
 // owns both ends, including when a call maps the store through a parameter.
 inline void TypeCheck::RecordElementLinks(const Roots &owners, TypeExpr *reached,
-                                          ElementLinks links, Node *at, bool intail) {
+                                          ValueLinks links, Node *at, bool intail) {
+    if (links.other) RecordLinkStore(owners, reached, links.other, at, intail);
+    if (links.tail) RecordLinkStore(owners, reached, links.tail, at, true);
+}
+
+inline void TypeCheck::RecordLinkStore(const Roots &owners, TypeExpr *reached,
+                                      SlotLinks links, Node *at, bool intail) {
     if (!reachable || owners.None()) return;
     for (auto &d : ShrinkTargets(owners, reached, false)) {
         if (IsTemp(d.root)) continue;
@@ -2413,7 +2421,7 @@ inline void TypeCheck::ApplyCalleeStores(FnSpec *spec, vector<Val> &argvals, Nod
         auto from = storeevents.size();
         replay.origin = (int)(&e - rec->classevents.data());
         if (e.elementlinks)
-            RecordElementLinks(mapped(e.container, !e.bound), e.reached, e.elementlinks, at, e.intail);
+            RecordLinkStore(mapped(e.container, !e.bound), e.reached, e.elementlinks, at, e.intail);
         else
             applystore(e, mapped(e.root, e.exact), true);
         replay.origin = -1;
@@ -2549,10 +2557,10 @@ inline void TypeCheck::CheckGlobalShrinks() {
         }
         for (auto arr : arrays) {
             auto arrtype = gs.bound ? gs.bound : LoadType(arr->type);
-            if (gs.incoming && arr->elementlinks == EL_ANY &&
+            if (gs.incoming && arr->elementlinks.All().direction == EL_ANY &&
                 RetainsRelativeSlot(LoadType(arr->type), ResizableArrayIn(arrtype), gs.replaced) &&
                 any_of(storeevents.begin(), storeevents.end(), [&](const StoreEvent &e) {
-                    return e.container == arr && e.elementlinks == EL_ANY &&
+                    return e.container == arr && e.elementlinks.direction == EL_ANY &&
                            !(e.intail && gs.replaced && ResizableArrayIn(gs.replaced));
                 }))
                 ErrorIn(LocOf(gs.at), cat(gs.prefix, ": retained storage may have a "

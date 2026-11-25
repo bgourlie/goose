@@ -3680,7 +3680,10 @@ global also applies at the shrink site. The final global check still
 accounts for external views.
 
 `Val::elementlinks` carries the owner's links through branches, by-value
-arguments, named results and each forwarded result slot. The by-value
+arguments, named results and each forwarded result slot. It keeps writes
+in the resizable tail separate from other writes and records whether a
+link can target an array itself. A layout conversion can move a complete
+element run while removing the length prefix a link would still name. The by-value
 argument's link state is part of the specialization key. `FitsAt` checks
 the links when the result changes array kind. A grow-shrink array cannot
 hold a link into its elements (§5.2), and an adapter that copies a

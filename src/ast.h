@@ -689,6 +689,38 @@ struct Prov : Roots {
 // storage. A decoded run or a rebind may also link into a later element.
 enum ElementLinks { EL_NONE, EL_BACKWARD, EL_ANY };
 
+struct SlotLinks {
+    ElementLinks direction = EL_NONE;
+    bool arraytarget = false; // A target may be an array itself, including its length prefix.
+    explicit operator bool() const { return direction != EL_NONE; }
+    auto operator<=>(const SlotLinks &) const = default;
+    void Include(SlotLinks other) {
+        direction = std::max(direction, other.direction);
+        arraytarget |= other.arraytarget;
+    }
+};
+
+// The resizable tail, when present, is unique in an owner's storage.
+// Other slots include writes whose position in that owner is unknown.
+struct ValueLinks {
+    SlotLinks other, tail;
+    explicit operator bool() const { return other || tail; }
+    bool operator==(const ValueLinks &) const = default;
+    SlotLinks All() const {
+        auto links = other;
+        links.Include(tail);
+        return links;
+    }
+    void Include(ValueLinks links, bool intail = false) {
+        (intail ? tail : other).Include(links.other);
+        tail.Include(links.tail);
+    }
+    bool Covers(ValueLinks links) const {
+        links.Include(*this);
+        return links == *this;
+    }
+};
+
 // The checked value of an expression (typecheck.h): its type, where it
 // points when it is a reference or slice, and the constant folding used for
 // literal fit and array sizes. Lives here because every node's Check
@@ -702,9 +734,9 @@ struct Val : Prov {
     double fval = 0;
     bool strlit = false;         // String literal: adaptable to u8 array types.
     bool emptyarr = false;       // [] with as yet unknown element type.
-    // The array may hold self-relative links between its elements. Moving the
-    // complete element run preserves them, but a grow-shrink array cannot (§5.2).
-    ElementLinks elementlinks = EL_NONE;
+    // Where a value holds self-relative links and which targets may survive
+    // a shrink or a change of layout (§3.9, §5.1).
+    ValueLinks elementlinks;
     bool isnull = false;         // The null literal: adaptable to any optional.
     // A literal parameter read inside its specialization (§7.7): a constant
     // of unknown value at its nominal type, adapting to any type of its
@@ -1824,7 +1856,7 @@ struct VarDef {
     // that class's storage holds (RootAlt::classread).
     Roots contents;
     bool contentbyteview = false; // A stored reference may view raw typed storage.
-    ElementLinks elementlinks = EL_NONE; // A store into this owner may have linked its elements.
+    ValueLinks elementlinks; // A store into this owner may have linked its elements.
     // A store other than a parameter's binding has been made into it, in
     // any round of a cycle's check (TypeCheck::HeldParam).
     bool storedinto = false;
@@ -2000,7 +2032,7 @@ template<typename F> void NamedArraysIn(TypeExpr *t, set<TypeExpr *> &seen, F f)
 // its depth stands, and the provenance bits.
 struct RootArg {
     int cls = 0;
-    ElementLinks elementlinks = EL_NONE;  // Contents of a by-value argument at entry.
+    ValueLinks elementlinks;  // Contents of a by-value argument at entry.
     int ownerparam = -1;
     int ownerfield = -1;
     bool writable = true;
@@ -2134,7 +2166,7 @@ struct StoreEvent {
     VarDef *container = nullptr;
     // Links within this owner's storage, from either a relative store or a
     // verified element run. Mapping this event requires only the destination.
-    ElementLinks elementlinks = EL_NONE;
+    SlotLinks elementlinks;
     bool intail = false;         // The receiving slot lies in the resizable element run.
     int linkclass = -1;          // Its index in the current body's class-store summary.
     // What was stored: a reference to something rooted at `root`, or (a
@@ -2222,7 +2254,7 @@ struct RetRoot {
     bool writable = true;      // Writable only where every return is (§9.5).
     bool byteview = false;
     bool freshview = false;    // Prov::freshview.
-    ElementLinks elementlinks = EL_NONE; // Any return may give an array with Val::elementlinks.
+    ValueLinks elementlinks; // Any return may give an array with Val::elementlinks.
     bool set = false;          // A non-null return has recorded its root.
     // The by-value holder parameter every return gives as it was passed,
     // nothing stored into it since its binding: the result holds what the
@@ -2257,7 +2289,7 @@ struct EnvRead {
     Roots contents;
     bool contentbyteview = false;
     bool slotref = false;
-    ElementLinks elementlinks = EL_NONE;
+    ValueLinks elementlinks;
 };
 
 // An exit of a body outside a specialization's activation that its check
@@ -2278,6 +2310,8 @@ struct FnRecord {
     // name parameter classes or lexical storage, mapped as return roots are.
     struct RelativeStore {
         Roots source, destination;
+        bool intail = false;
+        bool arraytarget = false;
         int result = -1;
     };
     vector<RelativeStore> relativestores;

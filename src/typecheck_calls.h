@@ -1768,7 +1768,7 @@ inline FnSpec *TypeCheck::GetOrCreateSpec(MatchInfo &mi, vector<Val> &argvals, N
         // reuse a body checked for fewer links in a by-value parameter.
         if (spec->inprogress && !rootsok &&
             !equal(roots.begin(), roots.end(), spec->roots.begin(), spec->roots.end(),
-                   [](const auto &a, const auto &b) { return a.elementlinks <= b.elementlinks; }))
+                   [](const auto &a, const auto &b) { return b.elementlinks.Covers(a.elementlinks); }))
             continue;
         auto depthsok = rootsok;
         for (size_t i = 0; depthsok && i < roots.size(); i++)
@@ -2996,7 +2996,7 @@ inline bool TypeCheck::SameRecord(const FnRecord &a, const FnRecord &b, const Fn
     if (a.relativestores.size() != b.relativestores.size()) return why("relative destinations");
     for (auto &p : a.relativestores)
         if (none_of(b.relativestores.begin(), b.relativestores.end(), [&](const auto &q) {
-                return p.result == q.result && sameroots(p.source, q.source) &&
+                return p.intail == q.intail && p.arraytarget == q.arraytarget && p.result == q.result && sameroots(p.source, q.source) &&
                        sameroots(p.destination, q.destination);
             }))
             return why("relative destinations");
@@ -3568,7 +3568,7 @@ inline void TypeCheck::RecordReturn(FnSpec *tspec, vector<Val> &vals, Node *at) 
     for (size_t i = 0; i < vals.size(); i++) {
         auto rt = tspec->rets[i];
         auto &rr = tspec->record.retroots[i];
-        rr.elementlinks = std::max(rr.elementlinks, vals[i].elementlinks);
+        rr.elementlinks.Include(vals[i].elementlinks);
         auto isrs = IsRefOrSlice(rt);
         auto holder = !isrs && HoldsPlainRef(rt);
         if (!isrs && !holder) continue;
@@ -4161,7 +4161,7 @@ inline bool TypeCheck::ResultLayoutFits(TypeExpr *from, TypeExpr *to) {
 // checked at every call, rather than assumed from the call that first
 // specialized the body. Concrete local roots must agree here.
 inline bool TypeCheck::RelativeDestination(const Roots &source, Dest dest, Node *at, bool record,
-                                          bool forwarding) {
+                                          bool forwarding, bool arraytarget) {
     if (source.None() || dest.unknown) return true;
     if (!source.Exact() || (!dest.result && !dest.roots.Exact())) return false;
     auto roots = source;
@@ -4202,12 +4202,15 @@ inline bool TypeCheck::RelativeDestination(const Roots &source, Dest dest, Node 
     if (!record) return true;
     if (dest.used) *dest.used = true;
     FnRecord::RelativeStore rs;
+    rs.intail = dest.intail;
+    rs.arraytarget = arraytarget;
     rs.source.Set(have, true);
     if (dest.result) rs.result = dest.resultindex;
     else rs.destination.Set(want, true);
     auto &stores = spec->record.relativestores;
     if (none_of(stores.begin(), stores.end(), [&](const auto &s) {
-            return s.result == rs.result && s.source == rs.source && s.destination == rs.destination;
+            return s.intail == rs.intail && s.arraytarget == rs.arraytarget && s.result == rs.result &&
+                   s.source == rs.source && s.destination == rs.destination;
         }))
         stores.push_back(rs);
     return true;
@@ -4249,7 +4252,8 @@ inline void TypeCheck::CheckCalleeRelative(Call *call, FnSpec *spec, vector<Val>
                 if (!dest.reached) dest.reached = spec->rets[i];
             }
         }
-        if (!RelativeDestination(source, dest, call, true, true)) {
+        dest.intail |= s.intail;
+        if (!RelativeDestination(source, dest, call, true, true, s.arraytarget)) {
             auto target = source.Root() ? string(source.Root()->name) : string("static data");
             auto receiver = dest.result ? cat("result ", dest.resultindex + 1, " of ", dest.result->sf->name)
                 : dest.roots.Root() ? string(dest.roots.Root()->name) : string("a temporary or argument slot");
@@ -4258,7 +4262,8 @@ inline void TypeCheck::CheckCalleeRelative(Call *call, FnSpec *spec, vector<Val>
                             target, " to receiving storage ", receiver));
         }
         if (s.result >= 0 && dest.reached && !dest.result && !source.None())
-            RecordElementLinks(dest.roots, dest.reached, dest.appended ? EL_BACKWARD : EL_ANY, call, dest.intail);
+            RecordLinkStore(dest.roots, dest.reached, { dest.appended ? EL_BACKWARD : EL_ANY, s.arraytarget },
+                            call, dest.intail);
     }
 }
 

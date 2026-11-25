@@ -275,7 +275,7 @@ struct TypeCheck {
     struct LinkFlow {
         struct Part {
             VarDef *owner;
-            ElementLinks kind;
+            SlotLinks kind;
             bool intail;
             int summary;
             auto operator<=>(const Part &) const = default;
@@ -560,7 +560,7 @@ struct TypeCheck {
         return d;
     }
     bool RelativeDestination(const Roots &source, Dest dest, Node *at, bool record,
-                             bool forwarding = false);
+                             bool forwarding = false, bool arraytarget = false);
     void CheckCalleeRelative(Call *call, FnSpec *spec, vector<Val> &args);
     bool ResultLayoutFits(TypeExpr *from, TypeExpr *to);
     // A declaration's immediate initializer and its owner, for root construction
@@ -2504,7 +2504,7 @@ struct TypeCheck {
     struct LitDeep {
         Roots roots;
         bool byteview = false;
-        ElementLinks elementlinks = EL_NONE;
+        ValueLinks elementlinks;
     };
     bool InitOrderStoreSafe(Node *n, TypeExpr *dest);
     bool InitOrderSafe(Node *n, set<FnSpec *> &visiting, FnSpec *callee = nullptr);
@@ -2591,7 +2591,7 @@ struct TypeCheck {
                          bool empties);
     void GrowOnlyAssignKnown(Assign *a, const Roots &built, bool whole);
     bool RetainsRelativeSlot(TypeExpr *part, TypeExpr *array, TypeExpr *replaced);
-    ElementLinks LiveElementLinks(VarDef *owner, TypeExpr *target = nullptr,
+    ValueLinks LiveElementLinks(VarDef *owner, TypeExpr *target = nullptr,
                                   TypeExpr *replaced = nullptr);
     // Whether a shrink whose receiver has these roots knows the arrays it
     // frees: none is static data or a temporary (§5.1).
@@ -2668,8 +2668,9 @@ struct TypeCheck {
     void NoteLitElem(LitDeep &deep, Node *at, const Val &v, TypeExpr *t);
     void HolderFromLit(Val &v, const LitDeep &deep);
     void AddStoreEvent(const StoreEvent &e);
-    void RecordElementLinks(const Roots &owners, TypeExpr *reached, ElementLinks links, Node *at,
+    void RecordElementLinks(const Roots &owners, TypeExpr *reached, ValueLinks links, Node *at,
                             bool intail = false);
+    void RecordLinkStore(const Roots &owners, TypeExpr *reached, SlotLinks links, Node *at, bool intail);
     void NoteSlotStore(const StoreEvent &e);
     // How NeverStoredError words a grow-shrink array `gs` a value pointing at
     // `roots` may point into: as the array itself where it is the value's one

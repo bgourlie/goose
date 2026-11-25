@@ -230,6 +230,7 @@ inline Val ArrayLit::Check(TypeCheck &tc, TypeExpr *expected) {
     } else if (expected && expected->kind == TY_SLICE) {
         elem = expected->sub;
     }
+    TypeCheck::FlagScope inelement(tc.curdst.intail, tc.curdst.intail || (expected && IsArrayKind(expected, A_GROW)));
     if (fillval) {
         auto cnt = tc.FillCount(fillcount);
         if (cnt < 0) tc.Error(this, "array fill count cannot be negative");
