@@ -337,6 +337,9 @@ struct TypeExpr {
 };
 
 // The views of a type's shape that every pass asks for.
+inline bool IsAggregate(const TypeExpr *t) {
+    return t->kind == TY_ARRAY || t->kind == TY_STRUCT || t->kind == TY_ENUM || t->kind == TY_VARIANT;
+}
 inline bool IsRefOrSlice(const TypeExpr *t) { return t->kind == TY_REF || t->kind == TY_SLICE; }
 inline bool IsOptional(const TypeExpr *t) { return t->kind == TY_REF && t->ref->optional; }
 inline bool IsOpaque(const TypeExpr *t) { return t && t->kind == TY_GENERIC && t->named->opaque; }
@@ -809,7 +812,6 @@ struct Val : Prov {
     RefPlace sliceplace; // Storage containing the viewed elements, independent of the slice slot.
     TypeExpr *type = nullptr;
     ConstKind ck = CK_NONE;
-    bool stoppedbydefer = false; // Constructed into the destination before an exit defer stopped control flow.
     int64_t ival = 0;
     bool uns = false;            // CK_INT: ival's bits are a u64 above i64.max.
     double fval = 0;
@@ -924,6 +926,8 @@ struct Val : Prov {
     // any of several, or anywhere a root only bounds (TypeCheck::HolderSource).
     VarDef *holderfrom = nullptr;
     FnValBind fnv;               // When type is TY_FN.
+
+    bool HasResultType() const { return type && type->kind != TY_VOID; }
 
     // The value delivered by one exit keeps its pointee or viewed elements,
     // and any links or references inside it. Its own storage is a new slot.

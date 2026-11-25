@@ -950,6 +950,13 @@ inline void Assign::CgStmt(CodeGen &cg) {
         cg.GenRelAssign(lv, lval, rhs, line);
         return;
     }
+    if (!IsAggregate(t)) {
+        // Evaluate the value before updating an existing slot. Routing an
+        // inlined call into the slot lets its defers observe the store early.
+        if (cg.IsVoidT(rhs->exprtype)) cg.GenAny(rhs, Dst {});
+        else cg.L(lv.s, " = ", cg.GenXD(rhs, t), ";");
+        return;
+    }
     if (cg.IsResz(t)) {
         // Whole-resizable assignment: clear (top back to the value start),
         // then construct the new contents in place (§4.4).

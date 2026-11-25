@@ -289,11 +289,21 @@ struct TypeCheck {
             LinkField field;
             int summary;
             auto operator<=>(const Part &) const = default;
+            auto operator<=>(VarDef *v) const { return std::compare_three_way {}(owner, v); }
         };
-        map<Part, size_t> live;
+        map<Part, size_t, std::less<>> live;
         vector<RelativeStore> resultlinks; // Writes into the result under construction on this path.
         void Add(const StoreEvent &e, size_t index) {
             live[{e.container, e.elementlink, e.linkfield, e.linkclass}] = index;
+        }
+        void ForgetOwner(VarDef *v) {
+            auto [first, last] = live.equal_range(v);
+            live.erase(first, last);
+        }
+        void ForgetLocal(VarDef *v) {
+            if (live.empty()) return;
+            ForgetOwner(v);
+            for (auto c : v->components) if (c) ForgetLocal(c);
         }
         void Join(const LinkFlow &other) {
             for (auto &link : other.resultlinks) link.AddTo(resultlinks);
@@ -2158,7 +2168,7 @@ struct TypeCheck {
             (uint64_t)count >= (1ull << IntBits(ls)))
             Error(n, cat("array length ", count, " exceeds storage range of ", TypeStr(t)));
     }
-    bool FitsAt(Val &v, TypeExpr *dt);
+    bool FitsAt(Val &v, TypeExpr *dt, bool delivered = true);
     static string ConstStr(const Val &v);
     Val CheckCond(Node *n);
     TypeExpr *UnifyBranch(TypeExpr *a, TypeExpr *b, Node *at, bool wantvalue);
@@ -2327,7 +2337,6 @@ struct TypeCheck {
     Val TempCopy(Val v);
     Node *WholeSlice(Node *n);
     Val CheckIf(IfExpr *x, TypeExpr *expected, bool wantvalue);
-    void PopValueScope(Val &v);
     Val CheckBlockVal(Block *b, TypeExpr *expected, bool wantvalue);
     Val CheckMatch(MatchExpr *m, TypeExpr *expected, bool wantvalue);
     Val CheckEarlyBlock(EarlyBlock *x, TypeExpr *expected, bool wantvalue);

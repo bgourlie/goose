@@ -25,11 +25,13 @@ inline void TypeCheck::PopScope() {
     auto &s = scopes.back();
     // A `var x = []` that nothing ever pushed into has no type to give
     // codegen; the scope ending is the last chance to say so.
-    for (auto i = s.varbase; i < (int)vars.size(); i++)
+    for (auto i = s.varbase; i < (int)vars.size(); i++) {
+        cur.links.ForgetLocal(vars[i]);
         if (IsPendingArray(vars[i]->type))
             Error(vars[i]->line, cat("the element type of ", vars[i]->name,
                                      " was never determined: nothing was pushed or "
                                      "appended into it, and no array was assigned to it"));
+    }
     vars.resize(s.varbase);
     localfns.resize(s.fnbase);
     scopes.pop_back();
@@ -569,7 +571,7 @@ inline Prov TypeCheck::RefProvOf(VarDef *vd) {
 
 inline VarDef *TypeCheck::ResetLocal(VarDef *previous) {
     if (!previous) return ast.NewVarDef();
-    erase_if(cur.links.live, [&](const auto &entry) { return entry.first.owner == previous; });
+    cur.links.ForgetOwner(previous);
     // Cached nested specializations capture this identity. Recompute its
     // checking state, but retain the capture discovered on an earlier pass,
     // and the marks no pass may lose (a nested function checked once set
@@ -961,8 +963,13 @@ inline TypeCheck::FlowState TypeCheck::SaveFlow() {
 }
 
 inline void TypeCheck::RestoreFlow(const FlowState &f) {
+    cur.links = f.links;
     for (auto &e : f.locals) {
-        if (!InScope(e.var, e.index)) continue;
+        if (!InScope(e.var, e.index)) {
+            // A snapshot taken at a break can outlive its local owners.
+            cur.links.ForgetLocal(e.var);
+            continue;
+        }
         e.var->assigned = e.state.assigned;
         e.var->maybeassigned = e.state.maybeassigned;
         e.var->narrowed = e.state.narrowed;
@@ -972,7 +979,6 @@ inline void TypeCheck::RestoreFlow(const FlowState &f) {
     for (auto [v, narrowed] : f.globals) v->narrowed = narrowed;
     reachable = f.reachable;
     cur.kills = f.kills;
-    cur.links = f.links;
 }
 
 inline TypeCheck::FlowState TypeCheck::JoinFlow(const FlowState &a, const FlowState &b) {
@@ -1086,8 +1092,6 @@ inline TypeExpr *TypeCheck::NarrowedRef(TypeExpr *t, Line l) {
 // the roots its callee's returns give the same way (CallResult).
 inline Val TypeCheck::MergeVals(const Val &a, bool areach, const Val &b, bool breach, Node *at,
                                 bool wantvalue) {
-    if (!areach) return b;
-    if (!breach) return a;
     Val v;
     // Branches that are all integer constants are one of them, a constant
     // of no committed type yet (Val::litint); floats of literals and the
@@ -1165,11 +1169,10 @@ inline Val TypeCheck::MergeVals(const Val &a, bool areach, const Val &b, bool br
     v.implicitcopy = a.implicitcopy ? a.implicitcopy : b.implicitcopy;
     v.refcopies = a.refcopies;
     v.refcopies.insert(v.refcopies.end(), b.refcopies.begin(), b.refcopies.end());
-    // All constructed operands constrain the destination type. Only values
-    // delivered after their defers contribute provenance to the join.
-    if (a.stoppedbydefer || b.stoppedbydefer) {
-        v.stoppedbydefer = a.stoppedbydefer && b.stoppedbydefer;
-        if (!v.stoppedbydefer) v.TakeResultProvenance(a.stoppedbydefer ? b : a);
+    // Typed expressions share a destination, even calls that cannot return.
+    // Only a branch that delivers its result contributes provenance.
+    if (!areach || !breach) {
+        if (areach || breach) v.TakeResultProvenance(areach ? a : b);
         return v;
     }
     if (a.holderset || b.holderset) {
@@ -1200,8 +1203,8 @@ inline Val TypeCheck::MergeVals(const Val &a, bool areach, const Val &b, bool br
 // array a whole-array slice of itself, and they point where that says.
 inline Val TypeCheck::JoinBranches(const Val &a, bool areach, const Val &b, bool breach,
                                    Node *at, bool wantvalue, bool onjoin) {
-    if (!areach && !a.stoppedbydefer) return b;
-    if (!breach && !b.stoppedbydefer) return a;
+    if (!areach && !a.HasResultType()) return b;
+    if (!breach && !b.HasResultType()) return a;
     auto elem = [](const Val &x) -> TypeExpr * {
         if (!x.type) return nullptr;
         if (x.type->kind == TY_SLICE) return x.type->sub;
@@ -1220,10 +1223,9 @@ inline Val TypeCheck::JoinBranches(const Val &a, bool areach, const Val &b, bool
         // first branches not to agree.
         NoArrayJoin(a);
         NoArrayJoin(b);
-        return MergeVals(a, true, b, true, at, wantvalue);
+        return MergeVals(a, areach, b, breach, at, wantvalue);
     }
     Val v;
-    v.stoppedbydefer = a.stoppedbydefer && b.stoppedbydefer;
     v.type = ast.SliceOf(ea, at->line);
     // Read-only where a branch is: a const slice, or an array a view of
     // which would be (§9.5).
@@ -1270,7 +1272,7 @@ inline bool TypeCheck::CycleStorable(const Roots &r) {
 // temporaries outlive the value.
 inline void TypeCheck::CheckBranchRoot(const Val &v, int depth, Node *at, const char *construct) {
     auto t = v.type;
-    if (!t || v.isnull || v.stoppedbydefer) return;
+    if (!t || v.isnull) return;
     auto isrs = IsRefOrSlice(t);
     if (!isrs && !HoldsPlainRef(t)) return;
     const Roots &roots = isrs ? v.AsRoots() : ContentsOf(v);
@@ -1494,17 +1496,6 @@ inline Val TypeCheck::CheckIf(IfExpr *x, TypeExpr *expected, bool wantvalue) {
     return onjoin ? v : TempCopy(v);
 }
 
-// A block constructs its tail in the receiver before running its defers.
-// A path that never got as far as constructing a value is bottom.
-inline void TypeCheck::PopValueScope(Val &v) {
-    auto constructed = reachable && v.type && v.type->kind != TY_VOID;
-    PopScope();
-    if (!reachable) {
-        v.stoppedbydefer |= constructed;
-        if (!v.stoppedbydefer) v.type = nullptr;
-    }
-}
-
 inline Val TypeCheck::CheckBlockVal(Block *b, TypeExpr *expected, bool wantvalue) {
     auto onpath = argpath == b;
     auto onjoin = joinpath == b;
@@ -1523,8 +1514,8 @@ inline Val TypeCheck::CheckBlockVal(Block *b, TypeExpr *expected, bool wantvalue
     } else if (wantvalue && reachable && expected && expected->kind != TY_VOID) {
         Error(b, "block used as a value must end in an expression");
     }
-    PopValueScope(v);
-    CheckBranchRoot(v, CurDepth(), b->tail, "block");
+    PopScope();
+    if (reachable) CheckBranchRoot(v, CurDepth(), b->tail, "block");
     b->exprtype = v.type ? v.type : ast.voidtype;
     return v;
 }
@@ -1582,9 +1573,9 @@ inline Val TypeCheck::CheckMatch(MatchExpr *m, TypeExpr *expected, bool wantvalu
         } else {
             CheckStmtExpr(arm.body);
         }
-        PopValueScope(av);
+        PopScope();
         auto aflow = SaveFlow();
-        CheckBranchRoot(av, CurDepth(), arm.body, "match arm");
+        if (reachable) CheckBranchRoot(av, CurDepth(), arm.body, "match arm");
         if (first) {
             result = av;
             resultreach = aflow.reachable;
@@ -1860,14 +1851,15 @@ inline Val TypeCheck::CheckEarlyBlock(EarlyBlock *x, TypeExpr *expected, bool wa
         }
     }
     auto sc = scopes.back();
-    PopValueScope(v);
+    PopScope();
+    auto tailreach = reachable;
     x->body->exprtype = v.type ? v.type : ast.voidtype;
     JoinBreakFlow(sc, true);
     reachable = reachable || sc.hasbreak;  // Exits via the tail or any break.
     if (!wantvalue) return VoidVal();
-    CheckBranchRoot(v, CurDepth(), x->body->tail, "block");
-    if (sc.breaktype) CheckBranchRoot(sc.breakvalue, CurDepth(), x, "block");
-    Val r = sc.breaktype ? JoinBranches(v, v.type != nullptr, sc.breakvalue, true, x, wantvalue,
+    if (tailreach) CheckBranchRoot(v, CurDepth(), x->body->tail, "block");
+    if (sc.hasbreak) CheckBranchRoot(sc.breakvalue, CurDepth(), x, "block");
+    Val r = sc.breaktype ? JoinBranches(v, tailreach, sc.breakvalue, sc.hasbreak, x, wantvalue,
                                         onjoin) : v;
     if (!r.type) r.type = ast.voidtype;
     return onjoin ? r : TempCopy(r);
@@ -1955,7 +1947,7 @@ inline Val TypeCheck::CheckLoop(LoopExpr *x, TypeExpr *expected, bool wantvalue)
     JoinBreakFlow(sc, false);
     reachable = sc.hasbreak;  // A loop only exits via break.
     if (!wantvalue || !sc.breaktype) return VoidVal();
-    CheckBranchRoot(sc.breakvalue, CurDepth(), x, "loop");
+    if (sc.hasbreak) CheckBranchRoot(sc.breakvalue, CurDepth(), x, "loop");
     return onjoin ? sc.breakvalue : TempCopy(sc.breakvalue);
 }
 
@@ -2252,7 +2244,6 @@ inline void TypeCheck::CheckBreak(Break *b) {
         // it was read from (RelyOnNamed).
         exit.TakeResultProvenance(v);
         exit.type = v.type;
-        exit.stoppedbydefer = v.stoppedbydefer;
         if (IntConsts(v, exit.litlo, exit.lithi)) {
             exit.litint = true;
             exit.nonneg = exit.litlo >= 0;
@@ -2274,14 +2265,10 @@ inline void TypeCheck::CheckBreak(Break *b) {
         // here: the construct's value does not carry the literal form.
         if (v.emptyarr) Error(b->val, "cannot infer array element type");
     }
-    auto constructed = reachable && exit.type && exit.type->kind != TY_VOID;
     ExitLinkDefers(si);
     auto &sc = scopes[si];
     if (b->val) {
-        // All constructed values must agree on a type, including one whose
-        // defer aborts after construction. Only completing breaks carry links.
-        exit.stoppedbydefer |= constructed && !reachable;
-        if (reachable || exit.stoppedbydefer) {
+        if (reachable || exit.HasResultType()) {
             sc.breakvalue = JoinBranches(sc.breakvalue, sc.hasbreak, exit, reachable, b, true,
                                          sc.onjoinpath);
             if (!sc.breaktype) sc.breaktype = exit.type;
@@ -3008,6 +2995,10 @@ inline void TypeCheck::AssignableClassCheck(TypeExpr *t, Node *at) {
 // being built (rebuilding, ExposedLater).
 inline Val TypeCheck::CheckAssignedValue(Assign *a, TypeExpr *target, TypeExpr *arr,
                                          const LVal &built, Dest dest) {
+    // An aggregate can start construction in its destination before its
+    // initializer finishes. A scalar store follows evaluation of its operand.
+    auto aggregate = IsAggregate(target);
+    if (aggregate) NoteStorageWrite(built, target);
     if (arr) {
         {
             struct Restore {
@@ -3025,6 +3016,7 @@ inline Val TypeCheck::CheckAssignedValue(Assign *a, TypeExpr *target, TypeExpr *
     SlotScope ss(*this, true);
     auto base = cur.growlog.size();
     auto v = CheckValueAt(a->rhs, target, dest);
+    if (!aggregate) NoteStorageWrite(built, target);
     if (arr && !built.None()) {
         CheckGrowsSince(base, built, cat("the value assigned to ", ExprStr(a->lval)), target);
         CheckBuiltUses(a->rhs, a->lval, target, built, arr);
@@ -3063,7 +3055,6 @@ inline void TypeCheck::CheckAssign(Assign *a) {
     auto held = lv;
     auto throughref = a->op != T_DOTASSIGN && IsPlainRef(held.type);
     if (throughref) DerefLValue(held, a->lval);
-    NoteStorageWrite(held, held.type);
     // A shrink only frees element storage. A field path from a variable, or
     // from a reference to a resizable value, stays in that value's own
     // storage (a frame object's prefix included). A path through an element,
@@ -3091,7 +3082,11 @@ inline void TypeCheck::CheckAssign(Assign *a) {
     } else {
         nodevals.erase(a->lval);
     }
-    if (a->op == T_DOTASSIGN) { CheckRebind(a, lv); return; }
+    if (a->op == T_DOTASSIGN) {
+        CheckRebind(a, lv);
+        NoteStorageWrite(held, held.type);
+        return;
+    }
     if (lv.isvarint)
         Error(a, "varint fields are written only at construction (§3.6)");
     if (lv.type->kind == TY_REF && lv.type->ref->lenstorage == IS_VARINT)
@@ -3101,7 +3096,10 @@ inline void TypeCheck::CheckAssign(Assign *a) {
     // writes the pointee; rebinding is `.=`.
     if (IsPlainRef(lv.type)) {
         if (a->op == T_ASSIGN) PointeeAssign(a, lv, held);
-        else CompoundAssign(a, lv.type->ref->sub, PointeeWritable(lv, a));
+        else {
+            CompoundAssign(a, lv.type->ref->sub, PointeeWritable(lv, a));
+            NoteStorageWrite(held, held.type);
+        }
         a->pointee = true;
         return;
     }
@@ -3112,6 +3110,7 @@ inline void TypeCheck::CheckAssign(Assign *a) {
         NoCopyWrite(a, lv);
         NoLetAssign(a, lv);
         CompoundAssign(a, lv.type, WholeWritable(lv));
+        NoteStorageWrite(held, held.type);
         if (lv.var) RequireAssigned(lv.var, a);
         return;
     }

@@ -25,11 +25,30 @@ fn read_rebound_alias() -> i64[] {
     return result;
 }
 
+fn stop() -> i64 { abort("stop"); }
+fn stopped_store(flag: bool) -> i64[] {
+    var out: i64[] = [41];
+    let alias .= out[0];
+    defer { if flag { alias = stop(); } }
+    defer { if flag { alias += stop(); } }
+    return out;
+}
+
+var slot: i64 = 7;
+inline fn read_before_store() -> i64 {
+    defer { assert(slot == 7); }
+    return 42;
+}
+
 fn main() {
     var counter = 41;
     let items: Item[] = build(counter);
     assert(items[0].counter == 42 && counter == 42);
     let numbers: i64[] = read_rebound_alias();
     assert(numbers[0] == 42);
+    let unchanged = stopped_store(false);
+    assert(unchanged[0] == 41);
+    slot = read_before_store();
+    assert(slot == 42);
     print("ok");
 }

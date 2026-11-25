@@ -1409,7 +1409,8 @@ inline Val TypeCheck::TryDispatch(Call *c, vector<SFunction *> &cands, FnSpec *e
         for (size_t r = 0; r < lastcallrets.size(); r++) {
             auto reaches = spec->inprogress || lastcallrets[r].elementlinks ||
                            (r < spec->record.retroots.size() && spec->record.retroots[r].set);
-            results[r] = MergeVals(results[r], reached[r], lastcallrets[r], reaches, c, true);
+            if (!reached[r]) results[r] = lastcallrets[r];
+            else if (reaches) results[r] = MergeVals(results[r], true, lastcallrets[r], true, c, true);
             reached[r] = reached[r] || reaches;
         }
     }

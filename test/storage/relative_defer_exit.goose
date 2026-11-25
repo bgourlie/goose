@@ -91,6 +91,14 @@ fn break_operand(stop: bool) -> i64 {
     return value;
 }
 
+fn stopped_rebind(stop: bool) {
+    var nodes: Node[>..] = [Node {}, Node {}];
+    if stop {
+        nodes[0].next .= block { defer { abort("stop"); } nodes[1] };
+    }
+    nodes.pop_n(1);
+}
+
 struct Stop { flag: bool }
 fn format(out: u8[>..]&, stop: Stop) { abort("stop"); }
 fn formatted_result(stop: bool) -> Node[] {
@@ -112,6 +120,7 @@ fn main() {
     var from_match: Node[>..<] = match_result(2);
     assert(from_break.len == 1 && from_tail.len == 1 && from_format.len == 1 && from_match.len == 1);
     assert(break_operand(false) == 42);
+    stopped_rebind(false);
     stopped(false);
     var nodes: Node[>..] = [Node {}, Node {}];
     { defer { nodes[0].next .= nodes[1]; } }

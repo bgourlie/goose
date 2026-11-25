@@ -2128,9 +2128,10 @@ frames between records what its activation had assigned by then and what
 it may have assigned since it began (`FnSpec::outerexits`), and a call that
 reuses that body applies this again (`ReplayOuterExits`). A body with no
 exit its caller reaches leaves the variables as its end did: the code after
-the call never runs. A branch that diverges has the null "bottom" type,
-which unifies with anything (`UnifyBranch`, `MergeVals`), and reads as
-`void` once the construct's node is left (`VoidIfBottom`). An `if` that
+the call never runs. A valueless exit such as `abort()` contributes no
+type to a branch join. A typed expression, including a call whose defer
+aborts, must fit the shared destination. Only paths that reach the join
+contribute result provenance (`JoinBranches`, `MergeVals`). An `if` that
 ends its block (as the `if` a guard parses to does) and whose `else`
 diverges is marked `IfExpr::flat` (`CheckIf`, by `blockpos`). Codegen puts
 its then-block after the `else` in the C block the `if` is in (§6.2), and
@@ -3670,6 +3671,9 @@ whereas decoding or rebinding can introduce forward links. `LinkFlow`
 records the writes that may still be live on each path, distinguishing
 slots known to lie in the resizable element run. A clear discards that
 run. Header links, including links into a byte view, may survive it.
+Scope exit runs defers and then removes the departing locals' entries,
+including their independently owned components. A write through a local
+alias stays live as long as the storage it changed.
 
 Branches and dispatch cases join the writes from each returning path.
 A call summary identifies which stores survive at each shrink and on

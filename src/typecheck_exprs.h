@@ -1034,7 +1034,7 @@ inline Val TypeCheck::CheckValue(Node *&n, TypeExpr *expected, bool callsite, bo
         auto litfloat = v.litfloat;
         MustFit(v, n, expected);
         NoRelRefCopy(n, expected);
-        if (reachable && expected->kind == TY_FLT) {
+        if (expected->kind == TY_FLT && from->kind != TY_VOID) {
             if (IsIntT(from)) ToFloat(n, from, expected);
             else if (litfloat && !TypeEq(from, expected)) RetypeFlex(n, expected);
         }
@@ -1071,11 +1071,13 @@ inline void TypeCheck::MustFit(Val &v, Node *n, TypeExpr *dt) {
     auto vt = DecayedType(v);
     if (vt->kind == TY_ARRAY && vt->arr->akind == A_FIXED)
         CheckArrayCount(n, dt, ArraySize(vt->arr));
-    if (!reachable) return;  // A diverging operand fits anything.
+    // A valueless exit fits any destination. A typed operand still needs a
+    // compatible representation, even if control never reaches the store.
+    if (!reachable && !v.HasResultType()) return;
     fitfail.clear();
     fitnode = n;
     auto from = LoadType(v.type);
-    if (FitsAt(v, dt)) {
+    if (FitsAt(v, dt, reachable)) {
         if (v.elementlinks && !curdst.discarded && !IsRefOrSlice(dt) && !curdst.roots.None())
             RecordElementLinks(curdst, dt, v.elementlinks, n);
         if (IsIntT(dt) && !TypeEq(from, dt)) {
@@ -1116,8 +1118,9 @@ inline void TypeCheck::MustFit(Val &v, Node *n, TypeExpr *dt) {
 // owned by curdst must be rooted at least as shallow (call-site argument
 // slots pass curdst null: parameters always die before their arguments'
 // roots).
-inline bool TypeCheck::FitsAt(Val &v, TypeExpr *dt) {
+inline bool TypeCheck::FitsAt(Val &v, TypeExpr *dt, bool delivered) {
     auto t = v.type;
+    if (!delivered) v.elementlinks = {};
     // An lvalue at a reference destination is the reference to it (§4.1),
     // a `const T&` where the lvalue is read-only (§9.5).
     if (BindsRef(v, dt)) {
@@ -1154,7 +1157,7 @@ inline bool TypeCheck::FitsAt(Val &v, TypeExpr *dt) {
     // if the slot's type says `const`, which is what a later read of the
     // slot then sees; a parameter or result takes either and is read-only
     // in that instantiation.
-    if (IsRefOrSlice(dt) && IsRefOrSlice(t) && !v.writable && !dt->cq && constslot) {
+    if (delivered && IsRefOrSlice(dt) && IsRefOrSlice(t) && !v.writable && !dt->cq && constslot) {
         fitfail = cat("storing a read-only ", dt->kind == TY_SLICE ? "slice" : "reference",
                       " of type ", TypeStr(t),
                       t->cq ? "" : " (read-only in this instantiation)",
@@ -1164,7 +1167,7 @@ inline bool TypeCheck::FitsAt(Val &v, TypeExpr *dt) {
     auto holder = !IsRefOrSlice(dt) && !IsRefOrSlice(t) && HoldsPlainRef(dt);
     // Argument slots pass no destination (parameters die before their
     // arguments' roots); an element or field being constructed does.
-    if (((IsRefOrSlice(dt) && IsRefOrSlice(t)) || holder) && !curdst.roots.None()) {
+    if (delivered && ((IsRefOrSlice(dt) && IsRefOrSlice(t)) || holder) && !curdst.roots.None()) {
         const Roots &roots = holder ? ContentsOf(v) : v.AsRoots();
         // An inexact destination root only bounds the storage the slot is
         // in: that may be any storage there or further out that can hold
@@ -1417,7 +1420,7 @@ inline bool TypeCheck::FitsAt(Val &v, TypeExpr *dt) {
                 for (auto &a : v.alts) if (!nullalt(a)) links.Add(a);
                 // A reference that points nowhere yet (RefProvOf), or a
                 // location reached through one, is read again once it does.
-                if (links.None() || (!dt->ref->pool && curdst.unknown)) {
+                if (!delivered || links.None() || (!dt->ref->pool && curdst.unknown)) {
                     v.type = dt;
                     return true;
                 }
