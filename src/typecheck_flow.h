@@ -1664,6 +1664,7 @@ inline Val TypeCheck::CheckMatch(MatchExpr *m, TypeExpr *expected, bool wantvalu
                                             " ", arm.pat.binder));
                     binder->type = ast.RefTo(vt, m->line);
                     BindProv(binder, sv);
+                    binder->refplace.location = sv.refplace.location;
                     ReadBack held;
                     if (TempContents(sv, held)) NoRelRefTempRead(m->scrutinee, enumtype, vt);
                 } else {
