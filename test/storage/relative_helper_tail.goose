@@ -13,5 +13,11 @@ fn main() {
     assert(list.nodes[0].next .== list.nodes[1]);
     list.nodes.clear();
     assert(list.nodes.len == 0 && list.head.next == null);
+    list.nodes.push(Node {});
+    list.nodes.push(Node {});
+    for &n, i in list.nodes { if i == 0 { n.next .= list.nodes[1]; } }
+    assert(list.nodes[0].next .== list.nodes[1]);
+    list.nodes.clear();
+    assert(list.nodes.len == 0 && list.head.next == null);
     print("ok");
 }

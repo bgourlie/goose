@@ -1929,6 +1929,14 @@ inline void TypeCheck::AddStoreEvent(const StoreEvent &e) {
     origin(evs.size() - 1);
 }
 
+// A directly bound element occupies its slot. A slice can view other storage,
+// and a reference element binds to the pointee loaded out of the slot.
+inline LinkLocation TypeCheck::ElementLocation(Node *sequence, TypeExpr *t) {
+    if (t->kind != TY_ARRAY || t->arr->sub->kind == TY_REF) return {};
+    if (IsArrayKind(t, A_GROW)) return { true };
+    return ReferentLocation(sequence);
+}
+
 // Where a checked argument binds by reference. Direct field and fixed-array
 // steps preserve the containing location. A reference stored in such a slot
 // may point elsewhere, even to a header field of the very same owner.
@@ -1942,16 +1950,12 @@ inline LinkLocation TypeCheck::ReferentLocation(Node *n) {
     if (!obj->exprtype) return {};
     auto t = obj->exprtype;
     if (t->kind == TY_REF) t = t->ref->sub;
-    if (dot) {
-        if (!dot->IsField() || dot->fieldidx < 0) return {};
-        auto fields = FieldRuns(t);
-        if (fields.size() != 1) return {};
-        auto ft = (*fields[0].ftypes)[dot->fieldidx];
-        if (!ft || ft->kind == TY_REF) return {};
-    } else {
-        if (t->kind != TY_ARRAY || t->arr->sub->kind == TY_REF) return {};
-        if (IsArrayKind(t, A_GROW)) return { true };
-    }
+    if (index) return ElementLocation(obj, t);
+    if (!dot->IsField() || dot->fieldidx < 0) return {};
+    auto fields = FieldRuns(t);
+    if (fields.size() != 1) return {};
+    auto ft = (*fields[0].ftypes)[dot->fieldidx];
+    if (!ft || ft->kind == TY_REF) return {};
     return ReferentLocation(obj);
 }
 

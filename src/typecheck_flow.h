@@ -1968,6 +1968,7 @@ inline void TypeCheck::CheckFor(ForLoop *x) {
     TypeExpr *bindtype = nullptr;
     TypeExpr *elemtype = nullptr;   // The array's element type, where it has one.
     Prov iterprov;   // What a reference binding points into.
+    LinkLocation elementplace;
     ReadBack contents;   // Where the elements point, when the array is a temporary.
     auto intemp = false;
     // A binder's written integer type (§6.5).
@@ -2081,6 +2082,7 @@ inline void TypeCheck::CheckFor(ForLoop *x) {
             // An element that is itself a reference binds as the one it holds
             // either way, there being no references to references (§3.8).
             if (byref && elem->kind != TY_REF) {
+                elementplace = ElementLocation(x->iter, t);
                 bindtype = ast.RefTo(elem, x->line);
             } else {
                 // An element that *is* a relative reference loads as a
@@ -2148,7 +2150,10 @@ inline void TypeCheck::CheckFor(ForLoop *x) {
                         intemp ? contents.from : HolderSource(iterprov));
             fitnode = saved;
         }
-        if (IsRefOrSlice(bindtype)) BindProv(vd, iterprov);
+        if (IsRefOrSlice(bindtype)) {
+            BindProv(vd, iterprov);
+            vd->refplace = elementplace;
+        }
         x->vdef = vd;
         if (!x->idxvar.empty()) {
             auto idx = NewVar(x->idxvar, idxtype ? idxtype : ast.inttypes[IS_I64], x->line,

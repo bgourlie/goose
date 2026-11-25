@@ -2696,6 +2696,7 @@ struct TypeCheck {
     void NoteLitElem(LitDeep &deep, Node *at, const Val &v, TypeExpr *t);
     void HolderFromLit(Val &v, const LitDeep &deep);
     void AddStoreEvent(const StoreEvent &e);
+    LinkLocation ElementLocation(Node *sequence, TypeExpr *t);
     LinkLocation ReferentLocation(Node *n);
     void NoteRefPlace(VarDef *vd, Node *arg, const Val &v);
     void RecordElementLinks(const Roots &owners, TypeExpr *reached, const ValueLinks &links, Node *at,
