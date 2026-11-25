@@ -8,6 +8,12 @@ fn use(a: i64, c: Choice.B, b: i64) { print(a, " B ", b); }
 enum Message { A { n: i64 }, B { s: u8[] } }
 fn payload(m: Message.A, b: i64) { print(m.n); }
 fn payload(m: Message.B, b: i64) { print(m.s); }
+fn read_after_init(a: i64, b: i64, value: i64&) { assert(value == a + b); }
+fn test_branch_argument(flag: bool) {
+    let x: i64;
+    let y = 42;
+    read_after_init(block { x = 42; 40 }, 2, if flag { x } else { y });
+}
 fn test_assignment(c: Choice, want: i64) {
     let x: i64;
     let y: i64;
@@ -17,6 +23,8 @@ fn test_assignment(c: Choice, want: i64) {
     assert(x == 41 && y == want);
 }
 fn main() {
+    test_branch_argument(true);
+    test_branch_argument(false);
     test_assignment(Choice.A {}, 42);
     test_assignment(Choice.B {}, 43);
     use(first(), choose(true), last());

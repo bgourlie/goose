@@ -1003,18 +1003,19 @@ inline Node *TypeCheck::WholeSlice(Node *n) {
 inline Val TypeCheck::CheckValue(Node *&n, TypeExpr *expected, bool callsite, bool branchcopy,
                                  bool inferred) {
     auto orig = n;
-    auto assignment = curdst.assignment;
+    auto construction = curdst.construction;
+    auto run = construction && construction->run == n;
     // Control constructs pass the destination to the selected value. A
     // call can start writing it once its arguments have been evaluated.
     // Other expressions compute their operands separately. A literal
-    // with relative fields starts constructing in the slot itself.
-    if (assignment && (Is<StructLit>(n) || Is<ArrayLit>(n)) && HasRelRefT(assignment, true))
-        NoteStorageWrite(curdst.roots, assignment);
-    Saved writing(curdst.assignment, assignment && (IsBranchConstruct(n) || Is<Call>(n))
-                                         ? assignment : nullptr);
+    // built in place can write before all its initializers return.
+    if (construction && reachable && construction->literal && !run && (Is<StructLit>(n) || Is<ArrayLit>(n)))
+        construction->started = true;
+    auto forwards = construction && (run || IsBranchConstruct(n) || Is<Call>(n));
+    Saved writing(curdst.construction, forwards ? construction : nullptr);
     auto v = CheckV(n, expected);
     // A branch delivers its value before its scope's defers run.
-    if (assignment && v.type->kind != TY_VOID) NoteStorageWrite(curdst.roots, assignment);
+    if (construction && v.type->kind != TY_VOID && reachable) construction->started = true;
     // An argument's casts are its call's to judge (JudgeCallCasts).
     if (!callsite) JudgeCastAt(orig, expected && expected->kind != TY_VOID ? expected : nullptr, v);
     // A nominal default is an ordinary construction at this destination,

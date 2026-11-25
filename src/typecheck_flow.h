@@ -2996,10 +2996,14 @@ inline Val TypeCheck::CheckAssignedValue(Assign *a, TypeExpr *target, TypeExpr *
     // A resizable assignment clears before evaluating its RHS. Fixed
     // aggregates can also receive an in-place initializer or call result.
     // A runtime-capacity limited array copies the completed source (§4.4).
+    Construction construction {};
     if (hasdefers && IsAggregate(target)) {
         auto cls = ClassOf(target);
         if (cls == SC_RESIZABLE) NoteStorageWrite(built, target);
-        if (cls == SC_FIXED) dest.assignment = target;
+        if (cls == SC_FIXED) {
+            construction.literal = HasRelRefT(target, true);
+            dest.construction = &construction;
+        }
     }
     if (arr) {
         {
@@ -3018,7 +3022,7 @@ inline Val TypeCheck::CheckAssignedValue(Assign *a, TypeExpr *target, TypeExpr *
     SlotScope ss(*this, true);
     auto base = cur.growlog.size();
     auto v = CheckValueAt(a->rhs, target, dest);
-    NoteStorageWrite(built, target);
+    NoteStorageWrite(built, target, reachable || construction.started);
     if (arr && !built.None()) {
         CheckGrowsSince(base, built, cat("the value assigned to ", ExprStr(a->lval)), target);
         CheckBuiltUses(a->rhs, a->lval, target, built, arr);

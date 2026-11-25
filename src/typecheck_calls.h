@@ -219,7 +219,7 @@ inline Val TypeCheck::CheckUfcsCall(Call *c, Dot *d, TypeExpr *expected) {
     auto bd = LookupBuiltin(d->name);
     if (bd && (bd->flags & BF_MEMBER) && !(bd->flags & BF_PROPERTY) &&
         rt->kind == TY_ARRAY) {
-        CheckWaitingArg(c, d->obj, entry);
+        CheckWaitingArg(c, d->obj, &entry);
         if (optional) Error(c, "optional value must be narrowed (if/guard/assert) before use");
         // A member works on the receiver's value, which for a control
         // construct is a copy of the branch taken.
@@ -255,7 +255,7 @@ inline Val TypeCheck::CheckUfcsCall(Call *c, Dot *d, TypeExpr *expected) {
     }
     if (!cands.empty())
         return ResolveCall(c, cands, env, d->name, &ov, d->obj, entry, nullptr, expected);
-    CheckWaitingArg(c, d->obj, entry);
+    CheckWaitingArg(c, d->obj, &entry);
     // A member builtin taking any receiver (bytes_of) takes it as checked.
     NoArrayJoin(ov);
     if (bd && !(bd->flags & BF_PROPERTY)) {
@@ -359,7 +359,7 @@ inline void TypeCheck::AddParamDefaults(Call *c, MatchInfo &best, vector<Node *>
                 Error(d, cat("the default of parameter ", p.name, " cannot be passed as ",
                              TypeStr(pt), ": ",
                              fitfail.empty() ? cat("it is ", TypeStr(v.type)) : fitfail));
-            BindBranchByRef(argnodes[i], v, pt, p.type, input);
+            BindBranchByRef(argnodes[i], v, pt, p.type, &input);
         });
         c->args[i - shift] = argnodes[i];
         argvals.insert(argvals.begin() + (int)i, v);
@@ -385,7 +385,12 @@ inline Val TypeCheck::ResolveCall(Call *c, vector<SFunction *> &cands, FnSpec *e
     {
         Discovering discovering(*this, c);
         for (auto &a : c->args) {
-            if (!argnodes.empty()) inputs.later.push_back(SaveFlow());
+            // Only a waiting call, a branch rebound to storage, or an untyped
+            // [] viewed by a slice parameter can need its own entry for replay.
+            auto literal = Is<ArrayLit>(a);
+            if (!argnodes.empty() && (Is<Call>(a) || IsBranchConstruct(a) ||
+                (literal && literal->elems.empty() && !literal->fillval && !literal->capexpr)))
+                inputs.later.emplace(argnodes.size(), SaveFlow());
             Val v;
             {
                 PathScope ps(*this, a);
@@ -573,9 +578,10 @@ inline void TypeCheck::RecheckArgs(Call *c, vector<SFunction *> &cands, MatchInf
 // receiver or an argument beside an exemplar's opaque value. A
 // call there whose phase 2 waited (Phase2Waits) is checked again in full, as
 // it was first.
-inline void TypeCheck::CheckWaitingArg(Call *c, Node *a, const FlowState &input) {
+inline void TypeCheck::CheckWaitingArg(Call *c, Node *a, const FlowState *input) {
     if (!phase2waits.count(a)) return;
-    RestoreFlow(input);
+    assert(input);
+    RestoreFlow(*input);
     Discovering discovering(*this, c);
     Saved<Node *> full(nowait, a);
     PathScope ps(*this, a);
@@ -620,7 +626,7 @@ inline void TypeCheck::BindBranchesByRef(vector<Node *> &argnodes, vector<Val> &
 // at a parameter declared a slice. One that does not bind the branches takes
 // the construct's copy, which makes their `&` redundant.
 inline void TypeCheck::BindBranchByRef(Node *&n, Val &v, TypeExpr *pt, TypeExpr *declared,
-                                       const FlowState &input) {
+                                       const FlowState *input) {
     if (!declared || declared->kind != TY_SLICE) NoArrayJoin(v);
     auto byref = v.storagebranches && pt->kind == TY_REF && pt->ref->lenstorage < 0;
     if (!byref) RefCopyWarnings(v);
@@ -629,7 +635,8 @@ inline void TypeCheck::BindBranchByRef(Node *&n, Val &v, TypeExpr *pt, TypeExpr 
     SlotScope ss(*this, false);
     FlagScope q(quiet, true);
     auto after = SaveFlow();
-    RestoreFlow(input);
+    assert(input);
+    RestoreFlow(*input);
     v = CheckValue(n, pt, true);
     RestoreFlow(after);
 }
@@ -1302,7 +1309,8 @@ inline Val TypeCheck::TryDispatch(Call *c, vector<SFunction *> &cands, FnSpec *e
         DestScope ds(*this, Dest {});
         SlotScope ss(*this, false);
         auto after = SaveFlow();
-        RestoreFlow(inputs[found]);
+        assert(inputs[found]);
+        RestoreFlow(*inputs[found]);
         argvals[found] = CheckValue(argnodes[found], ast.RefTo(enumtype, c->line), true);
         RestoreFlow(after);
     }
@@ -4225,14 +4233,14 @@ inline bool TypeCheck::ResultLayoutFits(TypeExpr *from, TypeExpr *to) {
     return from->kind == TY_VARIANT && to->kind == TY_ENUM && SameAdt(AdtOf(from), to);
 }
 
-// A call can start constructing a value in an assignment's destination
+// A call can start constructing a value in its destination
 // after its operands complete, even if the callee subsequently exits
 // without returning. A reference result is loaded after the call.
 inline void TypeCheck::NoteCallConstruction(const vector<TypeExpr *> &results) {
     for (size_t i = 0; i < results.size() && i < callresultdsts.size(); i++) {
         auto &dest = callresultdsts[i];
-        if (dest.assignment && IsAggregate(results[i]))
-            NoteStorageWrite(dest.roots, dest.assignment);
+        if (dest.construction && IsAggregate(results[i]) && reachable)
+            dest.construction->started = true;
     }
 }
 

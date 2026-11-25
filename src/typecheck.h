@@ -329,8 +329,19 @@ struct TypeCheck {
     // Operand zero starts in the call's own snapshot, including for UFCS.
     struct ArgumentFlows {
         const FlowState &entry;
-        vector<FlowState> later;
-        const FlowState &operator[](size_t i) const { return i ? later[i - 1] : entry; }
+        unordered_map<size_t, FlowState> later;
+        const FlowState *operator[](size_t i) const {
+            if (!i) return &entry;
+            auto it = later.find(i);
+            return it == later.end() ? nullptr : &it->second;
+        }
+    };
+    // A caller can decide whether the value lands in its storage after
+    // learning its type. Track whether construction could already have written.
+    struct Construction {
+        bool literal;  // A literal starts building in the slot itself.
+        ArrayLit *run = nullptr;  // An append builds only this literal's elements.
+        bool started = false;
     };
     // The destination of the value under construction (for reference stores):
     // where the storage the value lands in may be (an lvalue's roots).
@@ -359,7 +370,7 @@ struct TypeCheck {
         // resize adds, so no position in the array is its own (§3.9).
         bool fill = false;
         bool appended = false;       // New elements at the end of a grow-only array.
-        TypeExpr *assignment = nullptr; // Existing aggregate slot a value can write during construction.
+        Construction *construction = nullptr;
         Dest() {}
         Dest(const Roots &r, bool vb = false, TypeExpr *re = nullptr)
             : roots(r), varbind(vb), reached(re), unknown(r.None()) {}
@@ -2143,7 +2154,7 @@ struct TypeCheck {
                            const vector<TypeExpr *> &paramtypes, SFunction *sf,
                            const ArgumentFlows &inputs, int skip = -1,
                            size_t end = SIZE_MAX);
-    void BindBranchByRef(Node *&n, Val &v, TypeExpr *pt, TypeExpr *declared, const FlowState &input);
+    void BindBranchByRef(Node *&n, Val &v, TypeExpr *pt, TypeExpr *declared, const FlowState *input);
     Val CheckInferredResult(Node *&n, FnSpec *tspec);
     // A parameter that takes the value -- a slice, or a fixed-class value
     // that a non-fixed one constructs by copy (an array of another kind
@@ -2438,7 +2449,7 @@ struct TypeCheck {
         auto &p = cur.nodepath;
         return c != nowait && p.size() > 1 && p.back().node == c && p[p.size() - 2].discovering;
     }
-    void CheckWaitingArg(Call *c, Node *a, const FlowState &input);
+    void CheckWaitingArg(Call *c, Node *a, const FlowState *input);
     void CalleesReturn(const vector<FnSpec *> &specs, bool argsreach);
     // `defaults`: the call may leave out parameters that have a default
     // (§7.1), which ResolveCall then passes. Tag dispatch and rendering

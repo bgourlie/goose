@@ -45,9 +45,13 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
         case B_STR: {
             // str(a, b, ...): a fresh u8[>..] holding the arguments' text,
             // built at the destination like any resizable result (§7.3).
-            for (size_t i = 0; i < args.size(); i++) CheckPrintable(c, d.name, args, i);
             auto t = GrowU8Array(c->line);
             c->rettypes.push_back(t);
+            for (size_t i = 0; i < args.size(); i++) {
+                CheckPrintable(c, d.name, args, i);
+                // Each argument's completed text is copied to the result.
+                NoteCallConstruction(c->rettypes);
+            }
             Val v;
             v.type = t;
             v.Set(TempRoot(), false);
@@ -475,21 +479,6 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
     bool empties = d.kind == B_CLEAR;
     if (d.kind == B_RESIZE) {
         auto length = CheckIntAny(args[1]);
-        int64_t lo, hi;
-        if (ak == A_GROW && IntConsts(length, lo, hi) && lo == 0 && hi == 0) {
-            empties = !length.constfrom;
-            // Rely on a named initializer only where clearing the tail can
-            // discharge a link. A local with no links needs no such promise.
-            auto owner = rv.Exact() ? rv.Root() : nullptr;
-            if (length.constfrom && HasRelRefT(elem) &&
-                (cur.deferring || !owner || !owner->ownerspec ||
-                 owner->ownerspec != CurRealFrame().spec || owner->elementlinks)) {
-                empties = true;
-                for (auto d = length.constfrom; d; d = d->constfrom)
-                    if (d->refwrite) empties = false;
-                if (empties) RelyOnNamed(length, args[1]);
-            }
-        }
         if (args.size() == 3) {
             ElemArg(args[2], elem, elementdest());
             // The fill value is built once and copied into every slot the
@@ -499,6 +488,21 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
                                    "copying a value of type ", TypeStr(elem), ", which "
                                    "contains self-relative references, is not supported; push "
                                    "the elements, which constructs each in place"));
+        }
+        int64_t lo, hi;
+        if (ak == A_GROW && reachable && IntConsts(length, lo, hi) && lo == 0 && hi == 0) {
+            empties = !length.constfrom;
+            // The fill has run. A local whose previous links are all dead
+            // needs no promise about the value of the named initializer.
+            auto owner = rv.Exact() ? rv.Root() : nullptr;
+            if (length.constfrom && HasRelRefT(elem) &&
+                (cur.deferring || !owner || !owner->ownerspec || IsClassRoot(owner) ||
+                 owner->ownerspec != CurRealFrame().spec || LiveElementLinks(owner))) {
+                empties = true;
+                for (auto d = length.constfrom; d; d = d->constfrom)
+                    if (d->refwrite) empties = false;
+                if (empties) RelyOnNamed(length, args[1]);
+            }
         }
     }
     // index_of recovers the element index a reference stands for (§3.3).
@@ -604,8 +608,15 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
                 // its expression runs (§1.3(4)).
                 auto logbase = cur.growlog.size();
                 auto inplace = BuiltInPlace(elem);
-                if (inplace) writesduringargs = reachable;
-                ElemArg(an, elem, elementdest());
+                Construction construction { true };
+                auto dest = elementdest();
+                if (inplace && hasdefers) {
+                    if (d.kind == B_PUSH) dest.construction = &construction;
+                    // Pool allocation claims a free slot before filling it.
+                    else writesduringargs = reachable;
+                }
+                ElemArg(an, elem, dest);
+                writesduringargs |= construction.started;
                 if (inplace)
                     CheckGrowsSince(logbase, rv,
                                     cat("the element ",
@@ -616,13 +627,24 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
             }
             case 'a': {  // An array/slice of the receiver's element type.
                 auto logbase = cur.growlog.size();
-                auto entered = reachable;
                 // An array literal is the run appended: its elements are the
                 // receiver's, constructed into its storage (§4.2).
                 auto al = Is<ArrayLit>(an);
                 if (al && al->capexpr) al = nullptr;
-                auto av = al ? CheckValueAt(an, AppendedRun(elem, al), elementdest())
-                             : CheckV(an, nullptr);
+                Construction construction { true, al };
+                Val av;
+                if (al) {
+                    auto dest = elementdest();
+                    if (hasdefers) dest.construction = &construction;
+                    av = CheckValueAt(an, AppendedRun(elem, al), dest);
+                } else {
+                    // A computed source's type determines whether its result
+                    // is built at the receiver. Observe its construction
+                    // without giving the source a new provenance.
+                    auto forwards = hasdefers && (Is<Call>(an) || IsBranchConstruct(an));
+                    Saved writing(curdst.construction, forwards ? &construction : nullptr);
+                    av = CheckV(an, nullptr);
+                }
                 an->exprtype = av.type;
                 auto t2 = av.type;
                 if (IsPlainRef(t2)) t2 = t2->ref->sub;
@@ -650,7 +672,7 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
                                     recvarr);
                     // Earlier elements can already occupy the receiver even
                     // when a later initializer never returns.
-                    writesduringargs = entered;
+                    writesduringargs = construction.started;
                 }
                 break;
             }

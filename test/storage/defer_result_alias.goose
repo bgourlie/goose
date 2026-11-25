@@ -26,6 +26,19 @@ fn read_rebound_alias() -> i64[] {
 }
 
 fn stop() -> i64 { abort("stop"); }
+fn numbers(n: i64 = stop()) -> i64[] { [n] }
+fn fixed_numbers(n: i64) -> i64[2] { [n, stop()] }
+struct Linked { n: i64, next: Linked&<u32>? }
+fn linked(n: i64) -> Linked { Linked { n: n } }
+
+fn stopped_push(flag: bool) -> Linked[>..] {
+    var out: Linked[>..] = [linked(41)];
+    let alias .= out;
+    defer { if flag { alias.push(linked(stop())); } }
+    defer { if flag { alias.append([linked(stop())]); } }
+    return out;
+}
+
 fn stopped_store(flag: bool) -> i64[] {
     var out: i64[] = [41];
     let alias .= out[0];
@@ -40,6 +53,9 @@ fn stopped_builtin(flag: bool) -> i64[>..] {
     defer { if flag { alias.pop_n(stop()); } }
     defer { if flag { alias.push(stop()); } }
     defer { if flag { alias.append([1, stop()]); } }
+    defer { if flag { alias.append(numbers(stop())); } }
+    defer { if flag { alias.append(if flag { numbers(stop()) } else { numbers() }); } }
+    defer { if flag { alias.append(fixed_numbers(1)); } }
     defer { if flag { alias.resize(2, stop()); } }
     return out;
 }
@@ -48,6 +64,7 @@ fn stopped_format(flag: bool) -> u8[>..] {
     var out: u8[>..] = [41];
     let alias .= out;
     defer { if flag { alias.format(stop()); } }
+    defer { if flag { alias.append(str(stop())); } }
     defer { if flag { alias.format(Stop {}); } }
     return out;
 }
@@ -101,6 +118,7 @@ fn main() {
     let unchanged = stopped_store(false);
     assert(unchanged[0] == 41);
     assert(stopped_builtin(false)[0] == 41);
+    assert(stopped_push(false)[0].n == 41);
     assert(stopped_format(false)[0] == 41);
     assert(stopped_limited_format(false).len == 0);
     assert(copied_source()[0] == 41);

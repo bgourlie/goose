@@ -1,7 +1,24 @@
 struct Node { next: Node&<u32>? }
 let ZERO = 0;
+let length = 0;
 
 fn clear(nodes: Node[>..]&) { nodes.clear(); }
+
+fn change(n: i64&) { n = 1; }
+
+fn resize_after_clear() {
+    var nodes: Node[>..] = [Node {}, Node {}];
+    nodes[0].next .= nodes[1];
+    nodes.clear();
+    nodes.push(Node {});
+    nodes.resize(length);
+    assert(nodes.len == 0);
+    change(length);
+    nodes.push(Node {});
+    nodes.push(Node {});
+    nodes.resize(length);
+    assert(nodes.len == 1);
+}
 
 fn clear_alias(nodes: Node[>..]&, direct: bool) {
     let alias .= nodes;
@@ -10,6 +27,7 @@ fn clear_alias(nodes: Node[>..]&, direct: bool) {
 }
 
 fn main() {
+    resize_after_clear();
     var resized: Node[>..] = [Node {}, Node {}];
     resized[0].next .= resized[1];
     resized.resize(1 - 1);
