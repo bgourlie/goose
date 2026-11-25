@@ -2362,10 +2362,10 @@ struct FnRecord {
         int param;
         string path;
         bool relative;
-        VarDef *global = nullptr;   // A directly named global, instead of a parameter.
+        VarDef *external = nullptr; // A directly named global or captured owner.
         set<int> writes; // Ordinary class stores that may survive this overwrite at the shrink.
         bool SamePart(const CallerKill &k) const {
-            return param == k.param && global == k.global && path == k.path && relative == k.relative;
+            return param == k.param && external == k.external && path == k.path && relative == k.relative;
         }
         bool operator==(const CallerKill &) const = default;
     };

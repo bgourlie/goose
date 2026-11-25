@@ -1263,7 +1263,8 @@ inline bool TypeCheck::RetainsRelativeSlot(TypeExpr *part, TypeExpr *array, Type
 
 // Consult only writes that reach this point. Captures and globals can
 // also carry links into a body from its caller, until a proven overwrite.
-inline ValueLinks TypeCheck::LiveElementLinks(VarDef *owner, TypeExpr *target, TypeExpr *replaced) {
+inline ValueLinks TypeCheck::LiveElementLinks(VarDef *owner, TypeExpr *target, TypeExpr *replaced,
+                                              bool callerchecks) {
     if (!owner->elementlinks) return {};
     auto t = owner->type ? LoadType(owner->type) : target;
     auto arr = target ? ResizableArrayIn(target) : nullptr;
@@ -1278,7 +1279,10 @@ inline ValueLinks TypeCheck::LiveElementLinks(VarDef *owner, TypeExpr *target, T
         (part.intail ? links.tail : links.other).Include(part.kind);
     }
     auto spec = CurRealFrame().spec;
-    if (!cleared && spec && (owner->isglobal || (owner->ownerspec && owner->ownerspec != spec))) {
+    // A named callee records shrinks of captured owners as external shrinks.
+    // Each caller checks its own incoming links when that summary is applied.
+    auto capture = owner->ownerspec && owner->ownerspec != spec;
+    if (!cleared && spec && (owner->isglobal || (capture && !callerchecks))) {
         for (size_t i = 0; i < spec->record.eventstart; i++) {
             auto &e = storeevents[i];
             if (e.container == owner && !(emptiestail && e.intail))
@@ -1746,7 +1750,7 @@ inline void TypeCheck::CheckLinkShrink(const LinkShrink &s) {
         cur.deferring->shrinks.emplace_back(s, CurrentLinkEffects());
         return;
     }
-    if (LiveElementLinks(s.owner, s.array, s.replaced).All().direction == EL_ANY)
+    if (LiveElementLinks(s.owner, s.array, s.replaced, !s.viaclass).All().direction == EL_ANY)
         Error(s.at, cat(s.operation, ": retained storage may have a self-relative link "
                         "to a removed element (§5.1)"));
     if (s.viaclass) return;
@@ -3040,7 +3044,8 @@ inline vector<FnRecord::CallerKill> TypeCheck::CallerKills(FnSpec *spec, bool re
     vector<FnRecord::CallerKill> out;
     if (cur.kills.empty()) return out;
     for (auto &k : cur.kills)
-        if (k.relative && k.base->isglobal && k.base == k.container)
+        if (k.relative && k.base == k.container && k.base->type &&
+            (k.base->isglobal || k.base->ownerspec != spec))
             out.push_back({ -1, k.path, true, k.base });
     for (size_t p = 0; p < spec->params.size(); p++) {
         auto param = spec->params[p];
@@ -3832,13 +3837,13 @@ inline void TypeCheck::ApplyCalleeShrinks(Node *at, FnSpec *spec, vector<Val> &a
     // value names keep the events of an earlier check of its body, which no
     // order says anything of, so a kill never empties one.
     auto mapkill = [&](const FnRecord::CallerKill &k) -> std::optional<Kill> {
-        if (k.global) return Kill { k.global, k.global, k.path, storesbase, true };
+        if (k.external) return Kill { k.external, k.external, k.path, storesbase, true };
         auto p = k.param;
         if (p < 0 || (size_t)p >= argnodes.size() || (size_t)p >= argvals.size()) return {};
         auto &v = argvals[(size_t)p];
         if (!v.Exact()) return {};
         auto x = v.Root();
-        if (!x || (!k.relative && x->isglobal) || IsTemp(x) || x->captured) return {};
+        if (!x || (!k.relative && (x->isglobal || x->captured)) || IsTemp(x)) return {};
         auto n = argnodes[(size_t)p];
         if (auto u = Is<Unary>(n); u && u->op == T_BITAND) n = u->child;
         VarDef *base = nullptr;

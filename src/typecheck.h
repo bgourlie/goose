@@ -2592,7 +2592,7 @@ struct TypeCheck {
     void GrowOnlyAssignKnown(Assign *a, const Roots &built, bool whole);
     bool RetainsRelativeSlot(TypeExpr *part, TypeExpr *array, TypeExpr *replaced);
     ValueLinks LiveElementLinks(VarDef *owner, TypeExpr *target = nullptr,
-                                  TypeExpr *replaced = nullptr);
+                               TypeExpr *replaced = nullptr, bool callerchecks = false);
     // Whether a shrink whose receiver has these roots knows the arrays it
     // frees: none is static data or a temporary (§5.1).
     static bool ShrinkRootsKnown(const Roots &roots) {
