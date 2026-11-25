@@ -3673,8 +3673,9 @@ Branches and dispatch cases join the writes from each returning path.
 A call summary identifies which stores survive at each shrink and on
 return, and which parts of the incoming storage were overwritten on every
 path. The caller applies the overwrites before projecting those surviving
-stores. A defer can relink storage on scope exit, so a later textual
-overwrite cannot erase its pending writes. A guaranteed overwrite of a
+stores. A defer records the link effects that reach each shrink and the
+effects that survive its body. Each exit from its lexical scope applies
+those effects in reverse registration order. A guaranteed overwrite of a
 global also applies at the shrink site. The final global check still
 accounts for external views.
 
@@ -4142,8 +4143,9 @@ lexically inside the body's scopes (`Frame::lexframe`). The flow state the
 body is checked in is the statement's less the narrowing of every `var`,
 which an assignment between the statement and an exit may undo; the flow
 after the statement is the flow before it, since the body's assignments
-happen at exits that nothing in the block observes. The body's stores,
-growths and shrinks are recorded like any statement's, and the lifetime
+happen at exits that nothing in the block observes. Checks on self-relative
+links use the flow at each exit, including loop back edges and returns.
+Other stores, growths and shrinks are recorded as usual, and the lifetime
 rules see the variables live at the statement, which are at least those
 live at any exit.
 

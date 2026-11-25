@@ -3441,6 +3441,7 @@ inline void TypeCheck::CheckSpecBodyOnce(FnSpec *spec, vector<Val> *argvals, Lin
                         } else {
                             vector<Val> vals = { tv };
                             RecordReturn(spec, vals, tail);
+                            ExitLinkDefers(frames[fi].scopebase);
                             NoteExit(fi);
                             reachable = false;
                         }
@@ -3470,6 +3471,8 @@ inline void TypeCheck::CheckSpecBodyOnce(FnSpec *spec, vector<Val> *argvals, Lin
             rr.set = true;
         }
     } else if (reachable) {
+        ExitLinkDefers(frames[fi].scopebase);
+        scopes.back().defers.clear();
         NoteExit(fi);
         if (spec->retsknown && !spec->rets.empty())
             Error(sf->body, cat("function ", sf->name,
@@ -3941,6 +3944,7 @@ inline void TypeCheck::CheckReturn(Return *r) {
         }
         RecordReturn(tspec, vals, r);
     }
+    ExitLinkDefers(std::max(frames[tf].scopebase, CurRealFrame().scopebase));
     NoteExit(tf);
     reachable = false;
 }

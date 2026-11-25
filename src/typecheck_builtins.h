@@ -1274,7 +1274,7 @@ inline ElementLinks TypeCheck::LiveElementLinks(VarDef *owner, TypeExpr *target,
     auto links = EL_NONE;
     for (auto &[part, at] : cur.links.live) {
         if (part.owner != owner || (emptiestail && part.intail)) continue;
-        if (owner->type && !part.pending && cleared && at < since) continue;
+        if (owner->type && cleared && at < since) continue;
         links = std::max(links, part.kind);
     }
     auto spec = CurRealFrame().spec;
@@ -1458,7 +1458,7 @@ inline void TypeCheck::NoteOverwrite(Node *lval, const Roots &loc, size_t at, bo
 }
 
 // The assignment overwrites old links; the stores made in its RHS start at
-// k.at and belong to the new value. A registered defer can still relink it.
+// k.at and belong to the new value.
 inline void TypeCheck::ApplyLinkKill(const Kill &k) {
     if (cur.links.live.empty()) return;
     auto owner = k.container;
@@ -1474,7 +1474,7 @@ inline void TypeCheck::ApplyLinkKill(const Kill &k) {
     bool tail = part && ResizableArrayIn(part);
     erase_if(cur.links.live, [&](const auto &entry) {
         auto &[place, at] = entry;
-        if (place.owner != owner || place.pending) return false;
+        if (place.owner != owner) return false;
         if (tail && place.intail && at < k.at) return true;
         if (!all || at >= since) return false;
         auto reached = storeevents[at].reached;
@@ -1642,9 +1642,8 @@ inline void TypeCheck::GrowOnlyShrinkAt(Node *c, const string &op, VarDef *vd,
     // The elements freed: of the array itself, or for a bound, of an array
     // of its type. A parameter class's storage is not known here.
     auto arrtype = ShrunkType(vd, bound);
-    if (LiveElementLinks(vd, arr ? arr : arrtype, effect.replaced) == EL_ANY)
-        Error(c, cat("cannot ", op, " ", what, ": retained storage may have a "
-                     "self-relative link to a removed element (§5.1)"));
+    CheckLinkShrink({ c, cat("cannot ", op, " ", what), vd, bound, arr ? arr : arrtype,
+                      effect.replaced, viaclass });
     CheckHeldShrinks(c, op, vd, what, true, bound);
     ShrinkScanVars([&](VarDef *v) {
         // The array's own holder is scanned as any other where the fields
@@ -1735,13 +1734,24 @@ inline void TypeCheck::GrowOnlyShrinkAt(Node *c, const string &op, VarDef *vd,
     // callers' to name: the class's bound stands for it at every call, where
     // the argument says what that storage holds.
     if (viaclass) return;
-    // What the other globals hold may yet be stored by functions not checked
-    // so far: they are judged once every one has been.
-    if (vd->isglobal) NoteGlobalShrink(c, cat("cannot ", op, " ", what), vd, bound,
-                                       effect.replaced);
     NoteLiveViews(c, cat("cannot ", op, " ", what), vd, what, true, bound);
     NoteShrink(vd, bound, effect);
-    NoteShrinkOrder(vd, bound);
+}
+
+// A deferred shrink observes both the writes in its own body up to this
+// point and the storage as it stands when the enclosing block exits.
+inline void TypeCheck::CheckLinkShrink(const LinkShrink &s) {
+    if (!reachable) return;
+    if (cur.deferring) {
+        cur.deferring->shrinks.emplace_back(s, CurrentLinkEffects());
+        return;
+    }
+    if (LiveElementLinks(s.owner, s.array, s.replaced) == EL_ANY)
+        Error(s.at, cat(s.operation, ": retained storage may have a self-relative link "
+                        "to a removed element (§5.1)"));
+    if (s.viaclass) return;
+    if (s.owner->isglobal) NoteGlobalShrink(s.at, s.operation, s.owner, s.bound, s.replaced);
+    NoteShrinkOrder(s.owner, s.bound);
 }
 
 // A field or element of a literal that is a reference, slice or holder:
@@ -1848,7 +1858,6 @@ inline void TypeCheck::RecordElementLinks(const Roots &owners, TypeExpr *reached
         AddStoreEvent(e);
         auto index = storeevents.size() - 1;
         cur.links.Add(storeevents.back(), index);
-        if (cur.deferwrites) cur.deferwrites->push_back(index);
     }
 }
 
@@ -4064,6 +4073,15 @@ inline void TypeCheck::ApplyCalleeShrinks(Node *at, FnSpec *spec, vector<Val> &a
     };
     for (auto &h : hits) apply(h, judge(h));
     ApplyCalleeLiveShrinks(at, spec, argvals, name);
+    // On a long-distance return this activation also unwinds. The callee
+    // may have written any of the replayed stores before taking that exit.
+    for (auto &exit : spec->outerexits) {
+        auto floor = frames[RealFrameIndex()].scopebase;
+        for (auto &f : frames) if (f.spec == exit.target) floor = std::max(floor, f.scopebase);
+        auto flow = SaveFlow();
+        ExitLinkDefers(floor);
+        RestoreFlow(flow);
+    }
     if (applyexits && ordered && !rec->unknownexitlinks) {
         cur.links = std::move(entrylinks);
         for (auto &k : rec->exitoverwrites) argkill(k, true);

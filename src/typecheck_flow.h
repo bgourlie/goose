@@ -21,6 +21,7 @@ inline void TypeCheck::PushScope(int kind, Node *node) {
 }
 
 inline void TypeCheck::PopScope() {
+    if (reachable) ExitLinkDefers((int)scopes.size() - 1);
     auto &s = scopes.back();
     // A `var x = []` that nothing ever pushed into has no type to give
     // codegen; the scope ending is the last chance to say so.
@@ -1893,6 +1894,8 @@ inline TypeCheck::Scope TypeCheck::CheckLoopPasses(Node *x, FlowState &head,
         cur.looppasses.push_back({ (int)scopes.size(), firstbase, storeevents.size(), settled });
         PushScope(SK_LOOP, x);
         pass();
+        if (reachable) ExitLinkDefers((int)scopes.size() - 1);
+        scopes.back().defers.clear();
         auto &s = scopes.back();
         if (reachable) {
             s.backedge = s.backedges ? JoinFlow(s.backedge, SaveFlow()) : SaveFlow();
@@ -2262,6 +2265,7 @@ inline void TypeCheck::CheckBreak(Break *b) {
 inline void TypeCheck::NoteBreak(int si) {
     auto &sc = scopes[si];
     if (!reachable) return;
+    ExitLinkDefers(si);
     sc.hasbreak = true;
     sc.breakflow = sc.breakflows ? JoinFlow(sc.breakflow, SaveFlow()) : SaveFlow();
     sc.breakflows = true;
@@ -2285,6 +2289,8 @@ inline void TypeCheck::CheckContinue(Node *n) {
     if (si == -2) Error(n, "continue cannot cross a const for expansion boundary");
     if (si == -3) JumpLeavesDefer(n, "continue");
     if (si < 0) Error(n, "continue outside of a loop");
+    if (!reachable) return;
+    ExitLinkDefers(si);
     auto &sc = scopes[si];
     sc.backedge = sc.backedges ? JoinFlow(sc.backedge, SaveFlow()) : SaveFlow();
     sc.backedges = true;
@@ -2322,16 +2328,60 @@ inline void TypeCheck::CheckDefer(Defer *d) {
         for (auto v : g->defs)
             if (v->isvar) v->narrowed = nullptr;
     PushScope(SK_DEFER, d);
-    vector<size_t> writes;
-    Saved<vector<size_t> *> collecting(cur.deferwrites, &writes);
-    deferbodies++;
-    CheckBlockVal(d->body, nullptr, false);
-    deferbodies--;
+    DeferredLinks effects;
+    {
+        Saved collecting(cur.deferring, &effects);
+        cur.links.live.clear();
+        erase_if(cur.kills, [](const Kill &k) { return k.relative; });
+        deferbodies++;
+        CheckBlockVal(d->body, nullptr, false);
+        deferbodies--;
+        effects.exit = CurrentLinkEffects();
+    }
     PopScope();
     RestoreFlow(saved);
-    for (auto i : writes) cur.links.Add(storeevents[i], i, true);
-    if (collecting.saved) collecting.saved->insert(collecting.saved->end(), writes.begin(), writes.end());
+    if (reachable && (!effects.shrinks.empty() || !effects.exit.writes.live.empty() ||
+                      !effects.exit.overwrites.empty()))
+        scopes.back().defers.push_back(std::move(effects));
     d->exprtype = ast.voidtype;
+}
+
+inline TypeCheck::LinkEffects TypeCheck::CurrentLinkEffects() {
+    LinkEffects effects;
+    for (auto &k : cur.kills) if (k.relative) effects.overwrites.push_back(k);
+    effects.writes = cur.links;
+    return effects;
+}
+
+inline void TypeCheck::ApplyLinkEffects(const LinkEffects &effects) {
+    auto base = storeevents.size();
+    for (auto k : effects.overwrites) {
+        erase_if(cur.kills, [&](const Kill &old) { return old.SamePart(k); });
+        k.at = base;
+        cur.kills.push_back(k);
+        ApplyLinkKill(k);
+    }
+    // Timestamp surviving writes at execution. A subsequent assignment
+    // must be able to discard them even on a second exit or loop pass.
+    for (auto &[part, at] : effects.writes.live) {
+        storeevents.push_back(storeevents[at]);
+        cur.links.Add(storeevents.back(), storeevents.size() - 1);
+    }
+}
+
+inline void TypeCheck::ExitLinkDefers(int first) {
+    if (!reachable) return;
+    for (auto i = (int)scopes.size(); i-- > first;) {
+        for (auto it = scopes[i].defers.rbegin(); it != scopes[i].defers.rend(); ++it) {
+            for (auto &[shrink, before] : it->shrinks) {
+                Saved links(cur.links, cur.links);
+                Saved kills(cur.kills, cur.kills);
+                ApplyLinkEffects(before);
+                CheckLinkShrink(shrink);
+            }
+            ApplyLinkEffects(it->exit);
+        }
+    }
 }
 
 // Whether the code being checked is written in a defer body: one of the

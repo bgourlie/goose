@@ -278,12 +278,11 @@ struct TypeCheck {
             ElementLinks kind;
             bool intail;
             int summary;
-            bool pending;  // A defer may write this part on scope exit.
             auto operator<=>(const Part &) const = default;
         };
         map<Part, size_t> live;
-        void Add(const StoreEvent &e, size_t index, bool pending = false) {
-            live[{e.container, e.elementlinks, e.intail, e.linkclass, pending}] = index;
+        void Add(const StoreEvent &e, size_t index) {
+            live[{e.container, e.elementlinks, e.intail, e.linkclass}] = index;
         }
         void Join(const LinkFlow &other) {
             for (auto &[part, at] : other.live) {
@@ -345,7 +344,24 @@ struct TypeCheck {
         // A variable's own storage.
         Dest(VarDef *vd, bool vb = false) : varbind(vb) { roots.Set(vd, true); }
     };
+    // Relative writes that survive a block, and parts it overwrites on every path.
+    struct LinkEffects {
+        vector<Kill> overwrites;
+        LinkFlow writes;
+    };
+    struct LinkShrink {
+        Node *at;
+        string operation;
+        VarDef *owner;
+        TypeExpr *bound, *array, *replaced;
+        bool viaclass;
+    };
+    struct DeferredLinks {
+        vector<pair<LinkShrink, LinkEffects>> shrinks;
+        LinkEffects exit;
+    };
     struct Scope {
+        vector<DeferredLinks> defers;
         int kind = SK_PLAIN;
         int serial = 0;              // Unique per scope opened: tells a later one at its index apart.
         int varbase = 0;
@@ -2509,6 +2525,10 @@ struct TypeCheck {
     int deferbodies = 0;
     unordered_map<Defer *, vector<VarDef *>> defermentions;
     void CheckDefer(Defer *d);
+    LinkEffects CurrentLinkEffects();
+    void ApplyLinkEffects(const LinkEffects &effects);
+    void CheckLinkShrink(const LinkShrink &shrink);
+    void ExitLinkDefers(int first);
     bool InDeferBody();
     void NoteDeferMention(VarDef *v);
     void CheckDefers();
@@ -2897,7 +2917,7 @@ struct TypeCheck {
         LinkFlow links;
         // (program event, summary index) for ordinary class writes in this body.
         vector<pair<size_t, int>> classwrites;
-        vector<size_t> *deferwrites = nullptr; // Writes made while checking a deferred body.
+        DeferredLinks *deferring = nullptr; // Relative effects of the defer body being checked.
         // The parts of holders emptied on every path here (Kill), part of
         // the flow state, which a branch joins and a loop's head takes.
         vector<Kill> kills;
