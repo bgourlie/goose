@@ -1086,9 +1086,9 @@ inline FnSpec *TypeCheck::UserFormatIn(Call *c, TypeExpr *t, string_view ns,
                          "self-relative references, into the format overload taking it by "
                          "value is not supported; take it by reference"));
         auto sp = GetOrCreateSpec(mi, argvals, c);
-        // A kill in the value empties the argument's part, where it is all
-        // of the value; the builder has no node here, and holds no references.
-        ApplyCalleeStorage(c, sp, argvals, "format", { nullptr, arg }, false);
+        // A hook for the whole argument runs once. A nested hook may be
+        // skipped, e.g. when rendering an empty array of that element type.
+        ApplyCalleeStorage(c, sp, argvals, "format", { nullptr, arg }, arg != nullptr);
         ApplyCalleeRebinds(sp);
         c->fmtspecs.push_back({ t, sp });
         return sp;
