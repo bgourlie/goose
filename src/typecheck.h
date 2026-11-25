@@ -1350,6 +1350,8 @@ struct TypeCheck {
     void NoUntypedEmptyArray(const Val &v, Node *at, string_view use);
     TypeExpr *PendingElemFrom(const Val &av, Node *at);
     TypeExpr *PendingElemFromSeq(const Val &av, Node *at);
+    enum class PendingInput { Element, Sequence };
+    void InferPendingArray(TypeExpr *arrt, Node *input, Node *at, PendingInput kind);
     void CompletePending(TypeExpr *arrt, TypeExpr *elem, Line l);
     // The pending arrays of `reusable` declarations, by the pool each is the
     // type of: whatever completes one gives a pool its element (§5.4).

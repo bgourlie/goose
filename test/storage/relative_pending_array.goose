@@ -17,5 +17,10 @@ fn main() {
     var appended = [];
     appended.append([mark(other)]);
     assert(other[0].next .== other[1] && appended[0] == 42);
+
+    var third: Node[>..] = [Node {}, Node {}];
+    var assigned = [];
+    assigned = [mark(third)];
+    assert(third[0].next .== third[1] && assigned[0] == 42);
     print("ok");
 }

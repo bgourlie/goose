@@ -402,19 +402,8 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
         auto rt = rv.type;
         if (IsPlainRef(rt)) rt = rt->ref->sub;
         if (d.args[0] == 'e' || d.args[0] == 'a') {
-            // Only the type is inferred here. The argument is checked at
-            // its destination below, from the state after the receiver.
-            auto entry = SaveFlow();
-            auto growbase = cur.growlog.size();
-            auto av = DecayRef(CheckV(args[1], nullptr));
-            if (d.args[0] == 'e') {
-                JudgeCastAt(args[1], nullptr, av);
-                CompletePending(rt, PendingElemFrom(av, args[1]), c->line);
-            } else {
-                CompletePending(rt, PendingElemFromSeq(av, c), c->line);
-            }
-            RestoreFlow(entry);
-            cur.growlog.resize(growbase);
+            InferPendingArray(rt, args[1], c, d.args[0] == 'e' ? PendingInput::Element
+                                                               : PendingInput::Sequence);
         } else if (d.kind == B_FORMAT) {
             CompletePending(rt, ast.inttypes[IS_U8], c->line);
         } else {

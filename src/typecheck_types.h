@@ -580,6 +580,22 @@ inline TypeExpr *TypeCheck::PendingElemFromSeq(const Val &av, Node *at) {
     return elem;
 }
 
+// Only the element type survives this probe. The caller checks the input
+// again at its destination, where its flow and growth effects take place.
+inline void TypeCheck::InferPendingArray(TypeExpr *arrt, Node *input, Node *at, PendingInput kind) {
+    auto entry = SaveFlow();
+    auto growbase = cur.growlog.size();
+    auto av = DecayRef(CheckV(input, nullptr));
+    if (kind == PendingInput::Element) {
+        JudgeCastAt(input, nullptr, av);
+        CompletePending(arrt, PendingElemFrom(av, input), at->line);
+    } else {
+        CompletePending(arrt, PendingElemFromSeq(av, at), at->line);
+    }
+    RestoreFlow(entry);
+    cur.growlog.resize(growbase);
+}
+
 inline void TypeCheck::CompletePending(TypeExpr *arrt, TypeExpr *elem, Line l) {
     arrt->arr->sub = elem;
     ValidateType(arrt, l, VT_LOCAL);

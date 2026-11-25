@@ -3114,8 +3114,7 @@ inline void TypeCheck::CheckAssign(Assign *a) {
     }
     if (IsPendingArray(target)) {
         // `var x = []; x = other;` completes x from the assigned array.
-        auto av = DecayRef(CheckV(a->rhs, nullptr));
-        CompletePending(target, PendingElemFromSeq(av, a), a->line);
+        InferPendingArray(target, a->rhs, a, PendingInput::Sequence);
     }
     // An uninitialized local's first assignment constructs it; every other
     // assignment of a resizable array, or of a value holding one, replaces
