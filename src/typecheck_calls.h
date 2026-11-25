@@ -500,8 +500,7 @@ inline Val TypeCheck::ResolveCall(Call *c, vector<SFunction *> &cands, FnSpec *e
     RecheckArgs(c, cands, best, denv, argnodes, -1, {}, entryreach, entrylinks);
     // An argument can overwrite the same storage that the callee links.
     // Apply the body effects after both passes over the arguments.
-    ApplyCalleeShrinks(c, spec, argvals, name, argnodes, true);
-    ApplyCalleeGrows(c, spec, argvals, name);
+    ApplyCalleeStorage(c, spec, argvals, name, argnodes, true);
     // A C function's parameters are what they say (§7.10): a read-only
     // reference or slice needs the parameter declared const.
     if (best.sf->isextern) {
@@ -1390,8 +1389,7 @@ inline Val TypeCheck::TryDispatch(Call *c, vector<SFunction *> &cands, FnSpec *e
         armvals[found] = argvals[found];
         armvals[found].type = caseargs[vi];
         RestoreFlow(entry);
-        ApplyCalleeShrinks(c, spec, armvals, name, argnodes, true);
-        ApplyCalleeGrows(c, spec, armvals, name);
+        ApplyCalleeStorage(c, spec, armvals, name, argnodes, true);
         CheckCalleeRelative(c, spec, argvals);
         auto rec = RecordOf(spec);
         if (!rec || rec->mayreturn) exits = JoinFlow(exits, SaveFlow());
@@ -3012,6 +3010,12 @@ inline bool TypeCheck::SameRecord(const FnRecord &a, const FnRecord &b, const Fn
         return false;
     };
     auto sametype = [&](TypeExpr *x, TypeExpr *y) { return !x == !y && (!x || TypeEq(x, y)); };
+    if (a.storagewrites.size() != b.storagewrites.size() ||
+        !is_permutation(a.storagewrites.begin(), a.storagewrites.end(), b.storagewrites.begin(),
+            [&](const auto &p, const auto &q) {
+                return p.root == q.root && p.exact == q.exact && p.indirect == q.indirect &&
+                       sametype(p.type, q.type);
+            })) return why("storage writes");
     if (a.relativestores.size() != b.relativestores.size()) return why("relative destinations");
     for (auto &p : a.relativestores)
         if (none_of(b.relativestores.begin(), b.relativestores.end(), [&](const auto &q) {
@@ -3152,6 +3156,10 @@ inline void TypeCheck::CheckSpecBodyOnce(FnSpec *spec, vector<Val> *argvals, Lin
     // and the call site replays this body's shrinks and growths against
     // the caller's statement and constructions from the summary.
     BodyScope bodyscope(*this);
+    // main starts with the relative links left by global initialization.
+    // Ordinary callees check incoming global links when their shrink
+    // summary is applied, including later calls to the same specialization.
+    if (!argvals && !sf->isthread) cur.links = bodyscope.saved.links;
     frames[fi].bodyidx = (int)outerbodies.size();
     auto savereach = reachable;
     DestScope ds(*this, Dest {});
@@ -4021,8 +4029,9 @@ inline Val TypeCheck::CheckFunValCall(Call *c, const FnValBind &fb, TypeExpr *ex
     auto fv = fb.fv;
     auto entryreach = reachable;
     // The body runs in this body's state, as part of the calling statement:
-    // kills hold neither into it nor out of it (Kill), as across any call.
-    cur.kills.clear();
+    // ordinary holder overwrites do not cross the call. Relative writes and
+    // overwrites flow through the checked body just like other inline code.
+    erase_if(cur.kills, [](const Kill &k) { return !k.relative; });
     auto entrylinks = CurrentLinkEffects();
     if (!c->tyargs.empty()) Error(c, "a block takes no type arguments");
     vector<Val> argvals;
@@ -4115,6 +4124,10 @@ inline Val TypeCheck::CheckFunValCall(Call *c, const FnValBind &fb, TypeExpr *ex
         if (IsRefOrSlice(ptypes[i])) {
             BindRefProvenance(vd, argvals[i]);
             if (ptypes[i]->cq) vd->ref.writable = false;
+            if (!vd->isvar && IsPlainRef(ptypes[i]) && HasRelRefT(ptypes[i]->ref->sub)) {
+                if (auto k = ArgumentKill(c->args[i], argvals[i], ptypes[i]->ref->sub, true, 0))
+                    cur.blockargpaths.emplace(vd, std::move(*k));
+            }
         } else {
             if (argvals[i].elementlinks)
                 RecordElementLinks(RootsOf(vd), ptypes[i], argvals[i].elementlinks, c->args[i]);
@@ -4161,7 +4174,8 @@ inline Val TypeCheck::CheckFunValCall(Call *c, const FnValBind &fb, TypeExpr *ex
     if (needslocation && resultdest.used) *resultdest.used = true;
     PopScope();
     frames.pop_back();
-    cur.kills.clear();
+    for (auto vd : c->fvparams) cur.blockargpaths.erase(vd);
+    erase_if(cur.kills, [](const Kill &k) { return !k.relative; });
     // The result has the calling statement's lifetime (§9.2), with no
     // storage to bind by reference even where the tail names a variable.
     // Fresh construction still uses the receiver (BuiltWhereReceived).

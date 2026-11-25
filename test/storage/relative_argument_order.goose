@@ -1,4 +1,5 @@
 struct Node { next: Node&<u32>? }
+struct Pair<T> { first: T, second: T }
 enum Action { One, Two }
 
 fn remove(nodes: Node[>..]&) -> i64 { nodes.pop_n(1); return nodes.len; }
@@ -18,5 +19,8 @@ fn main() {
     nodes = [Node {}, Node {}, Node {}];
     dispatch(remove(nodes), choose(nodes));
     assert(nodes[0].next .== nodes[1]);
+    nodes = [Node {}, Node {}, Node {}];
+    let pair = Pair { first: remove(nodes), second: link(nodes) };
+    assert(pair.first == 2 && pair.second == 2 && nodes[0].next .== nodes[1]);
     print("ok");
 }

@@ -737,7 +737,10 @@ inline VarDef *TypeCheck::NewVar(string_view name, TypeExpr *type, Line l, bool 
 inline VarDef *TypeCheck::LookupVar(string_view name, string_view ns, Node *use) {
     auto top = (int)frames.size() - 1;
     for (auto i = (int)vars.size() - 1; i >= frames[top].varbase; i--)
-        if (vars[i]->name == name) return vars[i];
+        if (vars[i]->name == name) {
+            if (use && deferbodies) NoteDeferMention(vars[i]);
+            return vars[i];
+        }
     VarDef *found = nullptr;
     ForOuterVars(top, [&](VarDef *v) {
         if (v->name != name) return false;
@@ -747,6 +750,7 @@ inline VarDef *TypeCheck::LookupVar(string_view name, string_view ns, Node *use)
     });
     if (found) {
         if (use) NoteEnvRead(found);
+        if (use && deferbodies) NoteDeferMention(found);
         return found;
     }
     if (use) DefaultScopeName(name, use, false);
@@ -2323,6 +2327,45 @@ inline void TypeCheck::CheckDefer(Defer *d) {
     if (frames.back().isdefault || !real.sf || !real.spec)
         Error(d, "defer outside of a function: a global initializer has no scope exit (§6.6)");
     real.spec->hasdefer = true;
+    auto effects = CheckDeferredBody(d);
+    if (reachable) {
+        auto bindings = DeferBindings(d);
+        if (!bindings.empty()) {
+            effects.env = make_shared<DeferEnv>(DeferEnv { d, frames.size(), scopes.size(),
+                vars.size(), localfns.size(), scopes.back().defers.size(), blockpos, cur.nodepath,
+                SaveFlow(), std::move(bindings) });
+        }
+        if (effects.env || !effects.shrinks.empty() || !effects.exit.writes.live.empty() ||
+            !effects.exit.overwrites.empty())
+            scopes.back().defers.push_back(std::move(effects));
+    }
+    d->exprtype = ast.voidtype;
+}
+
+// Only a reference binding or holder the defer reads can give an existing
+// access a new destination. Follow aliases to their holders as well.
+inline vector<EnvRead> TypeCheck::DeferBindings(Defer *d) {
+    set<VarDef *> seen;
+    vector<EnvRead> bindings;
+    auto visit = [&](auto &&self, VarDef *v) -> void {
+        if (!v || v->isglobal || !seen.insert(v).second) return;
+        if (v->type && HoldsPlainRef(v->type))
+            bindings.push_back(EnvReadOf(v));
+        self(self, v->heldholder);
+        self(self, v->heldslice);
+        for (auto &a : v->ref.alts) self(self, a.root);
+        for (auto &a : v->contents.alts) self(self, a.root);
+    };
+    if (auto it = defermentions.find(d); it != defermentions.end())
+        for (auto v : it->second) visit(visit, v);
+    vector<FnSpec *> callees;
+    CalledSpecs(d->body, callees);
+    for (auto s : callees)
+        for (auto &r : s->envreads) visit(visit, r.var);
+    return bindings;
+}
+
+inline TypeCheck::DeferredLinks TypeCheck::CheckDeferredBody(Defer *d) {
     auto saved = SaveFlow();
     for (auto &e : saved.locals)
         if (e.var->isvar) e.var->narrowed = nullptr;
@@ -2342,10 +2385,38 @@ inline void TypeCheck::CheckDefer(Defer *d) {
     }
     PopScope();
     RestoreFlow(saved);
-    if (reachable && (!effects.shrinks.empty() || !effects.exit.writes.live.empty() ||
-                      !effects.exit.overwrites.empty()))
-        scopes.back().defers.push_back(std::move(effects));
-    d->exprtype = ast.voidtype;
+    return effects;
+}
+
+// Ref/holder provenance grows as later bindings are checked. Usually the
+// declaration-time summary still applies. If an owner changed, resolve the
+// body with the enlarged roots and its original lexical environment.
+inline void TypeCheck::RefreshDeferredBody(DeferredLinks &effects) {
+    auto env = effects.env;
+    if (!env || none_of(env->bindings.begin(), env->bindings.end(), [](const EnvRead &r) {
+            return r.ref != r.var->ref || r.contents != r.var->contents;
+        })) return;
+    auto exit = SaveFlow();
+    {
+        auto prefix = [](const auto &v, size_t n) {
+            return std::decay_t<decltype(v)>(v.begin(), v.begin() + n);
+        };
+        Saved fs(frames, prefix(frames, env->nframes));
+        Saved ss(scopes, prefix(scopes, env->nscopes));
+        Saved vs(vars, prefix(vars, env->nvars));
+        Saved ls(localfns, prefix(localfns, env->nfns));
+        Saved bs(blockpos, env->blocks);
+        Saved ps(cur.nodepath, env->path);
+        scopes.back().defers.resize(env->ndefers);
+        RestoreFlow(env->entry);
+        auto updated = CheckDeferredBody(env->body);
+        effects.shrinks = std::move(updated.shrinks);
+        effects.exit = std::move(updated.exit);
+        // The new binding may itself lead to a holder whose contents can change.
+        effects.env = make_shared<DeferEnv>(*env);
+        effects.env->bindings = DeferBindings(env->body);
+    }
+    RestoreFlow(exit);
 }
 
 inline TypeCheck::LinkEffects TypeCheck::CurrentLinkEffects() {
@@ -2383,6 +2454,7 @@ inline void TypeCheck::ExitLinkDefers(int first) {
     if (!reachable) return;
     for (auto i = (int)scopes.size(); i-- > first;) {
         for (auto it = scopes[i].defers.rbegin(); it != scopes[i].defers.rend(); ++it) {
+            RefreshDeferredBody(*it);
             for (auto &[shrink, before] : it->shrinks) {
                 Saved links(cur.links, cur.links);
                 Saved kills(cur.kills, cur.kills);
@@ -2427,6 +2499,82 @@ inline void TypeCheck::NoteDeferMention(VarDef *v) {
     }
 }
 
+// The destination of an actual write. A read or the creation of a writable
+// reference alone does not change the named result. Writes in a named callee
+// are recorded on its external roots and mapped when a defer calls it.
+inline void TypeCheck::NoteStorageWrite(const Roots &storage, TypeExpr *type) {
+    if (!hasdefers || !reachable) return;
+    auto &frame = CurRealFrame();
+    auto spec = frame.spec;
+    if (!spec) return;
+    auto note = [&](VarDef *root, bool exact, bool indirect) {
+        if (!root || root->isglobal || IsTemp(root)) return;
+        if (deferbodies && root->ownerspec == spec) {
+            for (auto i = frame.scopebase; i < (int)scopes.size(); i++)
+                if (scopes[i].kind == SK_DEFER)
+                    deferwrites[(Defer *)scopes[i].node].insert(root);
+        }
+        if (root->ownerspec == spec) return;
+        auto &writes = spec->record.storagewrites;
+        for (auto &w : writes)
+            if (w.root == root && w.exact == exact && w.indirect == indirect && TypeEq(w.type, type)) return;
+        writes.push_back({ root, type, exact, indirect });
+    };
+    for (auto &a : storage.alts) {
+        if (!a.root || a.root->isglobal) continue; // No global can point into the local result.
+        if (a.exact || IsClassRoot(a.root)) {
+            note(a.root, a.exact, !a.exact && a.from == a.root);
+        } else {
+            // A lifetime bound can cover more than one storage owner.
+            auto candidates = RootCandidates(type, Depth(a.root), false, true, true);
+            for (auto &c : candidates.alts) note(c.root, c.exact, false);
+        }
+    }
+}
+
+inline void TypeCheck::ApplyCalleeWrites(FnSpec *spec, const vector<Val> &args) {
+    if (!hasdefers || !reachable) return;
+    if (spec->sf->isextern) {
+        for (size_t p = 0; p < args.size() && p < spec->argtypes.size(); p++) {
+            auto t = spec->argtypes[p];
+            if (IsRefOrSlice(t) && !t->cq) NoteStorageWrite(args[p], PointeeOf(t));
+        }
+        return;
+    }
+    auto rec = RecordOf(spec);
+    if (!rec) return;
+    for (auto &w : rec->storagewrites) {
+        auto roots = MapClass(spec, w.root, args);
+        if (!w.exact) {
+            auto owner = HolderSource(roots);
+            Roots contents;
+            if (w.indirect && owner && ContentsReadBack(owner, w.type, contents))
+                roots = std::move(contents);
+            else {
+                roots.Weaken();
+                if (w.indirect)
+                    for (auto &a : roots.alts) a.from = a.root;
+            }
+        }
+        NoteStorageWrite(roots, w.type);
+    }
+}
+
+// Specializations reached directly by the checked tree, including implicit
+// format hooks and dispatch, and the bodies of inlined function values.
+inline void TypeCheck::CalledSpecs(Node *n, vector<FnSpec *> &to) {
+    if (!n) return;
+    auto add = [&](FnSpec *k) {
+        if (k && find(to.begin(), to.end(), k) == to.end()) to.push_back(k);
+    };
+    if (auto c = Is<Call>(n)) {
+        if (c->builtin < 0) add(c->spec);
+        for (auto k : c->dispatch) add(k);
+        for (auto &[t, k] : c->fmtspecs) add(k);
+    }
+    RunChildren(n, [&](Node *ch) { CalledSpecs(ch, to); });
+}
+
 // Checked once every specialization is: what a defer body calls, and what
 // it names of its function's result.
 //
@@ -2459,26 +2607,11 @@ inline void TypeCheck::CheckDefers() {
     for (auto sp : ast.fnspecs)
         if (sp->hasdefer && sp->body && !sp->failed) withdefers.push_back(sp);
     if (withdefers.empty()) return;
-    // The callees of every body, then the flag: the callee each
-    // specialization gets the machinery through, or itself where it has a
-    // site or propagates.
     unordered_map<FnSpec *, vector<FnSpec *>> callees;
     unordered_map<FnSpec *, FnSpec *> rfvia;
-    auto add = [&](vector<FnSpec *> &to, FnSpec *k) {
-        if (k && find(to.begin(), to.end(), k) == to.end()) to.push_back(k);
-    };
-    function<void(Node *, vector<FnSpec *> &)> collect = [&](Node *n, vector<FnSpec *> &to) {
-        if (!n) return;
-        if (auto c = Is<Call>(n)) {
-            if (c->builtin < 0) add(to, c->spec);
-            for (auto k : c->dispatch) add(to, k);
-            for (auto &[t, k] : c->fmtspecs) add(to, k);
-        }
-        RunChildren(n, [&](Node *ch) { collect(ch, to); });
-    };
     for (auto sp : ast.fnspecs) {
         if (!sp->body) continue;
-        collect(sp->body, callees[sp]);
+        CalledSpecs(sp->body, callees[sp]);
         if (!sp->needs.empty()) rfvia[sp] = sp;
     }
     for (auto changed = true; changed;) {
@@ -2505,7 +2638,7 @@ inline void TypeCheck::CheckDefers() {
             if (auto d = Is<Defer>(n)) {
                 CheckItem([&] {
                     vector<FnSpec *> ks;
-                    collect(d->body, ks);
+                    CalledSpecs(d->body, ks);
                     for (auto k : ks) {
                         if (!rfvia.count(k)) continue;
                         // The chain from the callee to the specialization
@@ -2534,6 +2667,10 @@ inline void TypeCheck::CheckDefers() {
                             if (isnamed(r.var))
                                 Error(d, cat("defer body calls ", k->sf->qname, ", which names ",
                                              why(r.var)));
+                    if (auto it = deferwrites.find(d); it != deferwrites.end())
+                        for (auto v : named)
+                            if (it->second.count(v))
+                                Error(d, cat("defer body writes through an alias to ", why(v)));
                 });
             }
             RunChildren(n, walk);
@@ -2896,6 +3033,7 @@ inline void TypeCheck::CheckAssign(Assign *a) {
     auto held = lv;
     auto throughref = a->op != T_DOTASSIGN && IsPlainRef(held.type);
     if (throughref) DerefLValue(held, a->lval);
+    NoteStorageWrite(held, held.type);
     // A shrink only frees element storage. A field path from a variable, or
     // from a reference to a resizable value, stays in that value's own
     // storage (a frame object's prefix included). A path through an element,
@@ -3298,6 +3436,7 @@ inline void TypeCheck::CheckIncDec(IncDec *x) {
     if (IsPlainRef(lv.type)) {
         st = lv.type->ref->sub;
         writable = PointeeWritable(lv, x);
+        DerefLValue(lv, x);
     } else {
         NoCopyWrite(x, lv);
         NoLetAssign(x, lv);
@@ -3308,6 +3447,7 @@ inline void TypeCheck::CheckIncDec(IncDec *x) {
     if (!IsIntT(st))
         Error(x, cat(TName(x->op), " requires an integer lvalue, got ", TypeStr(st)));
     if (st->ix) NoIndexUpdate(x, TName(x->op), st);
+    NoteStorageWrite(lv, st);
 }
 
 // An update computes a plain integer, which an index or bound type does not

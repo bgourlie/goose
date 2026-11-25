@@ -2576,7 +2576,10 @@ Restrictions, all checked statically:
   would disturb the first's state.
 * The body does not name a local the function returns by name: that local
   is built at its result destination (§7.3), and is complete when the body
-  runs.
+  runs. A write through an alias to any part of that storage is also an
+  error, including a write performed by a function the body calls. An
+  alias may be read. A reference stored in the result may still be used
+  to modify a separate object it points to.
 * The body is checked where it is written: it names what is declared
   before it, and a `var` optional narrowed before it is not narrowed in it,
   since an assignment before an exit may have undone that. What the body

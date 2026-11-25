@@ -362,6 +362,7 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
         if ((d.flags & BF_WRITE) && !rv.writable)
             Error(c, cat("cannot .", d.name, " through a non-writable value "
                          "(let, const, or a read-only instantiation, §9.5)"));
+        if (d.flags & BF_WRITE) NoteStorageWrite(rv, rt->kind == TY_SLICE ? elem : rt);
         // A reference that may point at such a pool, but is not a pool
         // reference, says so.
         auto notpoolref = [&](int ru) -> string {
@@ -795,6 +796,7 @@ inline void TypeCheck::CheckByteOut(Call *c, Node *out, const string &form) {
         Error(c, "cannot append through a non-writable value (let, or "
                  "non-writable provenance, §9.5)");
     NoteGrow(c, ov, cat(BuiltinByKind(c->builtin).grows, " ", ExprStr(out)), ot);
+    NoteStorageWrite(ov, ot);
 }
 
 // An argument of print/str/format (§3.7): every value type has a text
@@ -1086,9 +1088,8 @@ inline FnSpec *TypeCheck::UserFormatIn(Call *c, TypeExpr *t, string_view ns,
         auto sp = GetOrCreateSpec(mi, argvals, c);
         // A kill in the value empties the argument's part, where it is all
         // of the value; the builder has no node here, and holds no references.
-        ApplyCalleeShrinks(c, sp, argvals, "format", { nullptr, arg });
+        ApplyCalleeStorage(c, sp, argvals, "format", { nullptr, arg }, false);
         ApplyCalleeRebinds(sp);
-        ApplyCalleeGrows(c, sp, argvals, "format");
         c->fmtspecs.push_back({ t, sp });
         return sp;
     }
@@ -1282,7 +1283,7 @@ inline ValueLinks TypeCheck::LiveElementLinks(VarDef *owner, TypeExpr *target, T
     // A named callee records shrinks of captured owners as external shrinks.
     // Each caller checks its own incoming links when that summary is applied.
     auto capture = owner->ownerspec && owner->ownerspec != spec;
-    if (!cleared && spec && (owner->isglobal || (capture && !callerchecks))) {
+    if (!cleared && spec && !callerchecks && (owner->isglobal || capture)) {
         for (size_t i = 0; i < spec->record.eventstart; i++) {
             auto &e = storeevents[i];
             if (e.container == owner && !(emptiestail && e.intail))
@@ -1410,8 +1411,14 @@ inline bool TypeCheck::KillPath(Node *n, VarDef *&base, string &path) {
         auto vd = id->vdef;
         if (!vd || vd->istemp) return false;
         if (IsRefOrSlice(vd->type) && (vd->type->kind != TY_REF || vd->isvar)) return false;
-        base = vd;
-        path.clear();
+        auto binding = cur.blockargpaths.find(vd);
+        if (binding == cur.blockargpaths.end()) {
+            base = vd;
+            path.clear();
+        } else {
+            base = binding->second.base;
+            path = binding->second.path;
+        }
         return true;
     }
     auto d = Is<Dot>(n);
@@ -1425,6 +1432,25 @@ inline bool TypeCheck::KillPath(Node *n, VarDef *&base, string &path) {
     }
     Append(path, ".", d->name);
     return true;
+}
+
+// Express an overwrite through a reference parameter in its argument's
+// storage. A reference field names the slot itself, so confirm that the
+// path ends at the pointee for a relative overwrite.
+inline std::optional<TypeCheck::Kill> TypeCheck::ArgumentKill(Node *arg, const Val &v,
+                                                TypeExpr *pointee, bool relative, size_t at) {
+    if (!v.Exact()) return {};
+    auto x = v.Root();
+    if (!x || IsTemp(x) || (!relative && (x->isglobal || x->captured))) return {};
+    if (auto u = Is<Unary>(arg); u && u->op == T_BITAND) arg = u->child;
+    VarDef *base = nullptr;
+    string path;
+    if (!KillPath(arg, base, path)) return {};
+    if (IsRefOrSlice(base->type) ? !base->ref.Exact() || base->ref.Root() != x : base != x)
+        return {};
+    Kill kill { x, base, path, at, relative };
+    if (relative && !KillNamesType(kill, pointee)) return {};
+    return kill;
 }
 
 // A whole assignment to the location `lval` names, which lies where `loc`
@@ -2524,8 +2550,12 @@ inline void TypeCheck::ThreadIndexError(Node *at, TypeExpr *t) {
 inline void TypeCheck::NoteGlobalShrink(Node *at, const string &prefix, VarDef *vd,
                                         TypeExpr *bound, TypeExpr *replaced) {
     size_t since;
-    bool incoming = bound || !KilledFor(vd, vd, LoadType(vd->type), ResizableArrayIn(vd->type),
-                                        since, true, replaced);
+    // A named callee's own array is checked with the links reaching each
+    // call. A bound may name another global, and a host can call an export
+    // after any preceding export has edited the program's globals.
+    auto spec = CurRealFrame().spec;
+    bool incoming = bound || (spec && spec->sf->isexport &&
+        !KilledFor(vd, vd, LoadType(vd->type), ResizableArrayIn(vd->type), since, true, replaced));
     for (auto &gs : globalshrinks)
         if (gs.arr == vd && gs.incoming == incoming && !gs.replaced == !replaced &&
             (!replaced || TypeEq(gs.replaced, replaced)) && !gs.bound == !bound &&
@@ -3804,11 +3834,9 @@ inline void TypeCheck::ApplyCalleeShrinks(Node *at, FnSpec *spec, vector<Val> &a
     // where the callee cannot write into the part it emptied; its recorded
     // stores elsewhere in the container come after the kill.
     erase_if(cur.kills, [&](const Kill &k) {
-        // Relative stores through parameters are replayed below. Captured
-        // storage and callbacks can also be written by a cached body.
-        if (k.relative && !k.container->captured && !spec->sf->isnested && spec->fnvals.empty())
-            return false;
-        return CallMayWrite(spec, argvals, k);
+        // Relative writes, including those to captures and by callbacks,
+        // are projected from the callee's record below.
+        return !k.relative && CallMayWrite(spec, argvals, k);
     });
     // A shrink of an array the call may free: a grow-only array takes the
     // §5.1 scan (variables and recorded stores), a grow-shrink one the §5.2
@@ -3840,29 +3868,20 @@ inline void TypeCheck::ApplyCalleeShrinks(Node *at, FnSpec *spec, vector<Val> &a
         if (k.external) return Kill { k.external, k.external, k.path, storesbase, true };
         auto p = k.param;
         if (p < 0 || (size_t)p >= argnodes.size() || (size_t)p >= argvals.size()) return {};
-        auto &v = argvals[(size_t)p];
-        if (!v.Exact()) return {};
-        auto x = v.Root();
-        if (!x || (!k.relative && (x->isglobal || x->captured)) || IsTemp(x)) return {};
-        auto n = argnodes[(size_t)p];
-        if (auto u = Is<Unary>(n); u && u->op == T_BITAND) n = u->child;
-        VarDef *base = nullptr;
-        string bpath;
-        if (!KillPath(n, base, bpath)) return {};
-        if (IsRefOrSlice(base->type) ? !base->ref.Exact() || base->ref.Root() != x : base != x)
-            return {};
-        Kill kill { x, base, bpath, storesbase, k.relative };
-        if (k.relative && !KillNamesType(kill, spec->params[p]->type->ref->sub)) return {};
+        auto mapped = ArgumentKill(argnodes[p], argvals[p], spec->params[p]->type->ref->sub,
+                                   k.relative, storesbase);
+        if (!mapped) return {};
+        auto &kill = *mapped;
         kill.path += k.path;
         if (!k.relative) {
             for (; kill.at < storeevents.size(); kill.at++) {
                 auto &e = storeevents[kill.at];
-                if (e.elementlinks || e.container != x) continue;
+                if (e.elementlinks || e.container != kill.container) continue;
                 auto i = kill.at - storesbase;
                 if (i >= origins.size() || origins[i] < 0 || k.writes.count(origins[i])) break;
             }
         }
-        return kill;
+        return mapped;
     };
     auto argkill = [&](const FnRecord::CallerKill &k, bool permanent) {
         auto mapped = mapkill(k);

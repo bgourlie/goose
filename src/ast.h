@@ -2315,6 +2315,14 @@ struct FnRecord {
         int result = -1;
     };
     vector<RelativeStore> relativestores;
+    // Storage a write through a parameter or capture may change (§6.6).
+    // An indirect write follows a stored reference out of the argument.
+    struct StorageWrite {
+        VarDef *root;
+        TypeExpr *type;
+        bool exact, indirect;
+    };
+    vector<StorageWrite> storagewrites;
     // Whether this specialization can resume its immediate Goose caller.
     // A return-from to an outer body does not, although its C function returns
     // normally to propagate that exit. Unknown recursive calls may return.

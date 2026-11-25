@@ -2151,6 +2151,8 @@ Argument rechecks start from the call's entry reachability and relative-link
 state, including its receiver. Each argument sees the writes and overwrites
 of the preceding arguments. The continuation requires all arguments to
 complete, including the operand that supplies a dispatch tag.
+Generic struct literals likewise restore their entry state after inferring
+the type arguments and before checking the field initializers.
 
 A `let` declared without an initializer is assigned, or bound with `.=`,
 only where it is not maybe assigned (`NoLetReassign`, §4.4). This is
@@ -3675,9 +3677,12 @@ return, and which parts of the incoming storage were overwritten on every
 path. The caller applies the overwrites before projecting those surviving
 stores. A defer records the link effects that reach each shrink and the
 effects that survive its body. Each exit from its lexical scope applies
-those effects in reverse registration order. A guaranteed overwrite of a
-global also applies at the shrink site. The final global check still
-accounts for external views.
+those effects in reverse registration order. An inlined callback shares
+the calling statement's relative writes and overwrites. A helper that
+shrinks a global checks that array's incoming links at each call. The
+entry to `main` sees the writes surviving global initialization. The
+whole-program check accounts for views held by other globals and for
+unknown incoming links at host entry points or through a bound.
 
 `Val::elementlinks` carries the owner's links through branches, by-value
 arguments, named results and each forwarded result slot. It keeps writes
@@ -4172,6 +4177,14 @@ calls, or a named function it passes as a value, may have been checked
 before the `defer` and be reused there, so what such a callee names is read
 from its record of the variables outside its activation
 (`FnSpec::envreads`), which every call site fills, reused or not.
+The check also compares each named result with the storage written by
+the deferred body. Assignments and mutating builtins supply the receiving
+storage. A callee records writes to captures and parameter roots so each
+call can map them to the storage supplied there. A write through a
+reference loaded from the result is checked against the pointee's storage.
+If a reference or holder used by the body gains another possible target
+before an exit, its effects are checked again with those targets. Names
+still resolve in the lexical environment of the original `defer`.
 
 ---
 

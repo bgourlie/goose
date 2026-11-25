@@ -2833,7 +2833,9 @@ not do, each a compile error:
   the error names the chain of calls that brings the machinery in.
 * **Name the function's named result.** A local that the function returns
   by name is built where the caller receives it ([section 17](#results)),
-  and is complete when the body runs.
+  and is complete when the body runs. The body may read through an alias
+  to the local. Writing into the local through an alias, directly or in a
+  function the body calls, is an error.
 
 A `defer` belongs in a function: a global initializer has no scope exit.
 Nothing runs a defer where no exit happens: `abort`, a failed `assert` or

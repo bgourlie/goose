@@ -85,7 +85,6 @@ inline Val Ident::Check(TypeCheck &tc, TypeExpr *) {
     if (!expansionerror.empty()) tc.Error(this, string(expansionerror));
     if (auto vd = tc.LookupVar(name, ns, this)) {
         vdef = vd;
-        if (tc.deferbodies) tc.NoteDeferMention(vd);
         tc.RequireAssigned(vd, this);
         Val v;
         auto t = vd->narrowed ? vd->narrowed : vd->type;
@@ -342,6 +341,8 @@ inline Val StructLit::Check(TypeCheck &tc, TypeExpr *expected) {
             // which belong to the declaration's environment and to the type
             // the first inference gave; the source order it kept
             // (sourcefieldindices) picks out the written ones.
+            TypeCheck::FlagScope probe(tc.reachable, tc.reachable);
+            auto entrylinks = tc.CurrentLinkEffects();
             vector<FieldInit *> written;
             if (sourcefieldindices.empty()) {
                 for (auto &fi : inits) written.push_back(&fi);
@@ -389,6 +390,7 @@ inline Val StructLit::Check(TypeCheck &tc, TypeExpr *expected) {
                 args.push_back(bound);
             }
             t = tc.ast.StructOf(st, std::move(args), line);
+            tc.RestoreLinks(entrylinks);
         }
         auto inst = tc.GetStructInst(t);
         sinst = inst;

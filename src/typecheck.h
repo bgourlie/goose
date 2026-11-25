@@ -356,9 +356,11 @@ struct TypeCheck {
         TypeExpr *bound, *array, *replaced;
         bool viaclass;
     };
+    struct DeferEnv;
     struct DeferredLinks {
         vector<pair<LinkShrink, LinkEffects>> shrinks;
         LinkEffects exit;
+        shared_ptr<DeferEnv> env;
     };
     struct Scope {
         vector<DeferredLinks> defers;
@@ -447,6 +449,16 @@ struct TypeCheck {
         // The frame checking it, whose variables and lexical parents' its
         // names are (UsedAfter).
         int frame = 0;
+    };
+    // A defer still sees the declarations at registration when a mutable
+    // binding it uses acquires another possible target before scope exit.
+    struct DeferEnv {
+        Defer *body;
+        size_t nframes, nscopes, nvars, nfns, ndefers;
+        vector<BlockPos> blocks;
+        vector<PathEntry> path;
+        FlowState entry;
+        vector<EnvRead> bindings;
     };
     struct Discovering {
         TypeCheck &tc;
@@ -2524,8 +2536,16 @@ struct TypeCheck {
     // per identifier; what each body names of the variables declared
     // outside it (NoteDeferMention), for CheckDefers.
     int deferbodies = 0;
+    bool hasdefers = false;
     unordered_map<Defer *, vector<VarDef *>> defermentions;
+    unordered_map<Defer *, set<const VarDef *>> deferwrites;
+    vector<EnvRead> DeferBindings(Defer *d);
+    static void CalledSpecs(Node *n, vector<FnSpec *> &to);
+    void NoteStorageWrite(const Roots &storage, TypeExpr *type);
+    void ApplyCalleeWrites(FnSpec *spec, const vector<Val> &args);
     void CheckDefer(Defer *d);
+    DeferredLinks CheckDeferredBody(Defer *d);
+    void RefreshDeferredBody(DeferredLinks &effects);
     LinkEffects CurrentLinkEffects();
     void RestoreLinks(const LinkEffects &state);
     void ApplyLinkEffects(const LinkEffects &effects);
@@ -2613,6 +2633,7 @@ struct TypeCheck {
     // in force empty every slot of a `t` at `base` in container c that can
     // hold a view into an `arr`'s elements, since which event.
     bool KillPath(Node *n, VarDef *&base, string &path);
+    std::optional<Kill> ArgumentKill(Node *arg, const Val &v, TypeExpr *pointee, bool relative, size_t at);
     void NoteKill(Node *lval, const Roots &loc, TypeExpr *target, const Val &v, size_t at);
     void NoteOverwrite(Node *path, const Roots &loc, size_t at, bool relative, TypeExpr *target);
     bool KilledFor(VarDef *c, VarDef *base, TypeExpr *t, TypeExpr *arr, size_t &since,
@@ -2924,6 +2945,9 @@ struct TypeCheck {
         // The parts of holders emptied on every path here (Kill), part of
         // the flow state, which a branch joins and a loop's head takes.
         vector<Kill> kills;
+        // Immutable reference parameters of an inlined block that name a
+        // known part of an argument in this activation.
+        map<VarDef *, Kill> blockargpaths;
     };
     BodyState cur;
     // The states of the bodies being checked around this one, outermost
@@ -2966,6 +2990,14 @@ struct TypeCheck {
     // there is none, or a variable ADT's variants hold different ones.
     TypeExpr *SoleResizableIn(TypeExpr *t);
     void ApplyCalleeGrows(Node *at, FnSpec *spec, vector<Val> &argvals, string_view name);
+    void ApplyCalleeStorage(Node *at, FnSpec *spec, vector<Val> &args, string_view name,
+                            const vector<Node *> &argnodes, bool applyexits) {
+        ApplyCalleeShrinks(at, spec, args, name, argnodes, applyexits);
+        // A write through a stored reference can reach a value installed
+        // by this same call. Its stores have now been mapped to the caller.
+        ApplyCalleeWrites(spec, args);
+        ApplyCalleeGrows(at, spec, args, name);
+    }
     // Whether an element pushed into, or allocated in, an array of `elem`
     // is built in place at its slot, as codegen builds it (ElemValue): a
     // variable-size one, or a fixed one holding relative references of
@@ -3188,6 +3220,7 @@ struct TypeCheck {
             for (auto &v : en->variants)
                 for (auto &fld : v.fields)
                     if (fld.type) TypeParamSizes(fld.type, en->generics);
+        hasdefers = any_of(ast.allnodes.begin(), ast.allnodes.end(), [](Node *n) { return Is<Defer>(n); });
         CheckRoots();
     }
 

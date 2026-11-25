@@ -52,6 +52,8 @@ fn alternatives(action: Action, first: bool) {
 
 var global_nodes: Node[>..] = [];
 
+fn trim_global() { global_nodes.pop_n(1); }
+
 fn global_clear() {
     global_nodes.push(Node { n: 0 });
     global_nodes.push(Node { n: 0 });
@@ -59,6 +61,9 @@ fn global_clear() {
     global_nodes.clear();
     global_nodes.push(Node { n: 9 });
     assert(global_nodes.pop().n == 9);
+    global_nodes.push(Node { n: 10 });
+    trim_global();
+    assert(global_nodes.len == 0);
 }
 
 fn main() {
