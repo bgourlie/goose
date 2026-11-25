@@ -3262,8 +3262,12 @@ reference parameter, phase 2 warns about the `&`s because the branch binds
 by reference without them. Tag dispatch also binds such a construct at the
 dispatch position by reference. For a construct it dispatches by value,
 tag dispatch reports the copy and any redundant `&`s. Phase 2 checks that
-operand as the whole enum in its original argument position. A member builtin reports those noted on its
-receiver, which it takes as checked. A function value's declared reference
+operand as the whole enum in its original argument position. It starts
+from the caller's flow before argument discovery, including which locals
+are assigned. Each case sees the assignments made by the arguments, and
+only returning cases contribute assignments after the call. A member
+builtin reports the warnings noted on its receiver, which it takes as
+checked. A function value's declared reference
 parameter takes its provenance from the argument's check against it.
 
 Phase 2 checks each argument again, and so resolves each call nested in
@@ -4184,13 +4188,17 @@ calls, or a named function it passes as a value, may have been checked
 before the `defer` and be reused there, so what such a callee names is read
 from its record of the variables outside its activation
 (`FnSpec::envreads`), which every call site fills, reused or not.
-The check also compares each named result with the storage written by
-the deferred body. Assignments and mutating builtins record their receiving
+For writes through aliases, the checker and code generator use the same
+result-placement rule. A local copied into a different return layout can
+still be updated through an alias after the copy. A growable array
+returned as a variable array shares its elements with the result.
+Assignments and mutating builtins record their receiving
 storage when the write can begin. A scalar push writes after its operand
-returns. In-place construction can write during initialization, and
-`format` can write each argument before evaluating the next. A callee
-records writes to captures and parameter roots so each
-call can map them to the storage supplied there. A write through a
+returns. A call constructing an aggregate can begin writing its destination
+once its arguments complete. In-place literals can write during
+initialization, and `format` can write each argument before evaluating
+the next. A callee records writes to captures and parameter roots so
+each call can map them to the storage supplied there. A write through a
 reference loaded from the result is checked against the pointee's storage.
 If a reference or holder used by the body gains another possible target
 before an exit, its effects are checked again with those targets. Names

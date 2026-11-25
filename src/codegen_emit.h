@@ -18,7 +18,7 @@ namespace goose {
 inline const VarDef *CodeGen::OpenIbNrvo(InlineBlock *ib, const Dst &d) {
     if (d.k != DK_STACK || !ib->spec || ib->spec->rets.size() != 1) return nullptr;
     auto vd = NamedResult(ib->body, ib->sf, 1, 0);
-    if (!vd || !IsBytesT(vd->type) || nrvo.count(vd)) return nullptr;
+    if (!vd || nrvo.count(vd) || ResultPlacement(vd, ib->spec->rets[0]) == NamedLayout::Copy) return nullptr;
     auto ct = vd->type;
     NrvoDest nd;
     nd.stk = d.s;

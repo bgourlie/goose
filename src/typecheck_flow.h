@@ -2442,14 +2442,6 @@ inline TypeCheck::LinkEffects TypeCheck::CurrentLinkEffects() {
     return effects;
 }
 
-// An overload probe can evaluate an expression more than once. Restore
-// its relative-link state independently of the ordinary store analysis.
-inline void TypeCheck::RestoreLinks(const LinkEffects &state) {
-    cur.links = state.writes;
-    erase_if(cur.kills, [](const Kill &k) { return k.relative; });
-    cur.kills.insert(cur.kills.end(), state.overwrites.begin(), state.overwrites.end());
-}
-
 inline void TypeCheck::ApplyLinkEffects(const LinkEffects &effects) {
     auto base = storeevents.size();
     for (auto k : effects.overwrites) {
@@ -2644,11 +2636,13 @@ inline void TypeCheck::CheckDefers() {
     }
     for (auto sp : withdefers) {
         // A fixed-size result is copied out at the return (CodeGen::DetectNrvo).
-        vector<const VarDef *> named;
+        vector<const VarDef *> named, inresult;
         for (size_t j = 0; j < sp->rets.size(); j++)
             if (ClassOf(sp->rets[j]) != SC_FIXED)
-                if (auto v = goose::NamedResultOf(sp->body, sp->sf, sp->rets.size(), j))
+                if (auto v = goose::NamedResultOf(sp->body, sp->sf, sp->rets.size(), j)) {
                     named.push_back(v);
+                    if (ResultPlacement(v, sp->rets[j]) != NamedLayout::Copy) inresult.push_back(v);
+                }
         function<void(Node *)> walk = [&](Node *n) {
             if (!n) return;
             if (auto d = Is<Defer>(n)) {
@@ -2671,6 +2665,9 @@ inline void TypeCheck::CheckDefers() {
                         return find(named.begin(), named.end(), v) != named.end();
                     };
                     auto why = [&](const VarDef *v) {
+                        if (find(inresult.begin(), inresult.end(), v) == inresult.end())
+                            return cat(v->name, ", which ", sp->sf->qname,
+                                       " returns by name: a defer body cannot name the returned local (§6.6)");
                         return cat(v->name, ", which ", sp->sf->qname, " returns by name and so "
                                    "builds at its destination (§7.3): a defer runs after the value "
                                    "is complete (§6.6)");
@@ -2684,7 +2681,7 @@ inline void TypeCheck::CheckDefers() {
                                 Error(d, cat("defer body calls ", k->sf->qname, ", which names ",
                                              why(r.var)));
                     if (auto it = deferwrites.find(d); it != deferwrites.end())
-                        for (auto v : named)
+                        for (auto v : inresult)
                             if (it->second.count(v))
                                 Error(d, cat("defer body writes through an alias to ", why(v)));
                 });
@@ -2996,10 +2993,14 @@ inline void TypeCheck::AssignableClassCheck(TypeExpr *t, Node *at) {
 // being built (rebuilding, ExposedLater).
 inline Val TypeCheck::CheckAssignedValue(Assign *a, TypeExpr *target, TypeExpr *arr,
                                          const LVal &built, Dest dest) {
-    // An aggregate can start construction in its destination before its
-    // initializer finishes. A scalar store follows evaluation of its operand.
-    auto aggregate = IsAggregate(target);
-    if (aggregate) NoteStorageWrite(built, target);
+    // A resizable assignment clears before evaluating its RHS. Fixed
+    // aggregates can also receive an in-place initializer or call result.
+    // A runtime-capacity limited array copies the completed source (§4.4).
+    if (hasdefers && IsAggregate(target)) {
+        auto cls = ClassOf(target);
+        if (cls == SC_RESIZABLE) NoteStorageWrite(built, target);
+        if (cls == SC_FIXED) dest.assignment = target;
+    }
     if (arr) {
         {
             struct Restore {
@@ -3017,7 +3018,7 @@ inline Val TypeCheck::CheckAssignedValue(Assign *a, TypeExpr *target, TypeExpr *
     SlotScope ss(*this, true);
     auto base = cur.growlog.size();
     auto v = CheckValueAt(a->rhs, target, dest);
-    if (!aggregate) NoteStorageWrite(built, target);
+    NoteStorageWrite(built, target);
     if (arr && !built.None()) {
         CheckGrowsSince(base, built, cat("the value assigned to ", ExprStr(a->lval)), target);
         CheckBuiltUses(a->rhs, a->lval, target, built, arr);

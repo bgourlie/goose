@@ -8,7 +8,17 @@ fn use(a: i64, c: Choice.B, b: i64) { print(a, " B ", b); }
 enum Message { A { n: i64 }, B { s: u8[] } }
 fn payload(m: Message.A, b: i64) { print(m.n); }
 fn payload(m: Message.B, b: i64) { print(m.s); }
+fn test_assignment(c: Choice, want: i64) {
+    let x: i64;
+    let y: i64;
+    fn handle(c: Choice.A, n: i64) { y = n + 1; }
+    fn handle(c: Choice.B, n: i64) { y = n + 2; }
+    handle(block { x = 41; c }, x);
+    assert(x == 41 && y == want);
+}
 fn main() {
+    test_assignment(Choice.A {}, 42);
+    test_assignment(Choice.B {}, 43);
     use(first(), choose(true), last());
     use(first(), choose(false), last());
     var n = 1;

@@ -307,6 +307,10 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
                     c->defaultinit = DefaultCall(t->arr->sub, c->line);
             }
             if (c->defaultinit) {
+                // A nominal default with relative fields becomes a literal
+                // built at its receiving slot.
+                if (Is<StructLit>(c->defaultinit) && HasRelRefT(t, true))
+                    NoteCallConstruction(c->rettypes);
                 auto v = CheckValue(c->defaultinit, t->kind == TY_ARRAY ? t->arr->sub : t);
                 v.type = t;
                 // An array is filled with its element's default in a

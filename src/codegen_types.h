@@ -12,31 +12,8 @@ namespace goose {
 // re-evaluate.
 
 inline bool CodeGen::TEq(TypeExpr *a, TypeExpr *b) {
-    if (a == b) return true;
-    if (a->kind != b->kind) return false;
-    switch (a->kind) {
-        case TY_INT:  return a->intstorage == b->intstorage;
-        case TY_FLT:  return a->fltstorage == b->fltstorage;
-        case TY_BOOL: case TY_VOID: case TY_FN: return true;
-        case TY_STRUCT: return SI(a) == SI(b);
-        case TY_ENUM:   return EIOf(a) == EIOf(b) && a->enu->varmode == b->enu->varmode;
-        case TY_ARRAY: {
-            auto &x = *a->arr, &y = *b->arr;
-            if (x.akind != y.akind || !TEq(x.sub, y.sub)) return false;
-            switch (x.akind) {
-                case A_FIXED: case A_LIMITED: return ArrSize(a->arr) == ArrSize(b->arr);
-                case A_VAR:     return LenStore(a->arr) == LenStore(b->arr);
-                default:        return true;
-            }
-        }
-        case TY_SLICE: return TEq(a->sub, b->sub);
-        case TY_REF:
-            return TEq(a->ref->sub, b->ref->sub) && a->ref->optional == b->ref->optional &&
-                   a->ref->lenstorage == b->ref->lenstorage;
-        case TY_VARIANT:
-            return a->var->variant == b->var->variant && TEq(a->var->adt, b->var->adt);
-        default: assert(false); return false;
-    }
+    return SameStoredType(a, b, [&](TypeExpr *t) { return SI(t); },
+                                [&](TypeExpr *t) { return EIOf(t); });
 }
 
 // Instantiations: the typechecker filled the per-TypeExpr caches for every

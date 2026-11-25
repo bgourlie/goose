@@ -110,18 +110,16 @@ inline Val TypeCheck::CheckNamedCall(Call *c, Ident *id, TypeExpr *expected) {
         Node *nopre = nullptr;
         // A user function set sharing a builtin's name (a `format`
         // overload, §3.7) takes the calls it matches; the builtin the rest.
-        auto entryreach = reachable;
-        auto entrylinks = CurrentLinkEffects();
+        auto entry = SaveFlow();
         auto nomatch = false;
         auto v = ResolveCall(c, cands, env, id->name, nullptr, nopre,
-                             entryreach, entrylinks, bd ? &nomatch : nullptr, expected);
+                             entry, bd ? &nomatch : nullptr, expected);
         if (!nomatch) return v;
         // Without a cast, an argument might have matched a function (JudgeCastAt).
         auto fallback = builtinfallback;
         fallback.insert(c->args.begin(), c->args.end());
         Saved<unordered_set<Node *>> fs(builtinfallback, std::move(fallback));
-        reachable = entryreach;
-        RestoreLinks(entrylinks);
+        RestoreFlow(entry);
         return CheckBuiltin(c, *bd, c->args, nullptr);
     }
     if (!bd) {
@@ -203,8 +201,7 @@ inline FnValBind TypeCheck::LocalFnValue(const vector<SFunction *> &fns, FnSpec 
 
 inline Val TypeCheck::CheckUfcsCall(Call *c, Dot *d, TypeExpr *expected) {
     if (d->accessorowner) Error(d, "const for field accessor is not callable");
-    auto entryreach = reachable;
-    auto entrylinks = CurrentLinkEffects();
+    auto entry = SaveFlow();
     Val ov;
     {
         PathScope ps(*this, d->obj);
@@ -222,7 +219,7 @@ inline Val TypeCheck::CheckUfcsCall(Call *c, Dot *d, TypeExpr *expected) {
     auto bd = LookupBuiltin(d->name);
     if (bd && (bd->flags & BF_MEMBER) && !(bd->flags & BF_PROPERTY) &&
         rt->kind == TY_ARRAY) {
-        CheckWaitingArg(c, d->obj, entryreach, entrylinks);
+        CheckWaitingArg(c, d->obj, entry);
         if (optional) Error(c, "optional value must be narrowed (if/guard/assert) before use");
         // A member works on the receiver's value, which for a control
         // construct is a copy of the branch taken.
@@ -257,8 +254,8 @@ inline Val TypeCheck::CheckUfcsCall(Call *c, Dot *d, TypeExpr *expected) {
         cands = ast.LookupMethods(d->name, d->ns, rt);
     }
     if (!cands.empty())
-        return ResolveCall(c, cands, env, d->name, &ov, d->obj, entryreach, entrylinks, nullptr, expected);
-    CheckWaitingArg(c, d->obj, entryreach, entrylinks);
+        return ResolveCall(c, cands, env, d->name, &ov, d->obj, entry, nullptr, expected);
+    CheckWaitingArg(c, d->obj, entry);
     // A member builtin taking any receiver (bytes_of) takes it as checked.
     NoArrayJoin(ov);
     if (bd && !(bd->flags & BF_PROPERTY)) {
@@ -346,7 +343,7 @@ inline void TypeCheck::AddParamDefaults(Call *c, MatchInfo &best, vector<Node *>
         argnodes.insert(argnodes.begin() + (int)i, d);
         Val v;
         InParamDefault(c, best, env, i, [&]() {
-            auto input = CurrentLinkEffects();
+            auto input = SaveFlow();
             {
                 PathScope ps(*this, d);
                 v = CheckV(argnodes[i], nullptr);
@@ -372,15 +369,14 @@ inline void TypeCheck::AddParamDefaults(Call *c, MatchInfo &best, vector<Node *>
 // Phase 1 checks arguments bottom-up for resolution; phase 2 re-checks
 // each against its concrete parameter type (adapting literals etc.).
 inline Val TypeCheck::ResolveCall(Call *c, vector<SFunction *> &cands, FnSpec *env,
-                                  string_view name, Val *preval, Node *&prenode, bool entryreach,
-                                  const LinkEffects &entrylinks, bool *nomatch, TypeExpr *expected) {
+                                  string_view name, Val *preval, Node *&prenode,
+                                  const FlowState &entry, bool *nomatch, TypeExpr *expected) {
     vector<Node *> argnodes;
     vector<Val> argvals;
-    vector<LinkEffects> inputs;
+    ArgumentFlows inputs { entry };
     argnodes.reserve(c->args.size() + 1);
     argvals.reserve(c->args.size() + 1);
     if (prenode) {
-        inputs.push_back(entrylinks);
         auto v = *preval;
         RefArg(prenode, v);
         argnodes.push_back(prenode);
@@ -389,7 +385,7 @@ inline Val TypeCheck::ResolveCall(Call *c, vector<SFunction *> &cands, FnSpec *e
     {
         Discovering discovering(*this, c);
         for (auto &a : c->args) {
-            inputs.push_back(CurrentLinkEffects());
+            if (!argnodes.empty()) inputs.later.push_back(SaveFlow());
             Val v;
             {
                 PathScope ps(*this, a);
@@ -434,7 +430,7 @@ inline Val TypeCheck::ResolveCall(Call *c, vector<SFunction *> &cands, FnSpec *e
     if (tied.size() > 1) ambiguous(tied);
     if (tied.empty()) {
         // Tag dispatch (§8.2): the match-as-overload-set form.
-        auto v = TryDispatch(c, cands, env, argnodes, argvals, name, entryreach, inputs);
+        auto v = TryDispatch(c, cands, env, argnodes, argvals, name, inputs);
         if (v.type) return v;
         if (nomatch) {   // The caller has a builtin of this name to fall back on.
             *nomatch = true;
@@ -448,8 +444,10 @@ inline Val TypeCheck::ResolveCall(Call *c, vector<SFunction *> &cands, FnSpec *e
             // (CheckExemplars), which only a real binding could resolve.
             for (auto &av : argvals)
                 if (HasOpaque(av.type)) {
+                    auto after = SaveFlow();
                     for (size_t i = 0; i < argnodes.size(); i++)
-                        CheckWaitingArg(c, argnodes[i], entryreach, inputs[i]);
+                        CheckWaitingArg(c, argnodes[i], inputs[i]);
+                    RestoreFlow(after);
                     Val v;
                     v.type = OpaqueMember();
                     return v;
@@ -488,16 +486,19 @@ inline Val TypeCheck::ResolveCall(Call *c, vector<SFunction *> &cands, FnSpec *e
     }
     LoadSliceArgs(argvals, best.paramtypes);
     RefSliceArgs(argvals, best.paramtypes, c->line);
-    {
-        FlagScope rs(reachable, entryreach);
-        BindBranchesByRef(argnodes, argvals, best.paramtypes, best.sf, inputs, -1, best.nwritten);
-    }
+    BindBranchesByRef(argnodes, argvals, best.paramtypes, best.sf, inputs, -1, best.nwritten);
+    // Specializing here also checks recursive-call constraints on the
+    // original arguments, before their adaptation to parameter types.
     auto spec = GetOrCreateSpec(best, argvals, c);
     // Phase 2 starts at the call's entry again: a later argument may have
     // diverged during discovery, but earlier arguments still execute before
     // it.
     auto argsreach = reachable;
-    RecheckArgs(c, cands, best, denv, argnodes, -1, {}, entryreach, entrylinks);
+    RecheckArgs(c, cands, best, denv, argnodes, -1, {}, entry);
+    // Replay restored the caller's bindings. A completed callee now leaves
+    // its captures as its recorded exits did, just as at a reused call.
+    if (!spec->inprogress) ReplayEnvExits(spec);
+    NoteCallConstruction(spec->rets);
     // An argument can overwrite the same storage that the callee links.
     // Apply the body effects after both passes over the arguments.
     ApplyCalleeStorage(c, spec, argvals, name, argnodes, true);
@@ -528,16 +529,13 @@ inline Val TypeCheck::ResolveCall(Call *c, vector<SFunction *> &cands, FnSpec *e
 // from mi.nwritten on takes its default (AddParamDefaults), checked in the
 // default's frame. `skip` is a dispatch position, whose value the cases
 // take as the whole enum, checked by `atskip`. Phase 2 starts where the call
-// does, at `entryreach`, unless it waits (Phase2Waits), checking no argument.
+// does, with its entry flow, unless it waits (Phase2Waits), checking no argument.
 inline void TypeCheck::RecheckArgs(Call *c, vector<SFunction *> &cands, MatchInfo &mi,
                                    FnSpec *denv, vector<Node *> &argnodes, int skip,
-                                   const function<void(bool)> &atskip, bool entryreach, const LinkEffects &entrylinks) {
+                                   const function<void(bool)> &atskip, const FlowState &entry) {
     auto waits = Phase2Waits(c);
     if (waits) phase2waits.insert(c);
-    else {
-        reachable = entryreach;
-        RestoreLinks(entrylinks);
-    }
+    else RestoreFlow(entry);
     DestScope ds(*this, Dest {});
     for (size_t i = 0; i < mi.paramtypes.size(); i++) {
         if ((int)i == skip) {
@@ -575,12 +573,11 @@ inline void TypeCheck::RecheckArgs(Call *c, vector<SFunction *> &cands, MatchInf
 // receiver or an argument beside an exemplar's opaque value. A
 // call there whose phase 2 waited (Phase2Waits) is checked again in full, as
 // it was first.
-inline void TypeCheck::CheckWaitingArg(Call *c, Node *a, bool entryreach, const LinkEffects &input) {
+inline void TypeCheck::CheckWaitingArg(Call *c, Node *a, const FlowState &input) {
     if (!phase2waits.count(a)) return;
-    RestoreLinks(input);
+    RestoreFlow(input);
     Discovering discovering(*this, c);
     Saved<Node *> full(nowait, a);
-    FlagScope rs(reachable, entryreach);
     PathScope ps(*this, a);
     CheckV(a, nullptr);
 }
@@ -612,7 +609,7 @@ inline void TypeCheck::CalleesReturn(const vector<FnSpec *> &specs, bool argsrea
 // as it checks them.
 inline void TypeCheck::BindBranchesByRef(vector<Node *> &argnodes, vector<Val> &argvals,
                                          const vector<TypeExpr *> &paramtypes, SFunction *sf,
-                                         const vector<LinkEffects> &inputs, int skip, size_t end) {
+                                         const ArgumentFlows &inputs, int skip, size_t end) {
     for (size_t i = 0; i < paramtypes.size() && i < argvals.size() && i < end; i++)
         if ((int)i != skip)
             BindBranchByRef(argnodes[i], argvals[i], paramtypes[i], sf->params[i].type, inputs[i]);
@@ -623,7 +620,7 @@ inline void TypeCheck::BindBranchesByRef(vector<Node *> &argnodes, vector<Val> &
 // at a parameter declared a slice. One that does not bind the branches takes
 // the construct's copy, which makes their `&` redundant.
 inline void TypeCheck::BindBranchByRef(Node *&n, Val &v, TypeExpr *pt, TypeExpr *declared,
-                                       const LinkEffects &input) {
+                                       const FlowState &input) {
     if (!declared || declared->kind != TY_SLICE) NoArrayJoin(v);
     auto byref = v.storagebranches && pt->kind == TY_REF && pt->ref->lenstorage < 0;
     if (!byref) RefCopyWarnings(v);
@@ -631,10 +628,10 @@ inline void TypeCheck::BindBranchByRef(Node *&n, Val &v, TypeExpr *pt, TypeExpr 
     DestScope ds(*this, Dest {});
     SlotScope ss(*this, false);
     FlagScope q(quiet, true);
-    auto after = CurrentLinkEffects();
-    RestoreLinks(input);
+    auto after = SaveFlow();
+    RestoreFlow(input);
     v = CheckValue(n, pt, true);
-    RestoreLinks(after);
+    RestoreFlow(after);
 }
 
 // Tries each candidate on the arguments as ResolveCall ranks them: the best
@@ -1163,7 +1160,7 @@ inline TypeExpr *TypeCheck::SubstOwn(TypeExpr *pt, vector<pair<string_view, Type
 // Returns a Val with null type when no dispatch position exists.
 inline Val TypeCheck::TryDispatch(Call *c, vector<SFunction *> &cands, FnSpec *env,
                                   vector<Node *> &argnodes, vector<Val> &argvals,
-                                  string_view name, bool entryreach, const vector<LinkEffects> &inputs) {
+                                  string_view name, const ArgumentFlows &inputs) {
     auto found = -1;
     vector<MatchInfo> matches;  // Per variant, for the found position.
     TypeExpr *enumtype = nullptr;
@@ -1302,35 +1299,42 @@ inline Val TypeCheck::TryDispatch(Call *c, vector<SFunction *> &cands, FnSpec *e
     // Settle the dispatch argument for specialization. A construct passed
     // by reference binds its branches according to the payload mode.
     if (byref && !IsPlainRef(argvals[found].type)) {
-        FlagScope rs(reachable, entryreach);
         DestScope ds(*this, Dest {});
         SlotScope ss(*this, false);
-        auto after = CurrentLinkEffects();
-        RestoreLinks(inputs[found]);
+        auto after = SaveFlow();
+        RestoreFlow(inputs[found]);
         argvals[found] = CheckValue(argnodes[found], ast.RefTo(enumtype, c->line), true);
-        RestoreLinks(after);
+        RestoreFlow(after);
     }
     if (argvals[found].implicitcopy) ImplicitCopyError(argvals[found].implicitcopy);
     RefCopyWarnings(argvals[found]);
-    {
-        FlagScope rs(reachable, entryreach);
-        BindBranchesByRef(argnodes, argvals, matches[0].paramtypes, matches[0].sf, inputs, found);
-    }
+    BindBranchesByRef(argnodes, argvals, matches[0].paramtypes, matches[0].sf, inputs, found);
     // Specialize every arm; return types and the other parameters must
     // agree across the set.
     c->dispatcharg = found;
     LoadSliceArgs(argvals, matches[0].paramtypes);
     RefSliceArgs(argvals, matches[0].paramtypes, c->line);
     vector<Val> armvals = argvals;
-    vector<TypeExpr *> caseargs;
+    // Check the operands in source order, before any case can update
+    // captured locals. Each case starts at that same call-entry state.
+    auto argsreach = reachable;
+    RecheckArgs(c, cands, matches[0], nullptr, argnodes, found, [&](bool checking) {
+        if (checking) CheckV(argnodes[found], byref ? ast.RefTo(enumtype, c->line) : nullptr);
+        auto byreference = any_of(matches.begin(), matches.end(), [&](const MatchInfo &m) {
+            return m.paramtypes[found]->kind == TY_REF;
+        });
+        RecordVal(argnodes[found], byreference ? argvals[found] : DecayRef(argvals[found]));
+    }, inputs.entry);
+    auto entry = SaveFlow();
+    FlowState exits;
+    exits.reachable = false;
     FnSpec *first = nullptr;
     for (size_t vi = 0; vi < en->variants.size(); vi++) {
-        auto &mi = matches[vi];
+        RestoreFlow(entry);
         auto vt = ast.VariantTypeOf(enumtype, &en->variants[vi], c->line);
         armvals[found] = argvals[found];
         armvals[found].type = byref ? ast.RefTo(vt, c->line) : vt;
-        caseargs.push_back(armvals[found].type);
-        auto spec = GetOrCreateSpec(mi, armvals, c);
+        auto spec = GetOrCreateSpec(matches[vi], armvals, c);
         if (first) {
             if (spec->rets.size() != first->rets.size())
                 Error(c, cat("case functions of ", name, " disagree on return counts"));
@@ -1347,6 +1351,11 @@ inline Val TypeCheck::TryDispatch(Call *c, vector<SFunction *> &cands, FnSpec *e
             first = spec;
         }
         c->dispatch.push_back(spec);
+        NoteCallConstruction(spec->rets);
+        ApplyCalleeStorage(c, spec, armvals, name, argnodes, true);
+        CheckCalleeRelative(c, spec, argvals);
+        auto rec = RecordOf(spec);
+        if (!rec || rec->mayreturn) exits = JoinFlow(exits, SaveFlow());
     }
     // A case taking a non-fixed-size variant by value gets a copy of the
     // argument, taken before the tag is read and held to the end of the call
@@ -1366,33 +1375,6 @@ inline Val TypeCheck::TryDispatch(Call *c, vector<SFunction *> &cands, FnSpec *e
                          "non-fixed-size ", TypeStr(vt), " (§7.8): take it by reference: ",
                          TypeStr(vt), "&"));
         }
-    }
-    // Check the operands in source order before computing the call result.
-    auto argsreach = reachable;
-    RecheckArgs(c, cands, matches[0], nullptr, argnodes, found, [&](bool checking) {
-        // Evaluate the dispatch operand at its own position too. Its type
-        // is the whole enum at this point, before a case receives its payload.
-        if (checking) CheckV(argnodes[found], byref ? ast.RefTo(enumtype, c->line) : nullptr);
-        // Value cases receive an enum snapshot before later arguments.
-        // A reference case retains the original storage instead.
-        auto byreference = false;
-        for (auto sp : c->dispatch) byreference |= sp->argtypes[found]->kind == TY_REF;
-        RecordVal(argnodes[found], byreference ? argvals[found] : DecayRef(argvals[found]));
-    }, entryreach, inputs.front());
-    // Every case starts at the same point after argument evaluation. Only
-    // returning cases contribute their surviving links and overwrites.
-    auto entry = SaveFlow();
-    FlowState exits;
-    exits.reachable = false;
-    for (size_t vi = 0; vi < c->dispatch.size(); vi++) {
-        auto spec = c->dispatch[vi];
-        armvals[found] = argvals[found];
-        armvals[found].type = caseargs[vi];
-        RestoreFlow(entry);
-        ApplyCalleeStorage(c, spec, armvals, name, argnodes, true);
-        CheckCalleeRelative(c, spec, argvals);
-        auto rec = RecordOf(spec);
-        if (!rec || rec->mayreturn) exits = JoinFlow(exits, SaveFlow());
     }
     RestoreFlow(exits.reachable ? exits : entry);
     CalleesReturn(c->dispatch, argsreach);
@@ -4083,16 +4065,14 @@ inline Val TypeCheck::CheckFunValCall(Call *c, const FnValBind &fb, TypeExpr *ex
     if (fb.named) {
         vector<SFunction *> cands = fb.set ? *fb.set : vector<SFunction *> { fb.named };
         Node *nopre = nullptr;
-        return ResolveCall(c, cands, fb.env, fb.named->name, nullptr, nopre, reachable,
-                           CurrentLinkEffects(), nullptr, expected);
+        return ResolveCall(c, cands, fb.env, fb.named->name, nullptr, nopre, SaveFlow(), nullptr, expected);
     }
     auto fv = fb.fv;
-    auto entryreach = reachable;
     // The body runs in this body's state, as part of the calling statement:
     // ordinary holder overwrites do not cross the call. Relative writes and
     // overwrites flow through the checked body just like other inline code.
     erase_if(cur.kills, [](const Kill &k) { return !k.relative; });
-    auto entrylinks = CurrentLinkEffects();
+    auto entry = SaveFlow();
     if (!c->tyargs.empty()) Error(c, "a block takes no type arguments");
     vector<Val> argvals;
     argvals.reserve(c->args.size());
@@ -4138,8 +4118,7 @@ inline Val TypeCheck::CheckFunValCall(Call *c, const FnValBind &fb, TypeExpr *ex
     }
     RefSliceArgs(argvals, ptypes, c->line);
     auto argsreach = reachable;
-    reachable = entryreach;
-    RestoreLinks(entrylinks);
+    RestoreFlow(entry);
     {
         DestScope ds(*this, Dest {});
         for (size_t i = 0; i < ptypes.size(); i++) {
@@ -4244,6 +4223,17 @@ inline Val TypeCheck::CheckFunValCall(Call *c, const FnValBind &fb, TypeExpr *ex
 inline bool TypeCheck::ResultLayoutFits(TypeExpr *from, TypeExpr *to) {
     if (!to || to->kind == TY_VOID || TopConstEq(from, to)) return true;
     return from->kind == TY_VARIANT && to->kind == TY_ENUM && SameAdt(AdtOf(from), to);
+}
+
+// A call can start constructing a value in an assignment's destination
+// after its operands complete, even if the callee subsequently exits
+// without returning. A reference result is loaded after the call.
+inline void TypeCheck::NoteCallConstruction(const vector<TypeExpr *> &results) {
+    for (size_t i = 0; i < results.size() && i < callresultdsts.size(); i++) {
+        auto &dest = callresultdsts[i];
+        if (dest.assignment && IsAggregate(results[i]))
+            NoteStorageWrite(dest.roots, dest.assignment);
+    }
 }
 
 // Relate a relative link's target to its receiving root. A named result's

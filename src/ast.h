@@ -1845,6 +1845,56 @@ NODE_END
 // Keep that distinction even for roots with no resizable fields.
 enum SizeClass { SC_FIXED, SC_VARIABLE, SC_RESIZABLE, SC_ROOT };
 
+// Representation equality of checked types. Nominal types use the concrete
+// instantiation selected by the phase, including for cloned type expressions.
+template<typename StructOf, typename EnumOf>
+bool SameStoredType(TypeExpr *a, TypeExpr *b, const StructOf &structure, const EnumOf &enumeration) {
+    auto same = [&](TypeExpr *x, TypeExpr *y) { return SameStoredType(x, y, structure, enumeration); };
+    if (a == b) return true;
+    if (a->kind != b->kind) return false;
+    switch (a->kind) {
+        case TY_INT:  return a->intstorage == b->intstorage;
+        case TY_FLT:  return a->fltstorage == b->fltstorage;
+        case TY_BOOL: case TY_VOID: case TY_FN: return true;
+        case TY_STRUCT: return structure(a) == structure(b);
+        case TY_ENUM:   return enumeration(a) == enumeration(b) && a->enu->varmode == b->enu->varmode;
+        case TY_ARRAY: {
+            auto &x = *a->arr, &y = *b->arr;
+            if (x.akind != y.akind || !same(x.sub, y.sub)) return false;
+            switch (x.akind) {
+                case A_FIXED: case A_LIMITED: {
+                    assert((x.size >= 0 || !x.sizeexpr) && (y.size >= 0 || !y.sizeexpr));
+                    return x.size == y.size;
+                }
+                case A_VAR:
+                    return (x.lenstorage < 0 ? IS_U32 : x.lenstorage) ==
+                           (y.lenstorage < 0 ? IS_U32 : y.lenstorage);
+                default:        return true;
+            }
+        }
+        case TY_SLICE: return same(a->sub, b->sub);
+        case TY_REF:
+            return same(a->ref->sub, b->ref->sub) && a->ref->optional == b->ref->optional &&
+                   a->ref->lenstorage == b->ref->lenstorage;
+        case TY_VARIANT:
+            return a->var->variant == b->var->variant && same(a->var->adt, b->var->adt);
+        default: assert(false); return false;
+    }
+}
+
+enum class NamedLayout { Copy, Direct, PrefixedElements };
+
+// How a returned local occupies the declared result's storage (§7.3).
+template<typename Equal>
+NamedLayout NamedResultLayout(TypeExpr *local, TypeExpr *result, SizeClass resultclass, Equal same) {
+    if (resultclass != SC_VARIABLE && resultclass != SC_RESIZABLE) return NamedLayout::Copy;
+    if (same(local, result)) return NamedLayout::Direct;
+    if ((IsArrayKind(local, A_GROW) || IsArrayKind(local, A_GROWSHRINK)) &&
+        IsArrayKind(result, A_VAR) && same(local->arr->sub, result->arr->sub))
+        return NamedLayout::PrefixedElements;
+    return NamedLayout::Copy;
+}
+
 // One checked variable: a global, local, parameter, or binding (for/match/
 // function value). Created per specialization, so generic code has concrete
 // types here. Also carries the transient flow state (assigned/narrowed) used

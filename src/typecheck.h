@@ -326,6 +326,12 @@ struct TypeCheck {
         vector<Kill> kills;
         bool operator==(const FlowState &) const = default;
     };
+    // Operand zero starts in the call's own snapshot, including for UFCS.
+    struct ArgumentFlows {
+        const FlowState &entry;
+        vector<FlowState> later;
+        const FlowState &operator[](size_t i) const { return i ? later[i - 1] : entry; }
+    };
     // The destination of the value under construction (for reference stores):
     // where the storage the value lands in may be (an lvalue's roots).
     struct Dest {
@@ -353,6 +359,7 @@ struct TypeCheck {
         // resize adds, so no position in the array is its own (§3.9).
         bool fill = false;
         bool appended = false;       // New elements at the end of a grow-only array.
+        TypeExpr *assignment = nullptr; // Existing aggregate slot a value can write during construction.
         Dest() {}
         Dest(const Roots &r, bool vb = false, TypeExpr *re = nullptr)
             : roots(r), varbind(vb), reached(re), unknown(r.None()) {}
@@ -1800,6 +1807,12 @@ struct TypeCheck {
         VarDef *var;
     };
     vector<NamedResultUse> namedresultuses;
+    NamedLayout ResultPlacement(const VarDef *local, TypeExpr *result) {
+        return NamedResultLayout(local->type, result, ClassOf(result), [&](TypeExpr *a, TypeExpr *b) {
+            return SameStoredType(a, b, [&](TypeExpr *t) { return GetStructInst(t); },
+                                        [&](TypeExpr *t) { return GetEnumInst(t); });
+        });
+    }
     bool AllowNamedResult(Ident *id, TypeExpr *t);
     void CheckNamedResultUses(FnSpec *spec);
     VarDef *NamedResultOf(FnSpec *spec);
@@ -2128,9 +2141,9 @@ struct TypeCheck {
     static bool CopiesBranch(TypeExpr *dest) { return !dest || dest->kind == TY_VOID; }
     void BindBranchesByRef(vector<Node *> &argnodes, vector<Val> &argvals,
                            const vector<TypeExpr *> &paramtypes, SFunction *sf,
-                           const vector<LinkEffects> &inputs, int skip = -1,
+                           const ArgumentFlows &inputs, int skip = -1,
                            size_t end = SIZE_MAX);
-    void BindBranchByRef(Node *&n, Val &v, TypeExpr *pt, TypeExpr *declared, const LinkEffects &input);
+    void BindBranchByRef(Node *&n, Val &v, TypeExpr *pt, TypeExpr *declared, const FlowState &input);
     Val CheckInferredResult(Node *&n, FnSpec *tspec);
     // A parameter that takes the value -- a slice, or a fixed-class value
     // that a non-fixed one constructs by copy (an array of another kind
@@ -2403,7 +2416,7 @@ struct TypeCheck {
     FnValBind LocalFnValue(const vector<SFunction *> &fns, FnSpec *env);
     Val CheckUfcsCall(Call *c, Dot *d, TypeExpr *expected);
     Val ResolveCall(Call *c, vector<SFunction *> &cands, FnSpec *env, string_view name, Val *preval,
-                    Node *&prenode, bool entryreach, const LinkEffects &entrylinks, bool *nomatch = nullptr,
+                    Node *&prenode, const FlowState &entry, bool *nomatch = nullptr,
                     TypeExpr *expected = nullptr);
     void MatchCandidates(Call *c, vector<SFunction *> &cands, FnSpec *env, vector<Val> &argvals,
                          vector<MatchInfo> &tied, vector<MatchInfo> &converting, string *failures,
@@ -2413,7 +2426,7 @@ struct TypeCheck {
                         vector<Val> &argvals, const function<bool(vector<Val> &)> &resolves);
     void RecheckArgs(Call *c, vector<SFunction *> &cands, MatchInfo &mi, FnSpec *denv,
                      vector<Node *> &argnodes, int skip, const function<void(bool)> &atskip,
-                     bool entryreach, const LinkEffects &entrylinks);
+                     const FlowState &entry);
     // A call checked as an operand of a call that is `discovering` is checked
     // again, in full, in that call's phase 2, so its own phase 2 waits for
     // that check: run at every level of a nesting, it would double the
@@ -2425,7 +2438,7 @@ struct TypeCheck {
         auto &p = cur.nodepath;
         return c != nowait && p.size() > 1 && p.back().node == c && p[p.size() - 2].discovering;
     }
-    void CheckWaitingArg(Call *c, Node *a, bool entryreach, const LinkEffects &input);
+    void CheckWaitingArg(Call *c, Node *a, const FlowState &input);
     void CalleesReturn(const vector<FnSpec *> &specs, bool argsreach);
     // `defaults`: the call may leave out parameters that have a default
     // (§7.1), which ResolveCall then passes. Tag dispatch and rendering
@@ -2453,7 +2466,7 @@ struct TypeCheck {
     bool BindTypes(TypeExpr *pt, TypeExpr *at, vector<pair<string_view, TypeExpr *>> &b);
     TypeExpr *SubstOwn(TypeExpr *pt, vector<pair<string_view, TypeExpr *>> &b);
     Val TryDispatch(Call *c, vector<SFunction *> &cands, FnSpec *env, vector<Node *> &argnodes,
-                    vector<Val> &argvals, string_view name, bool entryreach, const vector<LinkEffects> &inputs);
+                    vector<Val> &argvals, string_view name, const ArgumentFlows &inputs);
 
     // ------------------------------------------------------------------
     // Specialization: find or create the FnSpec for a resolved call and
@@ -2592,12 +2605,12 @@ struct TypeCheck {
     void NoteStorageWrite(const Roots &storage, TypeExpr *type) {
         NoteStorageWrite(storage, type, reachable);
     }
+    void NoteCallConstruction(const vector<TypeExpr *> &results);
     void ApplyCalleeWrites(FnSpec *spec, const vector<Val> &args);
     void CheckDefer(Defer *d);
     DeferredLinks CheckDeferredBody(Defer *d);
     void RefreshDeferredBody(DeferredLinks &effects);
     LinkEffects CurrentLinkEffects();
-    void RestoreLinks(const LinkEffects &state);
     void ApplyLinkEffects(const LinkEffects &effects);
     void CheckLinkShrink(const LinkShrink &shrink);
     void ExitLinkDefers(int first);

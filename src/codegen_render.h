@@ -605,24 +605,12 @@ inline void CodeGen::DetectNrvo(FnSpec *sp) {
         if (!IsBytesT(sp->rets[j])) continue;
         auto cand = NamedResult(sp->body, sp->sf, sp->rets.size(), j);
         // One local can be built at one destination only.
-        auto ok = cand != nullptr && !nrvo.count(cand);
-        // The local's layout must be the return type's, or a resizable
-        // whose elements become the returned variable array's (that
-        // array's prefix is reserved ahead of them); anything else is
-        // copied on return like a non-named result.
-        auto rzarr = false;
-        if (ok && cand) {
-            auto rt = sp->rets[j];
-            auto ct = cand->type;
-            auto same = TEq(ct, rt);
-            rzarr = IsResz(ct) && ct->kind == TY_ARRAY && rt->kind == TY_ARRAY &&
-                    rt->arr->akind == A_VAR && TEq(ct->arr->sub, rt->arr->sub);
-            if (!same && !rzarr) ok = false;
-        }
-        if (ok && cand) {
+        if (!cand || nrvo.count(cand)) continue;
+        auto layout = ResultPlacement(cand, sp->rets[j]);
+        if (layout != NamedLayout::Copy) {
             NrvoDest nd;
             nd.stk = cat("gs_dst", j);
-            if (rzarr) {
+            if (layout == NamedLayout::PrefixedElements) {
                 nd.prefix = true;
                 nd.ls = LenStore(sp->rets[j]->arr);
             } else {

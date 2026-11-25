@@ -1544,6 +1544,10 @@ struct CodeGen {
     // ------------------------------------------------------------------
     // Function bodies.
 
+    NamedLayout ResultPlacement(const VarDef *local, TypeExpr *result) {
+        return NamedResultLayout(local->type, result, Cls(result),
+                                 [&](TypeExpr *a, TypeExpr *b) { return TEq(a, b); });
+    }
     void DetectNrvo(FnSpec *sp);
     // What a specialization's C declaration says besides its signature.
     static const char *FnAttrs(FnSpec *sp) {

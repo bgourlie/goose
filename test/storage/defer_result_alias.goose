@@ -63,6 +63,29 @@ fn stopped_limited_format(flag: bool) -> u8[..] {
     return out;
 }
 
+fn copied_source() -> i64[] {
+    var source: i64[2] = [41, 42];
+    let first .= source[0];
+    defer { first++; }
+    return source;
+}
+
+inline fn copied_growable() -> i64[>..<] {
+    var source: i64[>..] = [41];
+    let first .= source[0];
+    defer { first++; }
+    return source;
+}
+
+struct Small { value: i64 }
+fn make(n: i64) -> Small { Small { value: n } }
+fn stopped_aggregate(flag: bool) -> Small[] {
+    var result: Small[] = [Small { value: 42 }];
+    let first .= result[0];
+    defer { if flag { first = make(stop()); } }
+    return result;
+}
+
 var slot: i64 = 7;
 inline fn read_before_store() -> i64 {
     defer { assert(slot == 7); }
@@ -80,6 +103,10 @@ fn main() {
     assert(stopped_builtin(false)[0] == 41);
     assert(stopped_format(false)[0] == 41);
     assert(stopped_limited_format(false).len == 0);
+    assert(copied_source()[0] == 41);
+    let copied: i64[>..<] = copied_growable();
+    assert(copied[0] == 41);
+    assert(stopped_aggregate(false)[0].value == 42);
     slot = read_before_store();
     assert(slot == 42);
     print("ok");

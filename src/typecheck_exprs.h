@@ -1003,7 +1003,18 @@ inline Node *TypeCheck::WholeSlice(Node *n) {
 inline Val TypeCheck::CheckValue(Node *&n, TypeExpr *expected, bool callsite, bool branchcopy,
                                  bool inferred) {
     auto orig = n;
+    auto assignment = curdst.assignment;
+    // Control constructs pass the destination to the selected value. A
+    // call can start writing it once its arguments have been evaluated.
+    // Other expressions compute their operands separately. A literal
+    // with relative fields starts constructing in the slot itself.
+    if (assignment && (Is<StructLit>(n) || Is<ArrayLit>(n)) && HasRelRefT(assignment, true))
+        NoteStorageWrite(curdst.roots, assignment);
+    Saved writing(curdst.assignment, assignment && (IsBranchConstruct(n) || Is<Call>(n))
+                                         ? assignment : nullptr);
     auto v = CheckV(n, expected);
+    // A branch delivers its value before its scope's defers run.
+    if (assignment && v.type->kind != TY_VOID) NoteStorageWrite(curdst.roots, assignment);
     // An argument's casts are its call's to judge (JudgeCallCasts).
     if (!callsite) JudgeCastAt(orig, expected && expected->kind != TY_VOID ? expected : nullptr, v);
     // A nominal default is an ordinary construction at this destination,

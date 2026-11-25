@@ -927,11 +927,7 @@ inline bool TypeCheck::AllowNamedResult(Ident *id, TypeExpr *t) {
     for (auto st : spec->body->stmts)
         if (auto d = Is<VarDecl>(st); d && d->defs.size() == 1 && d->defs[0] == vd) top = true;
     if (!top) return false;
-    auto ct = vd->type;
-    auto elems = IsArrayKind(ct, A_GROW) || IsArrayKind(ct, A_GROWSHRINK);
-    if (!TypeEq(ct, t) && !(elems && IsArrayKind(t, A_VAR) && TypeEq(ct->arr->sub, t->arr->sub)))
-        return false;
-    if (!NamedResultKeepsLinks(ct)) return false;
+    if (ResultPlacement(vd, t) == NamedLayout::Copy || !NamedResultKeepsLinks(vd->type)) return false;
     namedresultuses.push_back({ spec, id, vd });
     return true;
 }
