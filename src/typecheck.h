@@ -2599,13 +2599,15 @@ struct TypeCheck {
     // themselves through references.
     struct RenderSeen {
         vector<TypeExpr *> path, recurring;
+        bool executes = true;  // A fixed empty array still needs its element's rendering code.
     };
     TypeExpr *OverloadedPart(Call *c, TypeExpr *t, vector<TypeExpr *> &seen);
     void CheckRenderable(Call *c, const char *what, TypeExpr *t, Node *at, RenderSeen &seen,
                          Val value, const Val &out);
-    FnSpec *UserFormat(Call *c, TypeExpr *t, const Val &value, const Val &out, Node *arg);
+    FnSpec *UserFormat(Call *c, TypeExpr *t, const Val &value, const Val &out, Node *arg,
+                       vector<Val> &hookargs);
     FnSpec *UserFormatIn(Call *c, TypeExpr *t, string_view ns, const Val &value, const Val &out,
-                         Node *arg);
+                         Node *arg, vector<Val> &hookargs);
     StrLit *ConstStrLit(Node *n);
     const string *EmbedShader(Call *c, vector<Node *> &args);
     const string *EmbedFile(Call *c, vector<Node *> &args);

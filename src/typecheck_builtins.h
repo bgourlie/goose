@@ -937,7 +937,16 @@ inline void TypeCheck::CheckRenderable(Call *c, const char *what, TypeExpr *t, N
     struct PopSeen { vector<TypeExpr *> &types; ~PopSeen() { types.pop_back(); } } pop { seen.path };
     value.type = t;
     value.writable &= !t->cq;
-    if (UserFormat(c, t, value, out, seen.path.size() == 1 ? at : nullptr)) return;
+    auto arg = seen.path.size() == 1 ? at : nullptr;
+    vector<Val> hookargs;
+    if (auto sp = UserFormat(c, t, value, out, arg, hookargs)) {
+        c->fmtspecs.push_back({ t, sp });
+        if (seen.executes) {
+            ApplyCalleeStorage(c, sp, hookargs, "format", { nullptr, arg }, true);
+            ApplyCalleeRebinds(sp);
+        }
+        return;
+    }
     // The argument itself, unless an overload takes it whole, is read where
     // it lies, around the overloads its parts run, so that storage stays in
     // use meanwhile (HeldOperands, the argument being rendered).
@@ -973,9 +982,37 @@ inline void TypeCheck::CheckRenderable(Call *c, const char *what, TypeExpr *t, N
     };
     switch (t->kind) {
         case TY_INT: case TY_FLT: case TY_BOOL: return;
-        case TY_ARRAY: child(t->arr->sub, IsRefOrSlice(t->arr->sub)); return;
-        case TY_SLICE: child(t->sub, IsRefOrSlice(t->sub)); return;
-        case TY_REF: child(t->ref->sub, false); return;
+        case TY_ARRAY: case TY_SLICE: {
+            auto elem = t->kind == TY_ARRAY ? t->arr->sub : t->sub;
+            if (IsU8(elem)) return;  // RenderLoc emits the entire byte string.
+            auto count = IsArrayKind(t, A_FIXED) ? ArraySize(t->arr) : -1;
+            Saved executing(seen.executes, seen.executes && count != 0);
+            auto base = c->fmtspecs.size();
+            auto element = [&] {
+                c->fmtspecs.resize(base);  // Keep overloads from the settled pass.
+                child(elem, IsRefOrSlice(elem));
+            };
+            if (!seen.executes || count == 1) {
+                element();
+            } else {
+                auto head = SaveFlow();
+                auto loop = CheckLoopPasses(at, head, element);
+                // A dynamic sequence can be empty. A nonempty fixed array
+                // leaves with the effects of its last element in force.
+                if (count > 0 && loop.backedges) RestoreFlow(loop.backedge);
+            }
+            return;
+        }
+        case TY_REF: {
+            if (t->ref->optional) {
+                auto skipped = SaveFlow();
+                child(t->ref->sub, false);
+                MergeFlow(skipped, SaveFlow());
+            } else {
+                child(t->ref->sub, false);
+            }
+            return;
+        }
         case TY_STRUCT: case TY_ENUM: case TY_VARIANT:
             if (ClassOf(t) == SC_ROOT) {
                 auto si = GetStructInst(t);
@@ -988,7 +1025,18 @@ inline void TypeCheck::CheckRenderable(Call *c, const char *what, TypeExpr *t, N
             // its payload meanwhile (§3.5): the parts lie in a copy codegen
             // takes once the tag is read (RenderLoc), a read-only temporary,
             // as a construct's value is.
-            if (t->kind == TY_ENUM && !t->enu->varmode) value = TempCopy(value);
+            if (t->kind == TY_ENUM) {
+                if (!t->enu->varmode) value = TempCopy(value);
+                auto entry = SaveFlow();
+                std::optional<FlowState> exit;
+                for (auto &variant : FieldRuns(t)) {
+                    RestoreFlow(entry);
+                    for (auto ft : *variant.ftypes) if (ft) child(ft, IsRefOrSlice(ft));
+                    exit = exit ? JoinFlow(*exit, SaveFlow()) : SaveFlow();
+                }
+                if (exit) RestoreFlow(*exit);
+                return;
+            }
             EachField(t, [&](TypeExpr *ft) { child(ft, IsRefOrSlice(ft)); });
             return;
         default:
@@ -1004,14 +1052,15 @@ inline void TypeCheck::CheckRenderable(Call *c, const char *what, TypeExpr *t, N
 // (docs/design/namespaces.md). `arg` is the argument where the value is all
 // of it, else null.
 inline FnSpec *TypeCheck::UserFormat(Call *c, TypeExpr *t, const Val &value, const Val &out,
-                                     Node *arg) {
+                                     Node *arg, vector<Val> &hookargs) {
     auto tns = NominalNs(t);
-    if (auto sp = UserFormatIn(c, t, tns, value, out, arg)) return sp;
-    return tns.empty() ? nullptr : UserFormatIn(c, t, {}, value, out, arg);
+    if (auto sp = UserFormatIn(c, t, tns, value, out, arg, hookargs)) return sp;
+    return tns.empty() ? nullptr : UserFormatIn(c, t, {}, value, out, arg, hookargs);
 }
 
 inline FnSpec *TypeCheck::UserFormatIn(Call *c, TypeExpr *t, string_view ns,
-                                      const Val &value, const Val &out, Node *arg) {
+                                      const Val &value, const Val &out, Node *arg,
+                                      vector<Val> &hookargs) {
     auto n = ast.FindNS(ns);
     if (!n) return nullptr;
     auto fit = n->functionmap.find("format");
@@ -1088,11 +1137,7 @@ inline FnSpec *TypeCheck::UserFormatIn(Call *c, TypeExpr *t, string_view ns,
                          "self-relative references, into the format overload taking it by "
                          "value is not supported; take it by reference"));
         auto sp = GetOrCreateSpec(mi, argvals, c);
-        // A hook for the whole argument runs once. A nested hook may be
-        // skipped, e.g. when rendering an empty array of that element type.
-        ApplyCalleeStorage(c, sp, argvals, "format", { nullptr, arg }, arg != nullptr);
-        ApplyCalleeRebinds(sp);
-        c->fmtspecs.push_back({ t, sp });
+        hookargs = std::move(argvals);
         return sp;
     }
     return nullptr;
