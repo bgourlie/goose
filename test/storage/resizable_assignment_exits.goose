@@ -28,11 +28,19 @@ fn outer() {
 
 struct Bag { tag: i64, xs: i64[>..<] }
 struct Box { tag: i64, items: i64[>..<]& }
+struct Views { flag: bool&, data: i64[>..<]& }
 fn siblings(stop: bool) {
     var bag = Bag { tag: 7, xs: [1] };
     let alias .= bag;
     let tag .= bag.tag;
     let box = Box { tag: 8, items: bag.xs };
+    let flag = true;
+    let views = Views { flag: flag, data: bag.xs };
+    let saved = views;
+    defer { assert(views.flag && saved.flag); }
+    fn audit() { assert(bag.tag == 7); }
+    fn relay_audit() { audit(); }
+    defer relay_audit();
     defer { assert(tag == 7 && alias.tag == 7 && box.tag == 8); }
     bag.xs = [2, if stop { return; } else { 3 }];
 }
@@ -48,6 +56,8 @@ fn components(stop: bool) {
     var state = State { items: [1], spare: [9] };
     let alias .= state;
     defer { assert(alias.spare.len == 1); }
+    fn audit() { assert(state.spare[0] == 9); }
+    defer audit();
     state.items = [2, if stop { return; } else { 3 }];
 }
 

@@ -3639,7 +3639,7 @@ inline void TypeCheck::NoteLiveViews(Node *at, const string &prefix, VarDef *roo
             out.push_back({ sv, sub->sub, true });
             if (growonly && HoldsPlainRef(sub->sub)) HeldViews(sv, sub->sub, isvar, out);
         } else if (growonly && HoldsPlainRef(sub)) {
-            HeldViews(p, sub, isvar, out, nullptr, base, arrtype);
+            HeldViews(p, sub, isvar, out, nullptr, nullptr, base, arrtype);
         }
         return out;
     };
@@ -3720,9 +3720,14 @@ inline void TypeCheck::NoteLiveViews(Node *at, const string &prefix, VarDef *roo
 // whose references lead wherever what came out of there does. `seen` holds
 // the holders followed so far.
 inline void TypeCheck::RecordedViews(VarDef *h, size_t from, TypeExpr *ht,
-                                     vector<LiveView> &out, set<VarDef *> &seen) {
-    if (!seen.insert(h).second) return;
+                                     vector<LiveView> &out, set<VarDef *> &seen,
+                                     span<const pair<TypeExpr *, bool>> slots) {
+    // Following a selected field can lead back to this holder. That read
+    // may see slots outside the initial selection.
+    if (slots.empty() && !seen.insert(h).second) return;
     EachHolderRoot(h, from, [&](const StoreEvent &e) {
+        if (e.pointee && !slots.empty() && none_of(slots.begin(), slots.end(),
+                [&](const auto &slot) { return MaySameType(e.pointee, slot.first); })) return;
         if (e.classread) {
             Prov cv;
             cv.Set(e.src, true);
@@ -3730,7 +3735,13 @@ inline void TypeCheck::RecordedViews(VarDef *h, size_t from, TypeExpr *ht,
             out.push_back({ cv, ht, true, true });
             return;
         }
-        StoredViews(e.root, e.exact, e.pointee, e.sliceref, e.byteview, ht, out, seen);
+        if (e.pointee || slots.empty()) {
+            StoredViews(e.root, e.exact, e.pointee, e.sliceref, e.byteview, ht, out, seen);
+            return;
+        }
+        // A copy of a whole holder can supply any slot in the read field.
+        for (auto [pt, sliceref] : slots)
+            StoredViews(e.root, e.exact, pt, sliceref, e.byteview, ht, out, seen);
     });
 }
 
@@ -3792,10 +3803,12 @@ inline void TypeCheck::StoredViews(VarDef *r, bool exact, TypeExpr *pointee, boo
 // not show yet may have moved to another holder at that depth
 // (HeldRefsMayPointInto). A global holder is judged with the globals.
 inline void TypeCheck::HeldViews(const Prov &p, TypeExpr *held, bool isvar,
-                                 vector<LiveView> &out, const TempHolds *temps, VarDef *base,
-                                 TypeExpr *arrtype) {
+                                 vector<LiveView> &out, TypeExpr *field, const TempHolds *temps,
+                                 VarDef *base, TypeExpr *arrtype) {
     vector<TypeExpr *> pointees;
-    ReachedThroughRefs(held, pointees);
+    ReachedThroughRefs(field ? field : held, pointees);
+    vector<pair<TypeExpr *, bool>> slots;
+    if (field) RefSlots(field, slots);
     for (auto &a : p.alts) {
         auto r = a.root;
         if (!r || r->isglobal) continue;
@@ -3808,11 +3821,11 @@ inline void TypeCheck::HeldViews(const Prov &p, TypeExpr *held, bool isvar,
                        KilledFor(r, base, held, arrtype, since);
         auto from = emptied ? std::max(LiveEventBase(r), since) : LiveEventBase(r);
         if (a.exact && r->type && !IsRefOrSlice(r->type) && !isvar) {
-            RecordedViews(r, from, r->type, out, seen);
+            RecordedViews(r, from, r->type, out, seen, slots);
             continue;
         }
         if ((a.exact || a.classread) && IsClassRoot(r) && !isvar) {
-            RecordedViews(r, from, held, out, seen);
+            RecordedViews(r, from, held, out, seen, slots);
             if (emptied) continue;
             Prov cv;
             cv.Set(r, true);
@@ -4065,7 +4078,7 @@ inline void TypeCheck::ApplyCalleeLiveShrinks(Node *at, FnSpec *spec, vector<Val
                     lp.alts = { la };
                     lp.byteview = orig.byteview;
                     vector<LiveView> vs;
-                    HeldViews(lp, held, false, vs, &temps);
+                    HeldViews(lp, held, false, vs, nullptr, &temps);
                     for (auto &w : vs) {
                         for (auto &b : w.p.alts) {
                             auto x = ls;
@@ -4672,16 +4685,18 @@ inline vector<TypeCheck::LiveView> TypeCheck::DeferredUseViews(VarDef *v, Dot *f
     }
     apart = place.base && place.base == target.base && !FieldPathWithin(place.path, target.path) &&
             !FieldPathWithin(target.path, place.path);
-    auto follows = IsRefOrSlice(selected) || HoldsPlainRef(selected);
+    // The holder's slot records describe plain references and slices.
+    auto readfield = field && !IsRelRef(selected) ? selected : nullptr;
     auto add = [&](const Prov &where, TypeExpr *type, bool direct) {
         if (direct && !apart) views.push_back({ where, type });
-        if (!follows || !HoldsPlainRef(type)) return;
-        HeldViews(where, type, false, views);
+        auto read = readfield ? readfield : type;
+        if (!HoldsPlainRef(read)) return;
+        HeldViews(where, type, false, views, readfield);
         if (v->isglobal) {
             Prov global;
             global.Set(v, false);
             vector<TypeExpr *> reached;
-            ReachedThroughRefs(type, reached);
+            ReachedThroughRefs(read, reached);
             for (auto ft : reached) views.push_back({ global, ft, true });
         }
     };
@@ -4761,43 +4776,53 @@ inline void TypeCheck::CheckBuiltUses(Node *rhs, Node *lval, TypeExpr *target,
     // among them, which may lead to the location whatever the variable's own
     // type holds: where the references stored there point, by a local
     // holder's record, else anywhere the variable's storage bounds.
-    auto checkread = [&](Ident *id, Node *path) {
-        auto v = id->vdef;
-        auto vt = ReadFieldType(Is<Dot>(path), id);
+    auto checkread = [&](Node *at, VarDef *v, Dot *field, const string &how, const string &via) {
+        auto vt = ReadFieldType(field, nullptr);
         if (!v || !v->type || !vt) return;
         vector<TypeExpr *> reached;
         ReachedThroughRefs(vt, reached);
         if (none_of(reached.begin(), reached.end(),
                     [&](TypeExpr *y) { return MayHoldBuilt(y, lval, target); }))
             return;
-        Roots at;
-        if (IsRefOrSlice(v->type)) at = Bounds(RefRootsOf(v));
-        else if (!v->isglobal && !v->contents.Unknown()) at = v->contents;
-        else at = Bounds(RootsOf(v));
+        Roots roots;
+        if (IsRefOrSlice(v->type)) roots = Bounds(RefRootsOf(v));
+        else if (!v->isglobal && !v->contents.Unknown()) roots = v->contents;
+        else roots = Bounds(RootsOf(v));
         for (auto &b : built.alts) {
             if (!b.root || IsTemp(b.root)) continue;
-            for (auto &a : at.alts) {
+            for (auto &a : roots.alts) {
                 auto may = MayAliasRoots(a.root, a.exact, b.root, b.exact);
                 if (may == AL_NO) continue;
-                report(id, may, a.root, b.root, cat("use ", ExprStr(path)),
-                       cat(ExprStr(path), " may refer to ", what));
+                report(at, may, a.root, b.root, how, via.empty()
+                       ? cat(ExprStr(field), " may refer to ", what) : via);
                 break;
             }
         }
     };
+    auto use = [&](Node *at, VarDef *v, Dot *field, const string &how, const string &via) {
+        if (field && FieldsApart(field, lval, target, onexit != nullptr)) return;
+        check(at, v, how, via, field);
+        if (field) checkread(at, v, field, how, via);
+        // Root fields have independent owners. DeferredUseViews already
+        // checks the selected components on an exit.
+        if (!onexit && !v->components.empty()) {
+            auto first = field;
+            while (first && Is<Dot>(first->obj)) first = Is<Dot>(first->obj);
+            for (auto c : v->components)
+                if (c && (!first || c->componentfield == first->fieldidx)) check(at, c, how, via);
+        }
+    };
     EachUse(rhs,
             [&](Ident *id, Node *path) {
-                if (FieldsApart(path, lval, target, onexit != nullptr)) return;
-                check(id, id->vdef, cat("use ", ExprStr(path)), string(), Is<Dot>(path));
-                if (path != id) checkread(id, path);
+                use(id, id->vdef, Is<Dot>(path), cat("use ", ExprStr(path)), {});
             },
             [&](Call *c, FnSpec *sp) {
-                vector<VarDef *> named;
+                vector<NamedUse> named;
                 auto pending = NamedOutside(sp, named);
-                for (auto v : named)
-                    check(c, v, cat("call ", sp->sf->name),
-                          cat(sp->sf->name, pending ? ", still being checked, may use "
-                                                    : " uses ", v->name));
+                for (auto [v, field] : named)
+                    use(c, v, field, cat("call ", sp->sf->name),
+                        cat(sp->sf->name, pending ? ", still being checked, may use " : " uses ",
+                            field ? ExprStr(field) : string(v->name)));
             });
 }
 
@@ -4890,13 +4915,13 @@ inline bool TypeCheck::FieldsApart(Node *use, Node *lval, TypeExpr *target, bool
 // checked (a recursive cycle) is not known in full: it counts as naming
 // every global and every variable in scope on the path being checked, and
 // the result says so.
-inline bool TypeCheck::NamedOutside(FnSpec *spec, vector<VarDef *> &out) {
+inline bool TypeCheck::NamedOutside(FnSpec *spec, vector<NamedUse> &out) {
     if (auto it = namedoutside.find(spec); it != namedoutside.end()) {
         out = it->second;
         return false;
     }
     set<FnSpec *> walked;
-    vector<VarDef *> named;
+    vector<NamedUse> named;
     auto pending = false;
     function<void(FnSpec *)> visit = [&](FnSpec *sp) {
         if (sp->sf->isextern || !walked.insert(sp).second) return;
@@ -4909,23 +4934,26 @@ inline bool TypeCheck::NamedOutside(FnSpec *spec, vector<VarDef *> &out) {
         }
         // Rounds reuse the same annotated body; the record only tells us
         // whether a completed round exists to justify reading it.
-        EachUse(sp->body, [&](Ident *id, Node *) { named.push_back(id->vdef); },
+        EachUse(sp->body, [&](Ident *id, Node *path) { named.push_back({ id->vdef, Is<Dot>(path) }); },
                 [&](Call *, FnSpec *callee) { visit(callee); });
     };
     visit(spec);
-    set<VarDef *> seen;
-    auto add = [&](VarDef *v) {
-        if (seen.insert(v).second) out.push_back(v);
-        for (auto c : v->components)
-            if (c && seen.insert(c).second) out.push_back(c);
+    // Keep one representative expression per resolved field path, even
+    // when a helper reads the same field in many places.
+    map<VarDef *, set<vector<pair<TypeExpr *, int>>>> seen;
+    auto add = [&](NamedUse use) {
+        vector<pair<TypeExpr *, int>> path;
+        for (auto d = use.field; d; d = Is<Dot>(d->obj))
+            path.emplace_back(d->obj->exprtype, d->fieldidx);
+        if (seen[use.var].insert(std::move(path)).second) out.push_back(use);
     };
     // A variable of an activation the call runs is created by it.
-    for (auto v : named)
-        if (v->isglobal || !walked.count(v->ownerspec)) add(v);
+    for (auto use : named)
+        if (use.var->isglobal || !walked.count(use.var->ownerspec)) add(use);
     if (pending) {
         for (auto g : ast.globals)
-            for (auto vd : g->defs) add(vd);
-        for (auto vd : vars) add(vd);
+            for (auto vd : g->defs) add({ vd, nullptr });
+        for (auto vd : vars) add({ vd, nullptr });
     } else {
         namedoutside[spec] = out;
     }

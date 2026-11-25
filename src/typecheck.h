@@ -3005,15 +3005,16 @@ struct TypeCheck {
     // (TempContents).
     using TempHolds = vector<pair<VarDef *, Roots>>;
     void RecordedViews(VarDef *h, size_t from, TypeExpr *ht, vector<LiveView> &out,
-                       set<VarDef *> &seen);
+                       set<VarDef *> &seen, span<const pair<TypeExpr *, bool>> slots = {});
     void StoredViews(VarDef *r, bool exact, TypeExpr *pointee, bool sliceref, bool byteview,
                      TypeExpr *ht, vector<LiveView> &out, set<VarDef *> &seen);
     // `base`: the `let` reference or parameter p is the binding of, whose
     // kills of what it points at (Kill) leave what holds views into an
-    // `arrtype` to the stores since.
+    // `arrtype` to the stores since. A selected field limits which of the
+    // holder's reference slots the read can follow.
     void HeldViews(const Prov &p, TypeExpr *held, bool isvar, vector<LiveView> &out,
-                   const TempHolds *temps = nullptr, VarDef *base = nullptr,
-                   TypeExpr *arrtype = nullptr);
+                   TypeExpr *field = nullptr, const TempHolds *temps = nullptr,
+                   VarDef *base = nullptr, TypeExpr *arrtype = nullptr);
     template<typename F> void EachHolderRoot(VarDef *holder, size_t from, F f);
     bool NoteLiveShrink(LiveShrink ls, FnSpec *current);
     void ApplyCalleeLiveShrinks(Node *at, FnSpec *spec, vector<Val> &argvals, string_view name);
@@ -3185,10 +3186,15 @@ struct TypeCheck {
     template<typename F, typename G> void EachUse(Node *n, F named, G called);
     TypeExpr *ReadFieldType(Dot *field, Node *base);
     bool FieldsApart(Node *use, Node *lval, TypeExpr *target, bool onexit);
-    bool NamedOutside(FnSpec *spec, vector<VarDef *> &out);
+    // A checked field path in the specialization's body, or the whole variable.
+    struct NamedUse {
+        VarDef *var;
+        Dot *field;
+    };
+    bool NamedOutside(FnSpec *spec, vector<NamedUse> &out);
     // Its results for callees whose bodies were all checked, which no
     // later check changes.
-    map<FnSpec *, vector<VarDef *>> namedoutside;
+    map<FnSpec *, vector<NamedUse>> namedoutside;
     // `fill`: a resize's fill value (Dest::fill).
     void ElemArg(Node *&n, TypeExpr *elem, Dest dest);
 
