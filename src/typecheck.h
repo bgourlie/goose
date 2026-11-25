@@ -142,6 +142,7 @@ struct TypeCheck {
         // a reference, which may be a variable: what is loaded out of it
         // was stored there (Prov::slotread).
         bool isslot = false;
+        bool intail = false;         // Inside a resizable array element, until a dereference.
         bool fotail = false;         // A frame object's resizable tail: has its own header (C.2).
         bool isvarint = false;       // varint field: read-only refs, not assignable.
         // A path into a temporary that has not crossed a reference: a
@@ -268,7 +269,41 @@ struct TypeCheck {
         VarFlow state;
         bool operator==(const FlowEntry &) const = default;
     };
+    // A may-write fact is local to a control-flow path. Keep the latest
+    // occurrence for assignment (whose RHS may install a fresh link) and
+    // the class-store index so a caller can project the surviving writes.
+    struct LinkFlow {
+        struct Part {
+            VarDef *owner;
+            ElementLinks kind;
+            bool intail;
+            int summary;
+            bool pending;  // A defer may write this part on scope exit.
+            auto operator<=>(const Part &) const = default;
+        };
+        map<Part, size_t> live;
+        void Add(const StoreEvent &e, size_t index, bool pending = false) {
+            live[{e.container, e.elementlinks, e.intail, e.linkclass, pending}] = index;
+        }
+        void Join(const LinkFlow &other) {
+            for (auto &[part, at] : other.live) {
+                auto &last = live[part];
+                last = std::max(last, at);
+            }
+        }
+        set<int> ClassStores() const {
+            set<int> stores;
+            for (auto &[part, at] : live) if (part.summary >= 0) stores.insert(part.summary);
+            return stores;
+        }
+        // Loop convergence depends on the possible writes, not event numbers.
+        bool operator==(const LinkFlow &o) const {
+            return live.size() == o.live.size() && equal(live.begin(), live.end(), o.live.begin(),
+                [](const auto &a, const auto &b) { return a.first == b.first; });
+        }
+    };
     struct FlowState {
+        LinkFlow links;
         small_vector<FlowEntry, 16> locals;
         // The narrowed globals only, in ast.globals order: the others are
         // not narrowed.
@@ -300,11 +335,13 @@ struct TypeCheck {
         // A resize's fill value: built once and copied into each slot the
         // resize adds, so no position in the array is its own (§3.9).
         bool fill = false;
-        // New elements at the end of a grow-only array.
-        bool appended = false;
+        bool intail = false;         // Receiving slot is in the resizable element run.
+        bool appended = false;       // New elements at the end of a grow-only array.
         Dest() {}
         Dest(const Roots &r, bool vb = false, TypeExpr *re = nullptr)
             : roots(r), varbind(vb), reached(re), unknown(r.None()) {}
+        Dest(const LVal &lv, bool vb, TypeExpr *re)
+            : Dest(static_cast<const Roots &>(lv), vb, re) { intail = lv.intail; }
         // A variable's own storage.
         Dest(VarDef *vd, bool vb = false) : varbind(vb) { roots.Set(vd, true); }
     };
@@ -2559,12 +2596,13 @@ struct TypeCheck {
     bool KilledFor(VarDef *c, VarDef *base, TypeExpr *t, TypeExpr *arr, size_t &since,
                    bool relative = false, TypeExpr *replaced = nullptr);
     TypeExpr *KillPartType(const Kill &k);
+    void ApplyLinkKill(const Kill &k);
     bool KillNamesType(const Kill &k, TypeExpr *target) {
         auto part = KillPartType(k);
         return part && TopConstEq(part, LoadType(target));
     }
     bool CallMayWrite(FnSpec *spec, const vector<Val> &argvals, const Kill &k);
-    vector<FnRecord::ParamKill> ParamKills(FnSpec *spec);
+    vector<FnRecord::CallerKill> CallerKills(FnSpec *spec, bool relativeonly = false);
     void NoteShrinkOrder(VarDef *root, TypeExpr *bound);
     // While a callee's shrink is judged at a call: the store events the call
     // replayed from `base` on, each with the index of the callee's class
@@ -2610,7 +2648,8 @@ struct TypeCheck {
     void NoteLitElem(LitDeep &deep, Node *at, const Val &v, TypeExpr *t);
     void HolderFromLit(Val &v, const LitDeep &deep);
     void AddStoreEvent(const StoreEvent &e);
-    void RecordElementLinks(const Roots &owners, TypeExpr *reached, ElementLinks links, Node *at);
+    void RecordElementLinks(const Roots &owners, TypeExpr *reached, ElementLinks links, Node *at,
+                            bool intail = false);
     void NoteSlotStore(const StoreEvent &e);
     // How NeverStoredError words a grow-shrink array `gs` a value pointing at
     // `roots` may point into: as the array itself where it is the value's one
@@ -2672,6 +2711,7 @@ struct TypeCheck {
         string prefix;
         vector<Diagnostic::Related> chain;
         TypeExpr *replaced;
+        bool incoming; // Links from before this activation may still survive.
     };
     vector<GlobalShrink> globalshrinks;
     void NoteGlobalShrink(Node *at, const string &prefix, VarDef *vd, TypeExpr *bound, TypeExpr *replaced);
@@ -2854,9 +2894,10 @@ struct TypeCheck {
         // is checked against those logged while its expression ran
         // (CheckGrowsSince).
         vector<GrowEvent> growlog;
-        // A deduplicated class store can be made on both sides of an
-        // overwrite. Only its last occurrence can prove it fully overwritten.
-        vector<size_t> lastclassstore;
+        LinkFlow links;
+        // (program event, summary index) for ordinary class writes in this body.
+        vector<pair<size_t, int>> classwrites;
+        vector<size_t> *deferwrites = nullptr; // Writes made while checking a deferred body.
         // The parts of holders emptied on every path here (Kill), part of
         // the flow state, which a branch joins and a loop's head takes.
         vector<Kill> kills;

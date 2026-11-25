@@ -2135,6 +2135,8 @@ struct StoreEvent {
     // Links within this owner's storage, from either a relative store or a
     // verified element run. Mapping this event requires only the destination.
     ElementLinks elementlinks = EL_NONE;
+    bool intail = false;         // The receiving slot lies in the resizable element run.
+    int linkclass = -1;          // Its index in the current body's class-store summary.
     // What was stored: a reference to something rooted at `root`, or (a
     // copy of) the contents of container `src` -- a holder value read out
     // of it, whose own events say what it points at. Never a local reference
@@ -2311,8 +2313,9 @@ struct FnRecord {
     // (TypeCheck::GrowEvent::arr).
     map<VarDef *, vector<TypeExpr *>> growexternals;
     map<int, vector<TypeExpr *>> growparams;
-    // Stores into the caller's storage, through reference parameters'
-    // class roots (§5.1): the call sites map them onto their arguments.
+    // Stores into the caller's storage through reference parameters' class
+    // roots (§5.1), and relative links written into captures and globals.
+    // Calls map parameter stores onto their arguments.
     vector<StoreEvent> classevents;
     // Where in the body each grow-only shrink above stands, as its call
     // sites judge it (§5.1): of a parameter's pointee or what it leads to
@@ -2321,37 +2324,41 @@ struct FnRecord {
     // latest occurrence (the later ones were stored after it); and the parts
     // of reference parameters' pointees every occurrence had emptied
     // (TypeCheck::Kill), each a parameter's index and the part's path.
-    struct ParamKill {
+    struct CallerKill {
         int param;
         string path;
         bool relative;
-        size_t before;  // Class-store prefix entirely overwritten on this path.
-        bool SamePart(const ParamKill &k) const {
-            return param == k.param && path == k.path && relative == k.relative;
+        VarDef *global = nullptr;   // A directly named global, instead of a parameter.
+        set<int> writes; // Ordinary class stores that may survive this overwrite at the shrink.
+        bool SamePart(const CallerKill &k) const {
+            return param == k.param && global == k.global && path == k.path && relative == k.relative;
         }
-        bool operator==(const ParamKill &) const = default;
+        bool operator==(const CallerKill &) const = default;
     };
-    static void IntersectKills(vector<ParamKill> &a, const vector<ParamKill> &b) {
+    static void IntersectKills(vector<CallerKill> &a, const vector<CallerKill> &b) {
         for (auto it = a.begin(); it != a.end();) {
             auto match = find_if(b.begin(), b.end(), [&](const auto &k) { return it->SamePart(k); });
             if (match == b.end()) it = a.erase(it);
             else {
-                it->before = std::min(it->before, match->before);
+                it->writes.insert(match->writes.begin(), match->writes.end());
                 ++it;
             }
         }
     }
     struct ShrinkOrder {
+        set<int> linkstores;       // Relative class stores still live at this shrink.
         int param = -1;
         VarDef *external = nullptr;
         TypeExpr *bound = nullptr;
         size_t before = 0;
-        vector<ParamKill> kills;
+        vector<CallerKill> kills;
     };
     vector<ShrinkOrder> shrinkorders;
-    // Parts of reference arguments overwritten on every normal return.
-    // Stores outside the overwritten prefix remain visible to the caller.
-    vector<ParamKill> exitoverwrites;
+    // Parts of reference arguments or globals overwritten on every normal return.
+    // Exit stores are applied after these guaranteed overwrites.
+    vector<CallerKill> exitoverwrites;
+    set<int> exitlinkstores;
+    bool unknownexitlinks = false;  // A nonlocal exit outside the checked activation.
     size_t eventstart = 0;         // storeevents.size() when the body's check began.
     size_t eventend = 0;           // And when it ended.
     // Where those events pointed as the check left them, at the body's

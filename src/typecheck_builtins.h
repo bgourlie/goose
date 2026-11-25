@@ -461,28 +461,10 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
         for (size_t i = 1; i < args.size(); i++) CheckPrintable(c, d.name, args, i, &rv);
         return VoidVal();
     }
-    // A grow-only array shrinks only where nothing can still be rooted in
-    // it (§5.1); pop, pop_n and resize also need an element the shrink can
-    // find, which a sequential array has not got.
-    auto shrink = (d.flags & BF_SHRINKS) != 0;
-    if (ak == A_GROW && shrink) {
-        auto length = d.kind == B_RESIZE ? Is<IntLit>(args[1]) : nullptr;
-        auto empties = d.kind == B_CLEAR || (length && length->val == 0);
-        CheckGrowShrink(c, d.name, args[0], rv, empties);
-        if (d.kind != B_CLEAR && ClassOf(elem) != SC_FIXED)
-            Error(c, cat(".", d.name, " needs fixed-size elements: ", TypeStr(rv.type),
-                         " is sequential (§3.3)"));
-    }
-    // A grow-shrink array shrinks from anywhere, provided nothing in scope
-    // refers into it (§5.2).
-    if (ak == A_GROWSHRINK && shrink)
-        ShrinkThrough(c, d.name, ExprStr(args[0]), rv,
-                      IsPlainRef(rv.type) ? rv.type->ref->sub : rv.type,
-                      d.kind == B_RESIZE && ResizesToMark(args[0], args[1]) ? SB_BALANCED
-                                                                            : SB_UNBALANCED);
     auto elementdest = [&] {
         Dest dest(rv, false, rv.reached);
         dest.fill = d.kind == B_RESIZE;
+        dest.intail = ak == A_GROW;
         dest.appended = ak == A_GROW && (d.kind == B_PUSH || d.kind == B_APPEND);
         return dest;
     };
@@ -499,7 +481,6 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
                                    "contains self-relative references, is not supported; push "
                                    "the elements, which constructs each in place"));
         }
-        return VoidVal();
     }
     // index_of recovers the element index a reference stands for (§3.3).
     // The reference must be an element of this very array, which is what
@@ -644,6 +625,25 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
             default: assert(false);
         }
     }
+    // A grow-only array shrinks only where nothing can still be rooted in
+    // it (§5.1); pop, pop_n and resize also need an element the shrink can
+    // find, which a sequential array has not got.
+    auto shrink = (d.flags & BF_SHRINKS) != 0;
+    if (ak == A_GROW && shrink) {
+        auto length = d.kind == B_RESIZE ? Is<IntLit>(args[1]) : nullptr;
+        auto empties = d.kind == B_CLEAR || (length && length->val == 0);
+        CheckGrowShrink(c, d.name, args[0], rv, empties);
+        if (d.kind != B_CLEAR && ClassOf(elem) != SC_FIXED)
+            Error(c, cat(".", d.name, " needs fixed-size elements: ", TypeStr(rv.type),
+                         " is sequential (§3.3)"));
+    }
+    // A grow-shrink array shrinks from anywhere, provided nothing in scope
+    // refers into it (§5.2).
+    if (ak == A_GROWSHRINK && shrink)
+        ShrinkThrough(c, d.name, ExprStr(args[0]), rv,
+                      IsPlainRef(rv.type) ? rv.type->ref->sub : rv.type,
+                      d.kind == B_RESIZE && ResizesToMark(args[0], args[1]) ? SB_BALANCED
+                                                                            : SB_UNBALANCED);
     // Returns, from the table.
     Val v = VoidVal();
     // A reference or slice element read out as itself: it points where the
@@ -1227,18 +1227,9 @@ inline const string *TypeCheck::EmbedShader(Call *c, vector<Node *> &args) {
 // the storage the struct lies in, as a reference to the field would.
 inline void TypeCheck::CheckGrowShrink(Node *at, const char *op, Node *recv, const Val &rv,
                                        bool empties) {
-    auto id = Is<Ident>(recv);
-    auto vd = id ? id->vdef : nullptr;
-    auto at_type = rv.type->kind == TY_REF ? rv.type->ref->sub : rv.type;
+    auto at_type = IsPlainRef(rv.type) ? rv.type->ref->sub : rv.type;
     assert(at_type->kind == TY_ARRAY);
-    Roots roots;
-    if (vd) {
-        // Through a reference variable or parameter: the array it points at.
-        auto viaref = vd->type && vd->type->kind == TY_REF;
-        roots = viaref ? RefRootsOf(vd) : RootsOf(vd);
-    } else {
-        roots = rv.AsRoots();
-    }
+    auto roots = rv.AsRoots();
     if (!ShrinkRootsKnown(roots))
         Error(at, cat(op, " through a reference whose array is not known (§5.1)"));
     if (empties && HasRelRefT(at_type))
@@ -1270,23 +1261,29 @@ inline bool TypeCheck::RetainsRelativeSlot(TypeExpr *part, TypeExpr *array, Type
     return AnyField(part, [&](TypeExpr *ft) { return RetainsRelativeSlot(ft, array, replaced); });
 }
 
-// Read the stores still live on this path. The owner's high-water mark
-// drives loop convergence; overwrites and call ordering determine which
-// links a value actually carries at a read, conversion, or shrink.
+// Consult only writes that reach this point. Captures and globals can
+// also carry links into a body from its caller, until a proven overwrite.
 inline ElementLinks TypeCheck::LiveElementLinks(VarDef *owner, TypeExpr *target, TypeExpr *replaced) {
     if (!owner->elementlinks) return EL_NONE;
     auto t = owner->type ? LoadType(owner->type) : target;
     auto arr = target ? ResizableArrayIn(target) : nullptr;
     if (t && !RetainsRelativeSlot(t, arr, replaced)) return EL_NONE;
-    auto from = LiveEventBase(owner);
-    size_t since;
-    if (t && KilledFor(owner, owner, t, arr, since, true, replaced)) from = std::max(from, since);
+    size_t since = 0;
+    bool cleared = t && KilledFor(owner, owner, t, arr, since, true, replaced);
+    auto emptiestail = replaced && ResizableArrayIn(replaced);
     auto links = EL_NONE;
-    for (auto i = from; i < storeevents.size(); i++) {
-        auto &e = storeevents[i];
-        if (e.container != owner || !e.elementlinks || StoredLater(i)) continue;
-        links = std::max(links, e.elementlinks);
-        if (links == EL_ANY) break;
+    for (auto &[part, at] : cur.links.live) {
+        if (part.owner != owner || (emptiestail && part.intail)) continue;
+        if (owner->type && !part.pending && cleared && at < since) continue;
+        links = std::max(links, part.kind);
+    }
+    auto spec = CurRealFrame().spec;
+    if (!cleared && spec && (owner->isglobal || (owner->ownerspec && owner->ownerspec != spec))) {
+        for (size_t i = 0; i < spec->record.eventstart; i++) {
+            auto &e = storeevents[i];
+            if (e.container == owner && !(emptiestail && e.intail))
+                links = std::max(links, e.elementlinks);
+        }
     }
     return links;
 }
@@ -1407,7 +1404,7 @@ inline void TypeCheck::CheckHeldShrinks(Node *at, const string &op, VarDef *root
 inline bool TypeCheck::KillPath(Node *n, VarDef *&base, string &path) {
     if (auto id = Is<Ident>(n)) {
         auto vd = id->vdef;
-        if (!vd || vd->isglobal || vd->istemp) return false;
+        if (!vd || vd->istemp) return false;
         if (IsRefOrSlice(vd->type) && (vd->type->kind != TY_REF || vd->isvar)) return false;
         base = vd;
         path.clear();
@@ -1446,10 +1443,10 @@ inline void TypeCheck::NoteOverwrite(Node *lval, const Roots &loc, size_t at, bo
                                      TypeExpr *target) {
     if (!reachable || !loc.Exact()) return;
     auto container = loc.Root();
-    if (!container || container->isglobal || IsTemp(container)) return;
+    if (!container || (!relative && container->isglobal) || IsTemp(container)) return;
     VarDef *base = nullptr;
     string path;
-    if (!KillPath(lval, base, path)) return;
+    if (!KillPath(lval, base, path) || (!relative && base->isglobal)) return;
     if (!IsRefOrSlice(base->type) && base != container) return;
     Kill kill { container, base, path, at, relative };
     // Clearing or assigning through a reference field replaces the pointee.
@@ -1457,6 +1454,32 @@ inline void TypeCheck::NoteOverwrite(Node *lval, const Roots &loc, size_t at, bo
     if (relative && !KillNamesType(kill, target)) return;
     erase_if(cur.kills, [&](const Kill &k) { return k.SamePart(kill); });
     cur.kills.push_back(std::move(kill));
+    if (relative) ApplyLinkKill(cur.kills.back());
+}
+
+// The assignment overwrites old links; the stores made in its RHS start at
+// k.at and belong to the new value. A registered defer can still relink it.
+inline void TypeCheck::ApplyLinkKill(const Kill &k) {
+    if (cur.links.live.empty()) return;
+    auto owner = k.container;
+    // A parameter class identifies an owner, not a particular subobject.
+    // Two fixed-size parameters of the same type may name sibling fields.
+    // A resizable pointee is unique in its owner (§3.3), so an overwrite
+    // there can kill writes reached through that same type of pointee.
+    auto t = LoadType(owner->type ? owner->type : k.base->type->ref->sub);
+    size_t since;
+    bool all = (owner->type || ClassOf(t) == SC_RESIZABLE) &&
+               KilledFor(owner, owner, t, nullptr, since, true);
+    auto part = KillPartType(k);
+    bool tail = part && ResizableArrayIn(part);
+    erase_if(cur.links.live, [&](const auto &entry) {
+        auto &[place, at] = entry;
+        if (place.owner != owner || place.pending) return false;
+        if (tail && place.intail && at < k.at) return true;
+        if (!all || at >= since) return false;
+        auto reached = storeevents[at].reached;
+        return owner->type || (reached && TopConstEq(t, LoadType(reached)));
+    });
 }
 
 // Whether the kills in force empty every slot of a `t` lying at `base` in
@@ -1763,20 +1786,20 @@ inline void TypeCheck::AddStoreEvent(const StoreEvent &e) {
         }
         // A variable being initialized may still be waiting for its type.
         // Its owner is already set, unlike a synthetic parameter class.
-        if (e.container->ownerspec) return;
+        if (e.container->ownerspec && e.container->ownerspec == CurRealFrame().spec) return;
     } else {
         madestores.push_back(e);
         e.container->storedinto = true;
         NoteSlotStore(e);
     }
-    if (e.container->type || e.container->isglobal) return;
+    if (!e.elementlinks && (e.container->type || e.container->isglobal)) return;
     auto spec = CurRealFrame().spec;
     if (!spec) return;
     // The callee's class event a replayed store came from, for the entry it
     // lands in: the earliest of those, where any is (Replay).
     auto origin = [&](size_t m) {
-        if (m >= cur.lastclassstore.size()) cur.lastclassstore.resize(m + 1, SIZE_MAX);
-        cur.lastclassstore[m] = storeevents.size() - 1;
+        if (e.elementlinks) storeevents.back().linkclass = (int)m;
+        else cur.classwrites.emplace_back(storeevents.size() - 1, (int)m);
         if (!replay.classorigins || m < replay.classbase) return;
         auto &os = *replay.classorigins;
         auto k = m - replay.classbase;
@@ -1792,7 +1815,7 @@ inline void TypeCheck::AddStoreEvent(const StoreEvent &e) {
     auto &evs = spec->record.classevents;
     for (size_t m = 0; m < evs.size(); m++) {
         auto &o = evs[m];
-        if (o.container == e.container && o.elementlinks == e.elementlinks &&
+        if (o.container == e.container && o.elementlinks == e.elementlinks && o.intail == e.intail &&
             o.root == e.root && o.src == e.src &&
             o.exact == e.exact && o.byteview == e.byteview && o.bound == e.bound &&
             o.slot == e.slot && o.sliceref == e.sliceref && !o.pointee == !e.pointee &&
@@ -1810,18 +1833,22 @@ inline void TypeCheck::AddStoreEvent(const StoreEvent &e) {
 // Internal links move with the complete element run. The destination alone
 // owns both ends, including when a call maps the store through a parameter.
 inline void TypeCheck::RecordElementLinks(const Roots &owners, TypeExpr *reached,
-                                          ElementLinks links, Node *at) {
+                                          ElementLinks links, Node *at, bool intail) {
     if (!reachable || owners.None()) return;
     for (auto &d : ShrinkTargets(owners, reached, false)) {
         if (IsTemp(d.root)) continue;
         StoreEvent e;
         e.container = d.root;
         e.elementlinks = links;
+        e.intail = intail;
         e.exact = true;  // No external root is stored.
         e.reached = reached;
         e.bound = d.bound;
         e.at = at->line;
         AddStoreEvent(e);
+        auto index = storeevents.size() - 1;
+        cur.links.Add(storeevents.back(), index);
+        if (cur.deferwrites) cur.deferwrites->push_back(index);
     }
 }
 
@@ -2377,7 +2404,7 @@ inline void TypeCheck::ApplyCalleeStores(FnSpec *spec, vector<Val> &argvals, Nod
         auto from = storeevents.size();
         replay.origin = (int)(&e - rec->classevents.data());
         if (e.elementlinks)
-            RecordElementLinks(mapped(e.container, !e.bound), e.reached, e.elementlinks, at);
+            RecordElementLinks(mapped(e.container, !e.bound), e.reached, e.elementlinks, at, e.intail);
         else
             applystore(e, mapped(e.root, e.exact), true);
         replay.origin = -1;
@@ -2475,10 +2502,14 @@ inline void TypeCheck::ThreadIndexError(Node *at, TypeExpr *t) {
 // same array, which differ in nothing that judgement asks.
 inline void TypeCheck::NoteGlobalShrink(Node *at, const string &prefix, VarDef *vd,
                                         TypeExpr *bound, TypeExpr *replaced) {
+    size_t since;
+    bool incoming = bound || !KilledFor(vd, vd, LoadType(vd->type), ResizableArrayIn(vd->type),
+                                        since, true, replaced);
     for (auto &gs : globalshrinks)
-        if (gs.arr == vd && (!gs.replaced == !replaced && (!replaced || TypeEq(gs.replaced, replaced))) && !gs.bound == !bound &&
+        if (gs.arr == vd && gs.incoming == incoming && !gs.replaced == !replaced &&
+            (!replaced || TypeEq(gs.replaced, replaced)) && !gs.bound == !bound &&
             (!bound || TypeEq(gs.bound, bound))) return;
-    globalshrinks.push_back({ vd, bound, at->line, prefix, Chain({}), replaced });
+    globalshrinks.push_back({ vd, bound, at->line, prefix, Chain({}), replaced, incoming });
 }
 
 // A global may hold a reference into a global array only where a store, or
@@ -2509,8 +2540,12 @@ inline void TypeCheck::CheckGlobalShrinks() {
         }
         for (auto arr : arrays) {
             auto arrtype = gs.bound ? gs.bound : LoadType(arr->type);
-            if (arr->elementlinks == EL_ANY &&
-                RetainsRelativeSlot(LoadType(arr->type), ResizableArrayIn(arrtype), gs.replaced))
+            if (gs.incoming && arr->elementlinks == EL_ANY &&
+                RetainsRelativeSlot(LoadType(arr->type), ResizableArrayIn(arrtype), gs.replaced) &&
+                any_of(storeevents.begin(), storeevents.end(), [&](const StoreEvent &e) {
+                    return e.container == arr && e.elementlinks == EL_ANY &&
+                           !(e.intail && gs.replaced && ResizableArrayIn(gs.replaced));
+                }))
                 ErrorIn(LocOf(gs.at), cat(gs.prefix, ": retained storage may have a "
                         "self-relative link to a removed element (§5.1)"), gs.chain);
             for (auto g : ast.globals) {
@@ -2984,19 +3019,25 @@ inline void TypeCheck::NoteShrink(VarDef *root, TypeExpr *bound, ShrinkEffect ef
 }
 
 // Express path-sensitive overwrites in terms of the caller's arguments.
-inline vector<FnRecord::ParamKill> TypeCheck::ParamKills(FnSpec *spec) {
-    vector<FnRecord::ParamKill> out;
+inline vector<FnRecord::CallerKill> TypeCheck::CallerKills(FnSpec *spec, bool relativeonly) {
+    vector<FnRecord::CallerKill> out;
     if (cur.kills.empty()) return out;
+    for (auto &k : cur.kills)
+        if (k.relative && k.base->isglobal && k.base == k.container)
+            out.push_back({ -1, k.path, true, k.base });
     for (size_t p = 0; p < spec->params.size(); p++) {
         auto param = spec->params[p];
         if (!IsPlainRef(param->type)) continue;
         for (auto &k : cur.kills) {
-            if (k.base != param || k.container != RefRootOf(param)) continue;
-            size_t before = 0;
-            if (k.relative)
-                while (before < cur.lastclassstore.size() && cur.lastclassstore[before] < k.at)
-                    before++;
-            out.push_back({ (int)p, k.path, k.relative, before });
+            if ((relativeonly && !k.relative) || k.base != param || k.container != RefRootOf(param)) continue;
+            FnRecord::CallerKill kill { (int)p, k.path, k.relative };
+            if (!k.relative) {
+                // Rechecking a loop reuses class-store indices. Only writes
+                // after this overwrite and before this shrink remain live.
+                for (auto [at, cls] : cur.classwrites)
+                    if (at >= k.at && !StoredLater(at)) kill.writes.insert(cls);
+            }
+            out.push_back(std::move(kill));
         }
     }
     return out;
@@ -3027,13 +3068,17 @@ inline void TypeCheck::NoteShrinkOrder(VarDef *root, TypeExpr *bound) {
                     b = std::max(b, callorder.classbase + k + 1);
             if (o.before <= callorder.classbase + os.size()) o.before = std::min(o.before, b);
         }
-        if (known) o.kills = ParamKills(s);
+        if (known) {
+            o.kills = CallerKills(s);
+            o.linkstores = cur.links.ClassStores();
+        }
         for (auto &e : s->record.shrinkorders) {
             if (e.param != param || e.external != external || !e.bound != !bound ||
                 (bound && !TypeEq(e.bound, bound)))
                 continue;
             e.before = std::max(e.before, o.before);
             FnRecord::IntersectKills(e.kills, o.kills);
+            e.linkstores.insert(o.linkstores.begin(), o.linkstores.end());
             return;
         }
         s->record.shrinkorders.push_back(o);
@@ -3769,33 +3814,52 @@ inline void TypeCheck::ApplyCalleeShrinks(Node *at, FnSpec *spec, vector<Val> &a
     // the part's path. Stores into a variable a nested function or a function
     // value names keep the events of an earlier check of its body, which no
     // order says anything of, so a kill never empties one.
-    auto argkill = [&](const FnRecord::ParamKill &k, bool permanent) {
+    auto mapkill = [&](const FnRecord::CallerKill &k) -> std::optional<Kill> {
+        if (k.global) return Kill { k.global, k.global, k.path, storesbase, true };
         auto p = k.param;
-        if (p < 0 || (size_t)p >= argnodes.size() || (size_t)p >= argvals.size()) return;
+        if (p < 0 || (size_t)p >= argnodes.size() || (size_t)p >= argvals.size()) return {};
         auto &v = argvals[(size_t)p];
-        if (!v.Exact()) return;
+        if (!v.Exact()) return {};
         auto x = v.Root();
-        if (!x || x->isglobal || IsTemp(x) || x->captured) return;
+        if (!x || (!k.relative && x->isglobal) || IsTemp(x) || x->captured) return {};
         auto n = argnodes[(size_t)p];
         if (auto u = Is<Unary>(n); u && u->op == T_BITAND) n = u->child;
         VarDef *base = nullptr;
         string bpath;
-        if (!KillPath(n, base, bpath)) return;
+        if (!KillPath(n, base, bpath)) return {};
         if (IsRefOrSlice(base->type) ? !base->ref.Exact() || base->ref.Root() != x : base != x)
-            return;
+            return {};
         Kill kill { x, base, bpath, storesbase, k.relative };
-        if (k.relative) {
-            if (!KillNamesType(kill, spec->params[p]->type->ref->sub)) return;
+        if (k.relative && !KillNamesType(kill, spec->params[p]->type->ref->sub)) return {};
+        kill.path += k.path;
+        if (!k.relative) {
             for (; kill.at < storeevents.size(); kill.at++) {
                 auto &e = storeevents[kill.at];
-                if (e.container != x || !e.elementlinks) continue;
+                if (e.elementlinks || e.container != x) continue;
                 auto i = kill.at - storesbase;
-                if (i >= origins.size() || origins[i] < 0 || (size_t)origins[i] >= k.before) break;
+                if (i >= origins.size() || origins[i] < 0 || k.writes.count(origins[i])) break;
             }
         }
-        kill.path += k.path;
+        return kill;
+    };
+    auto argkill = [&](const FnRecord::CallerKill &k, bool permanent) {
+        auto mapped = mapkill(k);
+        if (!mapped) return;
+        auto &kill = *mapped;
         if (permanent) erase_if(cur.kills, [&](const Kill &old) { return old.SamePart(kill); });
         cur.kills.push_back(std::move(kill));
+        if (k.relative) ApplyLinkKill(cur.kills.back());
+    };
+    auto entrylinks = cur.links;
+    // Link stores and guaranteed overwrites describe two separate effects:
+    // clear the incoming state first, then add writes surviving at this exit
+    // or shrink. Store order in an alternative branch is immaterial.
+    auto projectlinks = [&](const set<int> *live) {
+        for (size_t i = 0; i < origins.size(); i++) {
+            auto &e = storeevents[storesbase + i];
+            if (e.elementlinks && (!live || origins[i] < 0 || live->count(origins[i])))
+                cur.links.Add(e, storesbase + i);
+        }
     };
     auto apply = [&](const Hit &h, ShrinkBalance judged) {
         auto what = cat("call ", name, ", which ", h.how);
@@ -3809,15 +3873,19 @@ inline void TypeCheck::ApplyCalleeShrinks(Node *at, FnSpec *spec, vector<Val> &a
                 TypeCheck &tc;
                 CallOrder order;
                 size_t kills;
+                LinkFlow links;
                 ~Restore() {
+                    tc.cur.links = std::move(links);
                     tc.callorder = order;
                     tc.cur.kills.resize(std::min(kills, tc.cur.kills.size()));
                 }
-            } restore { *this, callorder, cur.kills.size() };
+            } restore { *this, callorder, cur.kills.size(), std::move(cur.links) };
+            cur.links = entrylinks;
             if (h.order) {
                 callorder = { storesbase, &origins, h.order->before, &classorigins, classbase };
                 for (auto &k : h.order->kills) argkill(k, false);
             }
+            projectlinks(h.order && h.order->before != SIZE_MAX ? &h.order->linkstores : nullptr);
             GrowOnlyShrinkAt(at, what, h.root, string(h.root->name), h.bound, h.arr,
                              h.viaclass, h.effect);
         } else if (judged == SB_UNBALANCED) {
@@ -3996,8 +4064,11 @@ inline void TypeCheck::ApplyCalleeShrinks(Node *at, FnSpec *spec, vector<Val> &a
     };
     for (auto &h : hits) apply(h, judge(h));
     ApplyCalleeLiveShrinks(at, spec, argvals, name);
-    if (applyexits && ordered)
+    if (applyexits && ordered && !rec->unknownexitlinks) {
+        cur.links = std::move(entrylinks);
         for (auto &k : rec->exitoverwrites) argkill(k, true);
+        projectlinks(&rec->exitlinkstores);
+    }
 }
 
 inline bool TypeCheck::BuiltInPlace(TypeExpr *elem) {

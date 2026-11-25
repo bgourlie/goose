@@ -1361,15 +1361,23 @@ inline Val TypeCheck::TryDispatch(Call *c, vector<SFunction *> &cands, FnSpec *e
         for (auto sp : c->dispatch) byreference |= sp->argtypes[found]->kind == TY_REF;
         RecordVal(argnodes[found], byreference ? argvals[found] : DecayRef(argvals[found]));
     }, entryreach);
-    // Like an ordinary call's, the cases' rebinds follow the argument checks.
+    // Every case starts at the same point after argument evaluation. Only
+    // returning cases contribute their surviving links and overwrites.
+    auto entry = SaveFlow();
+    FlowState exits;
+    exits.reachable = false;
     for (size_t vi = 0; vi < c->dispatch.size(); vi++) {
         auto spec = c->dispatch[vi];
         armvals[found] = argvals[found];
         armvals[found].type = caseargs[vi];
-        ApplyCalleeShrinks(c, spec, armvals, name, argnodes);
+        RestoreFlow(entry);
+        ApplyCalleeShrinks(c, spec, armvals, name, argnodes, true);
         ApplyCalleeGrows(c, spec, armvals, name);
+        CheckCalleeRelative(c, spec, argvals);
+        auto rec = RecordOf(spec);
+        if (!rec || rec->mayreturn) exits = JoinFlow(exits, SaveFlow());
     }
-    for (auto spec : c->dispatch) CheckCalleeRelative(c, spec, argvals);
+    RestoreFlow(exits.reachable ? exits : entry);
     CalleesReturn(c->dispatch, argsreach);
     // The cases are alternatives of one call, like a match's arms: the result
     // is only as long-lived, exact and writable as every case's result. A case
@@ -1971,8 +1979,6 @@ inline void TypeCheck::ReplayEnvExits(FnSpec *spec) {
         v->ref = x.ref;
         v->contents = x.contents;
         v->contentbyteview = x.contentbyteview;
-        if (x.elementlinks > v->elementlinks)
-            RecordElementLinks(RootsOf(v), v->type, x.elementlinks, spec->body);
         v->slotref = v->slotref || x.slotref;
         NoteFact(v);
     }
@@ -2002,11 +2008,12 @@ inline void TypeCheck::NoteExit(int tf, const OuterExit *added) {
     if (target) {
         // A nonlocal exit or a callback need not have this activation's
         // current paths. Only export overwrites that every exit proves.
-        vector<FnRecord::ParamKill> out;
+        vector<FnRecord::CallerKill> out;
         if (!added && tf == RealFrameIndex() && !frames.back().isfunval) {
-            out = ParamKills(target);
-            erase_if(out, [](const auto &k) { return !k.relative; });
-        }
+            auto stores = cur.links.ClassStores();
+            target->record.exitlinkstores.insert(stores.begin(), stores.end());
+            out = CallerKills(target, true);
+        } else target->record.unknownexitlinks = true;
         auto &all = target->record.exitoverwrites;
         if (!e->reached) all = std::move(out);
         else FnRecord::IntersectKills(all, out);
@@ -2994,7 +3001,8 @@ inline bool TypeCheck::SameRecord(const FnRecord &a, const FnRecord &b, const Fn
             }))
             return why("relative destinations");
     if (a.mayreturn != b.mayreturn) return why("normal completion");
-    if (a.exitoverwrites != b.exitoverwrites) return why("overwritten arguments");
+    if (a.exitoverwrites != b.exitoverwrites || a.exitlinkstores != b.exitlinkstores ||
+        a.unknownexitlinks != b.unknownexitlinks) return why("link effects on return");
     if (a.retroots.size() != b.retroots.size()) return why("returns");
     for (size_t i = 0; i < a.retroots.size(); i++) {
         auto &p = a.retroots[i], &q = b.retroots[i];
@@ -3047,7 +3055,7 @@ inline bool TypeCheck::SameRecord(const FnRecord &a, const FnRecord &b, const Fn
             return why("live shrinks");
     }
     auto sameevents = [&](const StoreEvent &p, const StoreEvent &q) {
-        return p.container == q.container && p.elementlinks == q.elementlinks &&
+        return p.container == q.container && p.elementlinks == q.elementlinks && p.intail == q.intail &&
                p.root == q.root && p.src == q.src &&
                p.exact == q.exact && p.byteview == q.byteview && p.bound == q.bound &&
                p.slot == q.slot && p.sliceref == q.sliceref && p.classread == q.classread &&
@@ -4246,7 +4254,7 @@ inline void TypeCheck::CheckCalleeRelative(Call *call, FnSpec *spec, vector<Val>
                             target, " to receiving storage ", receiver));
         }
         if (s.result >= 0 && dest.reached && !dest.result && !source.None())
-            RecordElementLinks(dest.roots, dest.reached, dest.appended ? EL_BACKWARD : EL_ANY, call);
+            RecordElementLinks(dest.roots, dest.reached, dest.appended ? EL_BACKWARD : EL_ANY, call, dest.intail);
     }
 }
 

@@ -3664,15 +3664,19 @@ return or an inlined body's exit ever copies such a local instead
 A verified array can contain links between elements. A non-null
 self-relative store also records a link on the receiving storage. A store
 into a newly pushed grow-only element can refer back to existing elements,
-whereas decoding or rebinding can introduce forward links.
-`RecordElementLinks` records these stores on the owner and replays them at
-calls through the destination parameter. `LiveElementLinks` consults the
-stores since the last guaranteed overwrite of the relevant slots. A shrink
-checks the slots it retains, including a byte link into an image-safe
-element (§5.1). The existing call and branch summaries intersect the
-overwritten paths. For relative links they also keep the prefix of class
-stores wholly before the overwrite, so a later store remains visible even
-when the two stores share a summary entry.
+whereas decoding or rebinding can introduce forward links. `LinkFlow`
+records the writes that may still be live on each path, distinguishing
+slots known to lie in the resizable element run. A clear discards that
+run. Header links, including links into a byte view, may survive it.
+
+Branches and dispatch cases join the writes from each returning path.
+A call summary identifies which stores survive at each shrink and on
+return, and which parts of the incoming storage were overwritten on every
+path. The caller applies the overwrites before projecting those surviving
+stores. A defer can relink storage on scope exit, so a later textual
+overwrite cannot erase its pending writes. A guaranteed overwrite of a
+global also applies at the shrink site. The final global check still
+accounts for external views.
 
 `Val::elementlinks` carries the owner's links through branches, by-value
 arguments, named results and each forwarded result slot. The by-value

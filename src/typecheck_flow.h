@@ -568,6 +568,7 @@ inline Prov TypeCheck::RefProvOf(VarDef *vd) {
 
 inline VarDef *TypeCheck::ResetLocal(VarDef *previous) {
     if (!previous) return ast.NewVarDef();
+    erase_if(cur.links.live, [&](const auto &entry) { return entry.first.owner == previous; });
     // Cached nested specializations capture this identity. Recompute its
     // checking state, but retain the capture discovered on an earlier pass,
     // and the marks no pass may lose (a nested function checked once set
@@ -950,6 +951,7 @@ inline TypeCheck::FlowState TypeCheck::SaveFlow() {
         if (v->narrowed) f.globals.push_back({ v, v->narrowed });
     f.reachable = reachable;
     f.kills = cur.kills;
+    f.links = cur.links;
     return f;
 }
 
@@ -964,6 +966,7 @@ inline void TypeCheck::RestoreFlow(const FlowState &f) {
     for (auto [v, narrowed] : f.globals) v->narrowed = narrowed;
     reachable = f.reachable;
     cur.kills = f.kills;
+    cur.links = f.links;
 }
 
 inline TypeCheck::FlowState TypeCheck::JoinFlow(const FlowState &a, const FlowState &b) {
@@ -1007,6 +1010,11 @@ inline TypeCheck::FlowState TypeCheck::JoinFlow(const FlowState &a, const FlowSt
                 if (k.SamePart(l))
                     joined.kills.push_back({ k.container, k.base, k.path, std::min(k.at, l.at), k.relative });
     }
+    joined.links = a.reachable ? a.links : b.links;
+    if (a.reachable && b.reachable) joined.links.Join(b.links);
+    erase_if(joined.links.live, [&](const auto &entry) {
+        return Depth(entry.first.owner) > CurDepth();
+    });
     joined.reachable = a.reachable || b.reachable;
     return joined;
 }
@@ -1869,7 +1877,6 @@ inline TypeCheck::Scope TypeCheck::CheckLoopPasses(Node *x, FlowState &head,
                                                    const function<void()> &pass) {
     auto entry = head;
     auto firstbase = storeevents.size();
-    map<VarDef *, ElementLinks> carriedlinks;
     auto warnbase = cur.pendingwarnings.size();
     auto settled = false;
     Scope sc;
@@ -1897,20 +1904,6 @@ inline TypeCheck::Scope TypeCheck::CheckLoopPasses(Node *x, FlowState &head,
         cur.looppasses.pop_back();
         auto next = sc.backedges ? JoinFlow(entry, sc.backedge) : entry;
         auto changed = lp.changed || !SameFlow(next, head);
-        // A link written after an overwrite can reach the next iteration
-        // even if the owner held the same kind of link before the loop.
-        if (sc.backedges) {
-            for (auto i = lp.eventbase; i < storeevents.size(); i++) {
-                auto &e = storeevents[i];
-                if (!e.elementlinks || Depth(e.container) > lp.scopeidx) continue;
-                if (e.elementlinks == EL_BACKWARD && IsClassRoot(e.container)) continue;
-                auto &links = carriedlinks[e.container];
-                if (links < e.elementlinks) {
-                    links = e.elementlinks;
-                    changed = true;
-                }
-            }
-        }
         head = next;
         if (changed) continue;
         if (settled || !(lp.sawunbound || lp.deferred)) break;
@@ -2329,11 +2322,15 @@ inline void TypeCheck::CheckDefer(Defer *d) {
         for (auto v : g->defs)
             if (v->isvar) v->narrowed = nullptr;
     PushScope(SK_DEFER, d);
+    vector<size_t> writes;
+    Saved<vector<size_t> *> collecting(cur.deferwrites, &writes);
     deferbodies++;
     CheckBlockVal(d->body, nullptr, false);
     deferbodies--;
     PopScope();
     RestoreFlow(saved);
+    for (auto i : writes) cur.links.Add(storeevents[i], i, true);
+    if (collecting.saved) collecting.saved->insert(collecting.saved->end(), writes.begin(), writes.end());
     d->exprtype = ast.voidtype;
 }
 

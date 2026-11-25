@@ -89,6 +89,7 @@ inline TypeCheck::LVal TypeCheck::CheckLValue(Node *n) {
                          " of variable-size elements cannot be indexed, only iterated; for "
                          "random access, keep your own array of references to them (§3.3)"));
         if (lv.intemp) NoRelRefTempRead(ix->obj, lv.type, elem);
+        lv.intail |= IsArrayKind(lv.type, A_GROW);
         CheckIntAny(ix->idx);
         if (lv.type->cq) lv.writable = false;   // An element of a const value.
         lv.letbound = false;
@@ -162,6 +163,7 @@ inline void TypeCheck::DerefLValue(LVal &lv, Node *at) {
         // so it keeps the container's root.
         ReadBackLVal(lv);
     }
+    lv.intail = false;
     lv.type = lv.type->ref->sub;
     lv.reached = LoadType(lv.type);
     lv.var = nullptr;
@@ -206,6 +208,7 @@ inline void TypeCheck::RequireIndexArray(TypeExpr *t, Node *at, string_view what
 // sliced lies in the elements it views (Prov::reached).
 inline void TypeCheck::SliceProvenance(LVal &lv, Node *at) {
     if (lv.type->kind != TY_SLICE) return;
+    lv.intail = false;
     if (!lv.var) {
         if (lv.fromstorage) ReadBackLVal(lv);
         else if (lv.throughref) lv.SetProv(SlotView(lv, lv.type));
@@ -1052,7 +1055,8 @@ inline void TypeCheck::MustFit(Val &v, Node *n, TypeExpr *dt) {
     auto from = LoadType(v.type);
     if (FitsAt(v, dt)) {
         if (v.elementlinks && !IsRefOrSlice(dt) && !curdst.roots.None())
-            RecordElementLinks(curdst.roots, curdst.reached ? curdst.reached : dt, v.elementlinks, n);
+            RecordElementLinks(curdst.roots, curdst.reached ? curdst.reached : dt, v.elementlinks,
+                               n, curdst.intail || IsArrayKind(dt, A_GROW));
         if (IsIntT(dt) && !TypeEq(from, dt)) {
             RelyOnNamed(v, n);
             if (v.flexint && dt->intstorage != IS_VARINT) RetypeFlexInt(n, dt);
@@ -1400,7 +1404,7 @@ inline bool TypeCheck::FitsAt(Val &v, TypeExpr *dt) {
                 }
                 if (recordingrelative && !dt->ref->pool && !curdst.result)
                     RecordElementLinks(curdst.roots, curdst.reached ? curdst.reached : dt,
-                                       curdst.appended ? EL_BACKWARD : EL_ANY, fitnode);
+                                       curdst.appended ? EL_BACKWARD : EL_ANY, fitnode, curdst.intail);
                 v.type = dt;
                 return true;
             }
@@ -1873,7 +1877,10 @@ inline Val TypeCheck::CheckLogical(Binary *b) {
         if (gn && !gv->narrowed) b->rightkills.push_back(gv);
     // What it leaves emptied may not be, but what it ended stays ended.
     auto rightkills = cur.kills;
+    auto rightlinks = std::move(cur.links);
+    auto rightreturns = reachable;
     RestoreFlow(snap);
+    if (rightreturns) cur.links.Join(rightlinks);
     erase_if(cur.kills, [&](const Kill &k) {
         return none_of(rightkills.begin(), rightkills.end(), [&](const Kill &l) {
             return k.SamePart(l);
