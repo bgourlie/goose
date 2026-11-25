@@ -2539,6 +2539,7 @@ struct TypeCheck {
     Val RetAltVal(FnSpec *spec, const RootAlt &alt, vector<Val> &argvals, TypeExpr *t, Node *at);
     int HeldParam(FnSpec *spec, const Val &v);
     Val CallResult(Call *c, FnSpec *spec, vector<Val> &argvals);
+    RefPlace CallerPlace(RefPlace place, FnSpec *spec, const vector<Val> &args);
     void ReturnThroughCalls(Val &v, int tf, Return *r);
     void CheckReturn(Return *r);
     FnSpec *EnsureThreadSpec(SFunction *sf, Line l);
@@ -2736,7 +2737,7 @@ struct TypeCheck {
     void HolderFromLit(Val &v, const LitDeep &deep);
     void AddStoreEvent(const StoreEvent &e);
     void NoteRefPlace(VarDef *vd, const Val &v);
-    RefPlace ArgumentPlace(TypeExpr *param, const Val &arg);
+    RefPlace ArgumentPlace(FnSpec *spec, VarDef *param, const vector<Val> &args);
     void RecordElementLinks(const Roots &owners, TypeExpr *reached, const ValueLinks &links, Node *at,
                             LinkLocation place = {}, const LinkField &field = {});
     void RecordLinkStore(const Roots &owners, TypeExpr *reached, ElementLink link, Node *at,

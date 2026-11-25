@@ -3047,7 +3047,7 @@ inline bool TypeCheck::SameRecord(const FnRecord &a, const FnRecord &b, const Fn
         auto &p = a.retroots[i], &q = b.retroots[i];
         if (!sameroots(p.alts, q.alts) || p.writable != q.writable || p.byteview != q.byteview ||
             p.freshview != q.freshview || p.elementlinks != q.elementlinks ||
-            p.set != q.set || p.heldparam != q.heldparam)
+            p.set != q.set || p.heldparam != q.heldparam || p.place != q.place)
             return why("return roots");
     }
     auto sameeffect = [&](const ShrinkEffect &p, const ShrinkEffect &q) {
@@ -3653,6 +3653,18 @@ inline void TypeCheck::RecordReturn(FnSpec *tspec, vector<Val> &vals, Node *at) 
         // A result may come from any return: every root one gives is kept,
         // with the guarantees that hold on all paths to it.
         auto held = holder ? HeldParam(tspec, vals[i]) : -1;
+        if (isrs) {
+            auto place = rt->kind == TY_SLICE ? vals[i].sliceplace : vals[i].refplace;
+            // Only the callee's actual parameters and global storage name
+            // the same places when another call reuses this specialization.
+            auto parameter = [&](VarDef *v) {
+                return v && v->isparam && v->ownerspec == tspec;
+            };
+            if (!parameter(place.location.param)) place.location.param = nullptr;
+            if (place.base && !place.base->isglobal && !parameter(place.base))
+                place = { place.location, nullptr, {}, place.nullonly };
+            rr.place = rr.set ? rr.place.Common(place) : place;
+        }
         rr.heldparam = !rr.set || rr.heldparam == held ? held : -1;
         rr.alts.Add(roots);
         rr.writable = rr.writable && vals[i].writable;
@@ -3707,6 +3719,25 @@ inline Val TypeCheck::RetAltVal(FnSpec *spec, const RootAlt &alt, vector<Val> &a
         if (!spec->inprogress) break;
     }
     return v;
+}
+
+// Roots can identify an owner shared by several arguments. A result's
+// field path is relative to the particular parameter the body returned.
+inline RefPlace TypeCheck::CallerPlace(RefPlace place, FnSpec *spec, const vector<Val> &args) {
+    if (auto p = place.location.param; p && p->ownerspec == spec) {
+        auto loc = ArgumentPlace(spec, p, args).location;
+        place.location = { place.location.intail || loc.intail, loc.param };
+    }
+    if (place.base && place.base->ownerspec == spec) {
+        auto actual = ArgumentPlace(spec, place.base, args);
+        if (!actual.base) return { place.location, nullptr, {}, actual.nullonly };
+        if (!actual.enclosing && !place.path.empty())
+            actual.path = ast.Intern(cat(actual.path, place.path));
+        actual.enclosing |= place.enclosing;
+        actual.location = place.location;
+        return actual;
+    }
+    return place;
 }
 
 inline Val TypeCheck::CallResult(Call *c, FnSpec *spec, vector<Val> &argvals) {
@@ -3788,6 +3819,11 @@ inline Val TypeCheck::CallResult(Call *c, FnSpec *spec, vector<Val> &argvals) {
             // where every return's are; a back edge's returns are not all
             // checked yet.
             if (backedge) v.ClearReads();
+            else if (!holder && rec) {
+                auto place = CallerPlace(ri.place, spec, argvals);
+                if (v.type->kind == TY_SLICE) v.sliceplace = place;
+                else v.refplace = place;
+            }
             if (holder) {
                 // The bound travels as the holder root; the value itself is
                 // a temporary.
@@ -3828,6 +3864,10 @@ inline void TypeCheck::ReturnThroughCalls(Val &v, int tf, Return *r) {
         auto s = frames[k].spec;
         if (frames[k].isfunval || !s || s == frames[tf].spec) continue;
         s->storesout = true;
+        if (isrs) {
+            auto &place = v.type->kind == TY_SLICE ? v.sliceplace : v.refplace;
+            place = frames[k].argvals ? CallerPlace(place, s, *frames[k].argvals) : RefPlace {};
+        }
         auto classof = [&](const RootAlt &a) {
             return a.root && find(s->classroots.begin(), s->classroots.end(), a.root) !=
                                  s->classroots.end();

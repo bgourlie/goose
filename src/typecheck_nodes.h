@@ -509,10 +509,13 @@ inline Val Dot::Check(TypeCheck &tc, TypeExpr *) {
 
 inline Val Call::Check(TypeCheck &tc, TypeExpr *expected) {
     auto v = tc.CheckCall(this, expected);
-    // An element-reference builtin computes its result's location. Other
-    // calls can share an argument's owner while returning a different part.
+    if (spec || !dispatch.empty()) return v; // CallResult maps each returned place.
     if (builtin < 0 || BuiltinByKind(builtin).rets[0] != 'r') v.refplace = {};
-    for (auto &r : tc.lastcallrets) r.refplace = {};
+    if (builtin < 0 || BuiltinByKind(builtin).rets[0] != 's') v.sliceplace = {};
+    for (auto &r : tc.lastcallrets) {
+        r.refplace = {};
+        r.sliceplace = {};
+    }
     return v;
 }
 

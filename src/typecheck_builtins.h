@@ -2001,13 +2001,18 @@ inline void TypeCheck::NoteRefPlace(VarDef *vd, const Val &v) {
 
 // Map a parameter's pointee (or viewed elements) to the storage passed at
 // this particular call. An implicit whole-array view covers its elements.
-inline RefPlace TypeCheck::ArgumentPlace(TypeExpr *param, const Val &arg) {
-    if (param->kind == TY_SLICE) {
+inline RefPlace TypeCheck::ArgumentPlace(FnSpec *spec, VarDef *param, const vector<Val> &args) {
+    auto it = find(spec->params.begin(), spec->params.end(), param);
+    auto index = (size_t)(it - spec->params.begin());
+    if (it == spec->params.end() || index >= args.size()) return {};
+    auto &arg = args[index];
+    auto pt = param->type;
+    if (pt->kind == TY_SLICE) {
         auto t = IsPlainRef(arg.type) ? arg.type->ref->sub : arg.type;
         if (t->kind == TY_ARRAY) return arg.refplace.Inside(IsArrayKind(t, A_GROW));
         return arg.type->kind == TY_SLICE ? arg.sliceplace : RefPlace {};
     }
-    return IsAddressRef(param) ? StoragePlace(arg, param->ref->sub, arg.refplace) : RefPlace {};
+    return IsAddressRef(pt) ? StoragePlace(arg, pt->ref->sub, arg.refplace) : RefPlace {};
 }
 
 // Internal links move with the complete element run. The destination alone
@@ -2602,10 +2607,7 @@ inline void TypeCheck::ApplyCalleeStores(FnSpec *spec, vector<Val> &argvals, Nod
             if (e.linkparam && e.linkparam->ownerspec == spec) {
                 // A class can cover both a header and a tail element. Only the
                 // parameter used to reach the slot supplies its location.
-                auto it = find(spec->params.begin(), spec->params.end(), e.linkparam);
-                auto p = (size_t)(it - spec->params.begin());
-                place = it != spec->params.end() && p < argvals.size()
-                            ? ArgumentPlace((*it)->type, argvals[p]).location : LinkLocation {};
+                place = ArgumentPlace(spec, e.linkparam, argvals).location;
             }
             auto field = e.linkfield;
             auto owners = mapped(e.container, !e.bound);
@@ -2613,11 +2615,7 @@ inline void TypeCheck::ApplyCalleeStores(FnSpec *spec, vector<Val> &argvals, Nod
                 field.base = ExactComponent(owners);
                 if (!field.base) field = {};
             } else if (field.base && field.base->ownerspec == spec) {
-                auto it = find(spec->params.begin(), spec->params.end(), field.base);
-                auto p = (size_t)(it - spec->params.begin());
-                RefPlace part;
-                if (it != spec->params.end() && p < argvals.size())
-                    part = ArgumentPlace((*it)->type, argvals[p]);
+                auto part = ArgumentPlace(spec, field.base, argvals);
                 // An indexed argument names the whole array field only as a
                 // containing field. The callee's suffix is inside its element.
                 if (!part.base) field = {};

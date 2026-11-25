@@ -10,6 +10,7 @@ fn forward(dst: Node&, src: Node&) {
 fn link_view(view: Node[:], target: Node&) {
     for &n in view { n.next .= target; }
 }
+fn window(view: Node[:]) -> Node[:] { view[0..] }
 
 fn slices(whole: bool) {
     var list = List { head: Node {}, nodes: [Node {}, Node {}] };
@@ -20,7 +21,7 @@ fn slices(whole: bool) {
         let view = if whole { list.nodes[..] } else { list.nodes[0..1] };
         view[0..][0].next .= list.head;
         assert(view[0].next .== list.head);
-        link_view(view, list.head);
+        link_view(window(view), list.head);
     }
     list.nodes.clear();
     list.nodes.push(Node {});

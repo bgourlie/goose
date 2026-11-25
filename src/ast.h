@@ -2361,6 +2361,7 @@ struct LiveShrink {
 // of them (§7.8).
 struct RetRoot {
     Roots alts;                // Every root the checked returns give.
+    RefPlace place;            // Pointee or viewed elements common to those returns.
     bool writable = true;      // Writable only where every return is (§9.5).
     bool byteview = false;
     bool freshview = false;    // Prov::freshview.
