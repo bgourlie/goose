@@ -467,7 +467,7 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
     auto elementdest = [&] {
         Dest dest(rv, false, rv.reached);
         dest.fill = d.kind == B_RESIZE;
-        dest.intail = ak == A_GROW;
+        dest.place.intail = ak == A_GROW;
         dest.appended = ak == A_GROW && (d.kind == B_PUSH || d.kind == B_APPEND);
         return dest;
     };
@@ -1914,7 +1914,7 @@ inline void TypeCheck::AddStoreEvent(const StoreEvent &e) {
     auto &evs = spec->record.classevents;
     for (size_t m = 0; m < evs.size(); m++) {
         auto &o = evs[m];
-        if (o.container == e.container && o.elementlink == e.elementlink &&
+        if (o.container == e.container && o.elementlink == e.elementlink && o.linkparam == e.linkparam &&
             o.root == e.root && o.src == e.src &&
             o.exact == e.exact && o.byteview == e.byteview && o.bound == e.bound &&
             o.slot == e.slot && o.sliceref == e.sliceref && !o.pointee == !e.pointee &&
@@ -1929,31 +1929,62 @@ inline void TypeCheck::AddStoreEvent(const StoreEvent &e) {
     origin(evs.size() - 1);
 }
 
-// An immutable binding names the same part of its owner's storage at each use.
+// Where a checked argument binds by reference. Direct field and fixed-array
+// steps preserve the containing location. A reference stored in such a slot
+// may point elsewhere, even to a header field of the very same owner.
+inline LinkLocation TypeCheck::ReferentLocation(Node *n) {
+    if (auto u = Is<Unary>(n); u && u->op == T_BITAND) n = u->child;
+    if (auto id = Is<Ident>(n); id && id->vdef) return id->vdef->refplace;
+    auto dot = Is<Dot>(n);
+    auto index = Is<Index>(n);
+    if (!dot && !index) return {};
+    auto obj = dot ? dot->obj : index->obj;
+    if (!obj->exprtype) return {};
+    auto t = obj->exprtype;
+    if (t->kind == TY_REF) t = t->ref->sub;
+    if (dot) {
+        if (!dot->IsField() || dot->fieldidx < 0) return {};
+        auto fields = FieldRuns(t);
+        if (fields.size() != 1) return {};
+        auto ft = (*fields[0].ftypes)[dot->fieldidx];
+        if (!ft || ft->kind == TY_REF) return {};
+    } else {
+        if (t->kind != TY_ARRAY || t->arr->sub->kind == TY_REF) return {};
+        if (IsArrayKind(t, A_GROW)) return { true };
+    }
+    return ReferentLocation(obj);
+}
+
+// An immutable binding keeps both the location of the pointee and the exact
+// path a whole overwrite there can be expressed against.
 inline void TypeCheck::NoteRefPlace(VarDef *vd, Node *arg, const Val &v) {
-    if (vd->isvar || vd->isglobal || !IsPlainRef(vd->type) || !HasRelRefT(vd->type->ref->sub)) return;
-    if (auto k = ArgumentKill(arg, v, vd->type->ref->sub, true, 0))
-        cur.aliaspaths.emplace(vd, std::move(*k));
+    if (vd->isvar || !IsPlainRef(vd->type) || !HasRelRefT(vd->type->ref->sub)) return;
+    vd->refplace = ReferentLocation(arg);
+    if (!vd->isglobal) {
+        if (auto k = ArgumentKill(arg, v, vd->type->ref->sub, true, 0))
+            cur.aliaspaths.emplace(vd, std::move(*k));
+    }
 }
 
 // Internal links move with the complete element run. The destination alone
 // owns both ends, including when a call maps the store through a parameter.
 inline void TypeCheck::RecordElementLinks(const Roots &owners, TypeExpr *reached,
-                                          const ValueLinks &links, Node *at, bool intail) {
-    for (auto link : links.slots) {
-        link.intail |= intail;
-        RecordLinkStore(owners, reached, link, at);
-    }
+                                          const ValueLinks &links, Node *at, LinkLocation place) {
+    for (auto link : links.slots) RecordLinkStore(owners, reached, link, at, place);
 }
 
 inline void TypeCheck::RecordLinkStore(const Roots &owners, TypeExpr *reached,
-                                      ElementLink link, Node *at) {
+                                      ElementLink link, Node *at, LinkLocation place) {
     if (!reachable || owners.None()) return;
+    link.intail |= place.intail;
     for (auto &d : ShrinkTargets(owners, reached, false)) {
         if (IsTemp(d.root)) continue;
         StoreEvent e;
         e.container = d.root;
         e.elementlink = link;
+        if (place.param && !link.intail && !d.bound && owners.Exact() &&
+            d.root == owners.Root() && d.root == place.param->ref.Root())
+            e.linkparam = place.param;
         e.exact = true;  // No external root is stored.
         e.reached = reached;
         e.bound = d.bound;
@@ -2101,8 +2132,9 @@ inline Roots TypeCheck::ClassArgRoots(TypeExpr *pt, const Val &v) {
 // names assigns the slice variable each such storage may be (StoreIntoSlot).
 // A store into a holder grows its contents as the caller's own would, which
 // a loop around the call feeds back (NoteFact).
-inline void TypeCheck::ApplyCalleeStores(FnSpec *spec, vector<Val> &argvals, Node *at,
-                                         vector<int> *origins) {
+inline void TypeCheck::ApplyCalleeStores(FnSpec *spec, vector<Val> &argvals,
+                                       const vector<Node *> &argnodes, Node *at,
+                                       vector<int> *origins) {
     auto base = storeevents.size();
     // The class event each store added from `from` on replays.
     auto tag = [&](size_t from, int origin) {
@@ -2515,10 +2547,20 @@ inline void TypeCheck::ApplyCalleeStores(FnSpec *spec, vector<Val> &argvals, Nod
         }
         auto from = storeevents.size();
         replay.origin = (int)(&e - rec->classevents.data());
-        if (e.elementlink)
-            RecordLinkStore(mapped(e.container, !e.bound), e.reached, e.elementlink, at);
-        else
+        if (e.elementlink) {
+            LinkLocation place { false, e.linkparam };
+            if (e.linkparam && e.linkparam->ownerspec == spec) {
+                // A class can cover both a header and a tail element. Only the
+                // parameter used to reach the slot supplies its location.
+                auto it = find(spec->params.begin(), spec->params.end(), e.linkparam);
+                auto p = (size_t)(it - spec->params.begin());
+                place = it != spec->params.end() && p < argnodes.size()
+                            ? ReferentLocation(argnodes[p]) : LinkLocation {};
+            }
+            RecordLinkStore(mapped(e.container, !e.bound), e.reached, e.elementlink, at, place);
+        } else {
             applystore(e, mapped(e.root, e.exact), true);
+        }
         replay.origin = -1;
         tag(from, (int)(&e - rec->classevents.data()));
     }
@@ -4025,7 +4067,7 @@ inline void TypeCheck::ApplyCalleeShrinks(Node *at, FnSpec *spec, vector<Val> &a
             ~Restore() { r = saved; }
         } restore { replay, replay };
         replay = { -1, &classorigins, classbase };
-        ApplyCalleeStores(spec, argvals, at, &origins);
+        ApplyCalleeStores(spec, argvals, argnodes, at, &origins);
     }
     // The record read: none in a cycle's first round (RecordOf), whose back
     // edge shrinks nothing yet.

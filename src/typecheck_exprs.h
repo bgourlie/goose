@@ -89,7 +89,7 @@ inline TypeCheck::LVal TypeCheck::CheckLValue(Node *n) {
                          " of variable-size elements cannot be indexed, only iterated; for "
                          "random access, keep your own array of references to them (§3.3)"));
         if (lv.intemp) NoRelRefTempRead(ix->obj, lv.type, elem);
-        lv.intail |= IsArrayKind(lv.type, A_GROW);
+        lv.place.intail |= IsArrayKind(lv.type, A_GROW);
         CheckIntAny(ix->idx);
         if (lv.type->cq) lv.writable = false;   // An element of a const value.
         lv.letbound = false;
@@ -163,7 +163,7 @@ inline void TypeCheck::DerefLValue(LVal &lv, Node *at) {
         // so it keeps the container's root.
         ReadBackLVal(lv);
     }
-    lv.intail = false;
+    lv.place = lv.var ? lv.var->refplace : LinkLocation {};
     lv.type = lv.type->ref->sub;
     lv.reached = LoadType(lv.type);
     lv.var = nullptr;
@@ -208,7 +208,7 @@ inline void TypeCheck::RequireIndexArray(TypeExpr *t, Node *at, string_view what
 // sliced lies in the elements it views (Prov::reached).
 inline void TypeCheck::SliceProvenance(LVal &lv, Node *at) {
     if (lv.type->kind != TY_SLICE) return;
-    lv.intail = false;
+    lv.place = {};
     if (!lv.var) {
         if (lv.fromstorage) ReadBackLVal(lv);
         else if (lv.throughref) lv.SetProv(SlotView(lv, lv.type));
@@ -1056,7 +1056,7 @@ inline void TypeCheck::MustFit(Val &v, Node *n, TypeExpr *dt) {
     if (FitsAt(v, dt)) {
         if (v.elementlinks && !IsRefOrSlice(dt) && !curdst.roots.None())
             RecordElementLinks(curdst.roots, curdst.reached ? curdst.reached : dt, v.elementlinks,
-                               n, curdst.intail || IsArrayKind(dt, A_GROW));
+                               n, { curdst.place.intail || IsArrayKind(dt, A_GROW), curdst.place.param });
         if (IsIntT(dt) && !TypeEq(from, dt)) {
             RelyOnNamed(v, n);
             if (v.flexint && dt->intstorage != IS_VARINT) RetypeFlexInt(n, dt);
@@ -1423,7 +1423,8 @@ inline bool TypeCheck::FitsAt(Val &v, TypeExpr *dt) {
                 }
                 if (recordingrelative && !dt->ref->pool && !curdst.result)
                     RecordLinkStore(curdst.roots, curdst.reached ? curdst.reached : dt,
-                                    { pointee, curdst.appended ? EL_BACKWARD : EL_ANY, curdst.intail }, fitnode);
+                                    { pointee, curdst.appended ? EL_BACKWARD : EL_ANY },
+                                    fitnode, curdst.place);
                 v.type = dt;
                 return true;
             }
@@ -3176,7 +3177,7 @@ inline TypeCheck::LitDeep TypeCheck::CheckInits(StructLit *sl, vector<Field> &fi
         auto component = selft->kind == TY_STRUCT && selft->struc->st->isroot
                              ? RootComponent(rootowner, selft, sl->fieldindices[k]) : nullptr;
         DestScope ds(*this, component ? Dest(component) : curdst);
-        curdst.intail |= IsArrayKind(ft, A_GROW);
+        curdst.place.intail |= IsArrayKind(ft, A_GROW);
         if (Is<SelfRef>(fi.val)) CheckSelfInit(fi.val, ft, selft);
         else {
             SlotScope ss(*this, true);

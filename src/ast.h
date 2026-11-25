@@ -689,6 +689,14 @@ struct Prov : Roots {
 // storage. A decoded run or a rebind may also link into a later element.
 enum ElementLinks { EL_NONE, EL_BACKWARD, EL_ANY };
 
+// The slot lies in a growable array element, or within the pointee of this
+// particular reference parameter. Following a stored reference loses both facts.
+struct LinkLocation {
+    bool intail = false;
+    VarDef *param = nullptr;
+    bool operator==(const LinkLocation &) const = default;
+};
+
 struct ElementLink {
     TypeExpr *pointee = nullptr; // One representative per loaded type (LinkPointee).
     ElementLinks direction = EL_NONE;
@@ -1774,6 +1782,7 @@ struct VarDef {
     // A global's position in ast.globals' definitions (TypeCheck::NoteNarrowed).
     int globalindex = 0;
     bool isparam = false;
+    LinkLocation refplace;       // Pointee of a stable reference binding.
     // Independently owned fields of a root declaration. These synthetic
     // variables have the owner's scope and stable identities across loop
     // checking passes, but are not source-level bindings.
@@ -2183,6 +2192,7 @@ struct StoreEvent {
     // Links within this owner's storage, from either a relative store or a
     // verified element run. Mapping this event requires only the destination.
     ElementLink elementlink;
+    VarDef *linkparam = nullptr; // Direct destination parameter, even when parameters share a class.
     int linkclass = -1;          // Its index in the current body's class-store summary.
     // What was stored: a reference to something rooted at `root`, or (a
     // copy of) the contents of container `src` -- a holder value read out
@@ -2305,6 +2315,7 @@ struct EnvRead {
     bool contentbyteview = false;
     bool slotref = false;
     ValueLinks elementlinks;
+    LinkLocation refplace;
 };
 
 // An exit of a body outside a specialization's activation that its check

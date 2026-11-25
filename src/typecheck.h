@@ -128,6 +128,7 @@ struct TypeCheck {
     // provenance names the storage's owner, and `writable` whether the whole
     // path admits writes.
     struct LVal : Prov {
+        LinkLocation place;
         TypeExpr *type = nullptr;    // The location's own type (varints undecoded).
         VarDef *var = nullptr;       // Set when the path is a bare variable name.
         // The location is a `let` binding or field itself, which is not
@@ -143,7 +144,6 @@ struct TypeCheck {
         // a reference, which may be a variable: what is loaded out of it
         // was stored there (Prov::slotread).
         bool isslot = false;
-        bool intail = false;         // Inside a resizable array element, until a dereference.
         bool fotail = false;         // A frame object's resizable tail: has its own header (C.2).
         bool isvarint = false;       // varint field: read-only refs, not assignable.
         // A path into a temporary that has not crossed a reference: a
@@ -315,6 +315,7 @@ struct TypeCheck {
     // The destination of the value under construction (for reference stores):
     // where the storage the value lands in may be (an lvalue's roots).
     struct Dest {
+        LinkLocation place;
         Roots roots;
         FnSpec *result = nullptr;
         int resultindex = 0;
@@ -334,13 +335,12 @@ struct TypeCheck {
         // A resize's fill value: built once and copied into each slot the
         // resize adds, so no position in the array is its own (§3.9).
         bool fill = false;
-        bool intail = false;         // Receiving slot is in the resizable element run.
         bool appended = false;       // New elements at the end of a grow-only array.
         Dest() {}
         Dest(const Roots &r, bool vb = false, TypeExpr *re = nullptr)
             : roots(r), varbind(vb), reached(re), unknown(r.None()) {}
         Dest(const LVal &lv, bool vb, TypeExpr *re)
-            : Dest(static_cast<const Roots &>(lv), vb, re) { intail = lv.intail; }
+            : Dest(static_cast<const Roots &>(lv), vb, re) { place = lv.place; }
         // A variable's own storage.
         Dest(VarDef *vd, bool vb = false) : varbind(vb) { roots.Set(vd, true); }
     };
@@ -2635,7 +2635,6 @@ struct TypeCheck {
     // whole assignment's of a value holding no references, and whether those
     // in force empty every slot of a `t` at `base` in container c that can
     // hold a view into an `arr`'s elements, since which event.
-    void NoteRefPlace(VarDef *vd, Node *arg, const Val &v);
     bool KillPath(Node *n, VarDef *&base, string &path);
     std::optional<Kill> OverwrittenPart(Node *n, const Roots &loc, TypeExpr *target, bool relative,
                                         size_t at);
@@ -2697,9 +2696,12 @@ struct TypeCheck {
     void NoteLitElem(LitDeep &deep, Node *at, const Val &v, TypeExpr *t);
     void HolderFromLit(Val &v, const LitDeep &deep);
     void AddStoreEvent(const StoreEvent &e);
+    LinkLocation ReferentLocation(Node *n);
+    void NoteRefPlace(VarDef *vd, Node *arg, const Val &v);
     void RecordElementLinks(const Roots &owners, TypeExpr *reached, const ValueLinks &links, Node *at,
-                            bool intail = false);
-    void RecordLinkStore(const Roots &owners, TypeExpr *reached, ElementLink link, Node *at);
+                            LinkLocation place = {});
+    void RecordLinkStore(const Roots &owners, TypeExpr *reached, ElementLink link, Node *at,
+                         LinkLocation place = {});
     void NoteSlotStore(const StoreEvent &e);
     // How NeverStoredError words a grow-shrink array `gs` a value pointing at
     // `roots` may point into: as the array itself where it is the value's one
@@ -2729,8 +2731,8 @@ struct TypeCheck {
                                      set<VarDef *> &seen);
     // `origins`: for each store event the call adds, the index of the class
     // event it replays, -1 for any other (CallOrder).
-    void ApplyCalleeStores(FnSpec *spec, vector<Val> &argvals, Node *at,
-                           vector<int> *origins = nullptr);
+    void ApplyCalleeStores(FnSpec *spec, vector<Val> &argvals, const vector<Node *> &argnodes,
+                           Node *at, vector<int> *origins = nullptr);
     void NoteHolderBinding(VarDef *d, const Val &v, Node *at);
 
     // Whether a global may hold a reference into a global array is known

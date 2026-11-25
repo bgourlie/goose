@@ -1917,7 +1917,7 @@ inline vector<VarDef *> TypeCheck::NarrowedOptionals(const MatchInfo &mi) {
 
 inline EnvRead TypeCheck::EnvReadOf(VarDef *vd) {
     return { vd, vd->assigned, vd->maybeassigned, vd->refrootknown, vd->ref, vd->contents,
-             vd->contentbyteview, vd->slotref, vd->elementlinks };
+             vd->contentbyteview, vd->slotref, vd->elementlinks, vd->refplace };
 }
 
 // A body names vd outside its activation: a nested function one of its
@@ -1958,7 +1958,7 @@ inline bool TypeCheck::EnvIs(const VarDef *vd, const EnvRead &r) {
            vd->refrootknown == r.refrootknown &&
            vd->ref == r.ref && vd->contents == r.contents &&
            vd->contentbyteview == r.contentbyteview && vd->slotref == r.slotref &&
-           vd->elementlinks == r.elementlinks;
+           vd->elementlinks == r.elementlinks && vd->refplace == r.refplace;
 }
 
 // Whether each variable the body read outside its activation is as it was
@@ -3078,7 +3078,7 @@ inline bool TypeCheck::SameRecord(const FnRecord &a, const FnRecord &b, const Fn
             return why("live shrinks");
     }
     auto sameevents = [&](const StoreEvent &p, const StoreEvent &q) {
-        return p.container == q.container && p.elementlink == q.elementlink &&
+        return p.container == q.container && p.elementlink == q.elementlink && p.linkparam == q.linkparam &&
                p.root == q.root && p.src == q.src &&
                p.exact == q.exact && p.byteview == q.byteview && p.bound == q.bound &&
                p.slot == q.slot && p.sliceref == q.sliceref && p.classread == q.classread &&
@@ -3189,6 +3189,7 @@ inline void TypeCheck::CheckSpecBodyOnce(FnSpec *spec, vector<Val> *argvals, Lin
         auto vd = NewVar(p.name, pt, p.line.line ? p.line : sf->line, p.isvar,
                          i < oldparams.size() ? oldparams[i] : nullptr);
         vd->isparam = true;
+        if (!vd->isvar && IsPlainRef(pt)) vd->refplace.param = vd;
         if (auto links = spec->roots[i].elementlinks)
             RecordElementLinks(RootsOf(vd), pt, links, sf->body);
         vd->assigned = vd->maybeassigned = true;
@@ -4234,7 +4235,7 @@ inline bool TypeCheck::RelativeDestination(const Roots &source, Dest dest, TypeE
     if (!record) return true;
     if (dest.used) *dest.used = true;
     FnRecord::RelativeStore rs;
-    rs.intail = dest.intail;
+    rs.intail = dest.place.intail;
     rs.pointee = pointee;
     rs.source.Set(have, true);
     if (dest.result) rs.result = dest.resultindex;
@@ -4284,7 +4285,7 @@ inline void TypeCheck::CheckCalleeRelative(Call *call, FnSpec *spec, vector<Val>
                 if (!dest.reached) dest.reached = spec->rets[i];
             }
         }
-        dest.intail |= s.intail;
+        dest.place.intail |= s.intail;
         if (!RelativeDestination(source, dest, s.pointee, call, true, true)) {
             auto target = source.Root() ? string(source.Root()->name) : string("static data");
             auto receiver = dest.result ? cat("result ", dest.resultindex + 1, " of ", dest.result->sf->name)
@@ -4295,7 +4296,7 @@ inline void TypeCheck::CheckCalleeRelative(Call *call, FnSpec *spec, vector<Val>
         }
         if (s.result >= 0 && dest.reached && !dest.result && !source.None())
             RecordLinkStore(dest.roots, dest.reached,
-                            { s.pointee, dest.appended ? EL_BACKWARD : EL_ANY, dest.intail }, call);
+                            { s.pointee, dest.appended ? EL_BACKWARD : EL_ANY }, call, dest.place);
     }
 }
 
