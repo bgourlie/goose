@@ -569,7 +569,6 @@ inline Prov TypeCheck::RefProvOf(VarDef *vd) {
 
 inline VarDef *TypeCheck::ResetLocal(VarDef *previous) {
     if (!previous) return ast.NewVarDef();
-    cur.aliaspaths.erase(previous);
     erase_if(cur.links.live, [&](const auto &entry) { return entry.first.owner == previous; });
     // Cached nested specializations capture this identity. Recompute its
     // checking state, but retain the capture discovered on an earlier pass,
@@ -950,7 +949,7 @@ inline TypeCheck::FlowState TypeCheck::SaveFlow() {
     FlowState f;
     EachNamedVar((int)frames.size() - 1, CurRealFrame().spec, [&](int i) {
         auto v = vars[i];
-        f.locals.push_back({ i, v, { v->assigned, v->maybeassigned, v->narrowed } });
+        f.locals.push_back({ i, v, { v->assigned, v->maybeassigned, v->narrowed, v->refplace } });
     });
     // Globals' narrowing participates too (assignment in branches).
     for (auto v : narrowedglobals)
@@ -967,6 +966,7 @@ inline void TypeCheck::RestoreFlow(const FlowState &f) {
         e.var->assigned = e.state.assigned;
         e.var->maybeassigned = e.state.maybeassigned;
         e.var->narrowed = e.state.narrowed;
+        e.var->refplace = e.state.refplace;
     }
     for (auto v : narrowedglobals) v->narrowed = nullptr;
     for (auto [v, narrowed] : f.globals) v->narrowed = narrowed;
@@ -994,7 +994,9 @@ inline TypeCheck::FlowState TypeCheck::JoinFlow(const FlowState &a, const FlowSt
         auto aa = at(a, p, e), bb = at(b, q, e);
         e.state = { (!a.reachable || aa.assigned) && (!b.reachable || bb.assigned),
                     (a.reachable && aa.maybeassigned) || (b.reachable && bb.maybeassigned),
-                    narrow(aa.narrowed, bb.narrowed) };
+                    narrow(aa.narrowed, bb.narrowed),
+                    !a.reachable ? bb.refplace : !b.reachable ? aa.refplace
+                                                              : aa.refplace.Common(bb.refplace) };
     }
     // A global stays narrowed where every reachable side narrowed it.
     if (!a.reachable) joined.globals = b.globals;
@@ -2152,7 +2154,7 @@ inline void TypeCheck::CheckFor(ForLoop *x) {
         }
         if (IsRefOrSlice(bindtype)) {
             BindProv(vd, iterprov);
-            vd->refplace = elementplace;
+            vd->refplace.location = elementplace;
         }
         x->vdef = vd;
         if (!x->idxvar.empty()) {
@@ -3181,6 +3183,7 @@ inline void TypeCheck::CheckRebind(Assign *a, LVal &lv) {
         NoLetReassign(a, lv.var, "rebind", "bound");
         if (!lv.var->refrootknown || lv.var->ref.Unknown()) BindRefProvenance(lv.var, v);
         else if (!v.isnull) CheckRefRebindRoot(a, lv.var, v);
+        NoteRefPlace(lv.var, a->rhs, v);
         lv.var->assigned = lv.var->maybeassigned = true;
         // Rebinding an optional settles its nullness — narrowed only when
         // the new value is provably non-null (a plain reference).

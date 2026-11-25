@@ -1464,14 +1464,8 @@ inline bool TypeCheck::KillPath(Node *n, VarDef *&base, string &path) {
         auto vd = id->vdef;
         if (!vd || vd->istemp) return false;
         if (IsRefOrSlice(vd->type) && (vd->type->kind != TY_REF || vd->isvar)) return false;
-        auto binding = cur.aliaspaths.find(vd);
-        if (binding == cur.aliaspaths.end()) {
-            base = vd;
-            path.clear();
-        } else {
-            base = binding->second.base;
-            path = binding->second.path;
-        }
+        base = vd->refplace.base ? vd->refplace.base : vd;
+        path = vd->refplace.path;
         return true;
     }
     auto d = Is<Dot>(n);
@@ -1942,7 +1936,7 @@ inline LinkLocation TypeCheck::ElementLocation(Node *sequence, TypeExpr *t) {
 // may point elsewhere, even to a header field of the very same owner.
 inline LinkLocation TypeCheck::ReferentLocation(Node *n) {
     if (auto u = Is<Unary>(n); u && u->op == T_BITAND) n = u->child;
-    if (auto id = Is<Ident>(n); id && id->vdef) return id->vdef->refplace;
+    if (auto id = Is<Ident>(n); id && id->vdef) return id->vdef->refplace.location;
     auto dot = Is<Dot>(n);
     auto index = Is<Index>(n);
     if (!dot && !index) return {};
@@ -1963,11 +1957,19 @@ inline LinkLocation TypeCheck::ReferentLocation(Node *n) {
 // path a whole overwrite there can be expressed against.
 inline void TypeCheck::NoteRefPlace(VarDef *vd, Node *arg, const Val &v) {
     if (vd->isvar || !IsPlainRef(vd->type) || !HasRelRefT(vd->type->ref->sub)) return;
-    vd->refplace = ReferentLocation(arg);
+    RefPlace place;
+    place.location = ReferentLocation(arg);
+    // A captured let can be initialized in a shorter-lived scope. Keep
+    // facts expressed in bindings that will still exist wherever it is read.
+    if (place.location.param && Depth(place.location.param) > Depth(vd)) place.location.param = nullptr;
     if (!vd->isglobal) {
-        if (auto k = ArgumentKill(arg, v, vd->type->ref->sub, true, 0))
-            cur.aliaspaths.emplace(vd, std::move(*k));
+        auto k = ArgumentKill(arg, v, vd->type->ref->sub, true, 0);
+        if (k && Depth(k->base) <= Depth(vd)) {
+            place.base = k->base;
+            if (!k->path.empty()) place.path = ast.Intern(std::move(k->path));
+        }
     }
+    vd->refplace = place;
 }
 
 // Internal links move with the complete element run. The destination alone

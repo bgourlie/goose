@@ -163,7 +163,7 @@ inline void TypeCheck::DerefLValue(LVal &lv, Node *at) {
         // so it keeps the container's root.
         ReadBackLVal(lv);
     }
-    lv.place = lv.var ? lv.var->refplace : LinkLocation {};
+    lv.place = lv.var ? lv.var->refplace.location : LinkLocation {};
     lv.type = lv.type->ref->sub;
     lv.reached = LoadType(lv.type);
     lv.var = nullptr;

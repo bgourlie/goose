@@ -1991,6 +1991,7 @@ inline void TypeCheck::ReplayEnvExits(FnSpec *spec) {
         // whether it may be assigned (EnvIs), and stays so where it was.
         v->assigned = x.assigned;
         v->maybeassigned = v->maybeassigned || x.maybeassigned;
+        v->refplace = x.refplace;
         if (EnvIs(v, x)) continue;
         v->refrootknown = x.refrootknown;
         v->ref = x.ref;
@@ -2014,10 +2015,19 @@ inline void TypeCheck::NoteExit(int tf, const OuterExit *added) {
     auto isassigned = [&](VarDef *v) {
         return v->assigned || (added && added->assigned.count(v));
     };
+    auto assignedplace = [&](VarDef *v) {
+        if (added) {
+            auto it = added->assigned.find(v);
+            if (it != added->assigned.end()) return it->second;
+        }
+        return v->refplace;
+    };
     auto maybe = [&](VarDef *v) {
         return v->maybeassigned || (added && added->maybeassigned.count(v));
     };
     for (size_t i = 0; i < e->vars.size(); i++) {
+        auto place = assignedplace(e->vars[i]);
+        e->places[i] = e->reached ? e->places[i].Common(place) : place;
         e->assigned[i] = (!e->reached || e->assigned[i]) && isassigned(e->vars[i]);
         e->maybeassigned[i] = (e->reached && e->maybeassigned[i]) || maybe(e->vars[i]);
     }
@@ -2043,7 +2053,7 @@ inline void TypeCheck::NoteExit(int tf, const OuterExit *added) {
         for (auto v : e->vars) {
             auto at = find(mine->vars.begin(), mine->vars.end(), v);
             if (at == mine->vars.end()) continue;
-            if (isassigned(v)) x.assigned.insert(v);
+            if (isassigned(v)) x.assigned.emplace(v, assignedplace(v));
             if (maybe(v) && !mine->maybeonentry[at - mine->vars.begin()])
                 x.maybeassigned.insert(v);
         }
@@ -2053,7 +2063,14 @@ inline void TypeCheck::NoteExit(int tf, const OuterExit *added) {
             if (o.target != target) continue;
             // What every exit of the target it takes has assigned, and what
             // any of them may have.
-            std::erase_if(o.assigned, [&](VarDef *v) { return !x.assigned.count(v); });
+            for (auto it = o.assigned.begin(); it != o.assigned.end();) {
+                auto p = x.assigned.find(it->first);
+                if (p == x.assigned.end()) it = o.assigned.erase(it);
+                else {
+                    it->second = it->second.Common(p->second);
+                    ++it;
+                }
+            }
             o.maybeassigned.insert(x.maybeassigned.begin(), x.maybeassigned.end());
             known = true;
         }
@@ -3132,6 +3149,7 @@ inline void TypeCheck::CheckSpecBodyOnce(FnSpec *spec, vector<Val> *argvals, Lin
         exits.maybeonentry.push_back(vars[i]->maybeassigned);
     });
     exits.assigned.resize(exits.vars.size());
+    exits.places.resize(exits.vars.size());
     exits.maybeassigned.resize(exits.vars.size());
     for (auto g : ast.globals) for (auto v : g->defs) outernarrowed.push_back({ v, v->narrowed });
     Frame f;
@@ -3189,7 +3207,7 @@ inline void TypeCheck::CheckSpecBodyOnce(FnSpec *spec, vector<Val> *argvals, Lin
         auto vd = NewVar(p.name, pt, p.line.line ? p.line : sf->line, p.isvar,
                          i < oldparams.size() ? oldparams[i] : nullptr);
         vd->isparam = true;
-        if (!vd->isvar && IsPlainRef(pt)) vd->refplace.param = vd;
+        if (!vd->isvar && IsPlainRef(pt)) vd->refplace.location.param = vd;
         if (auto links = spec->roots[i].elementlinks)
             RecordElementLinks(RootsOf(vd), pt, links, sf->body);
         vd->assigned = vd->maybeassigned = true;
@@ -3522,6 +3540,7 @@ inline void TypeCheck::CheckSpecBodyOnce(FnSpec *spec, vector<Val> *argvals, Lin
     // never returned from, and leaves them as its end did.
     if (exits.reached) {
         for (size_t i = 0; i < exits.vars.size(); i++) {
+            exits.vars[i]->refplace = exits.places[i];
             exits.vars[i]->assigned = exits.assigned[i];
             exits.vars[i]->maybeassigned = exits.maybeassigned[i];
         }
@@ -4172,7 +4191,6 @@ inline Val TypeCheck::CheckFunValCall(Call *c, const FnValBind &fb, TypeExpr *ex
     if (needslocation && resultdest.used) *resultdest.used = true;
     PopScope();
     frames.pop_back();
-    for (auto vd : c->fvparams) cur.aliaspaths.erase(vd);
     erase_if(cur.kills, [](const Kill &k) { return !k.relative; });
     // The result has the calling statement's lifetime (§9.2), with no
     // storage to bind by reference even where the tail names a variable.

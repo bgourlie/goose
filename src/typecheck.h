@@ -181,6 +181,7 @@ struct TypeCheck {
     struct BodyExits {
         vector<VarDef *> vars;
         vector<bool> assigned, maybeassigned, maybeonentry;
+        vector<RefPlace> places;    // Stable bindings common to all exits.
         bool reached = false;
     };
 
@@ -262,6 +263,7 @@ struct TypeCheck {
         bool assigned = false;
         bool maybeassigned = false;
         TypeExpr *narrowed = nullptr;
+        RefPlace refplace;
         bool operator==(const VarFlow &) const = default;
     };
     struct FlowEntry {
@@ -2954,8 +2956,6 @@ struct TypeCheck {
         // The parts of holders emptied on every path here (Kill), part of
         // the flow state, which a branch joins and a loop's head takes.
         vector<Kill> kills;
-        // Immutable reference bindings to a known part of storage in this activation.
-        map<VarDef *, Kill> aliaspaths;
     };
     BodyState cur;
     // The states of the bodies being checked around this one, outermost

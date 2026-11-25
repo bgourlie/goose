@@ -697,6 +697,26 @@ struct LinkLocation {
     bool operator==(const LinkLocation &) const = default;
 };
 
+// Facts about the pointee of a stable binding. The containing location can
+// be known even when the exact base and field path differ between branches.
+struct RefPlace {
+    LinkLocation location;
+    VarDef *base = nullptr;
+    string_view path;
+
+    RefPlace Common(const RefPlace &other) const {
+        RefPlace common;
+        common.location.intail = location.intail && other.location.intail;
+        if (location.param == other.location.param) common.location.param = location.param;
+        if (base == other.base && path == other.path) {
+            common.base = base;
+            common.path = path;
+        }
+        return common;
+    }
+    bool operator==(const RefPlace &) const = default;
+};
+
 struct ElementLink {
     TypeExpr *pointee = nullptr; // One representative per loaded type (LinkPointee).
     ElementLinks direction = EL_NONE;
@@ -1782,7 +1802,7 @@ struct VarDef {
     // A global's position in ast.globals' definitions (TypeCheck::NoteNarrowed).
     int globalindex = 0;
     bool isparam = false;
-    LinkLocation refplace;       // Pointee of a stable reference binding.
+    RefPlace refplace;       // Pointee of a stable reference binding.
     // Independently owned fields of a root declaration. These synthetic
     // variables have the owner's scope and stable identities across loop
     // checking passes, but are not source-level bindings.
@@ -2315,14 +2335,15 @@ struct EnvRead {
     bool contentbyteview = false;
     bool slotref = false;
     ValueLinks elementlinks;
-    LinkLocation refplace;
+    RefPlace refplace;
 };
 
 // An exit of a body outside a specialization's activation that its check
 // took (FnSpec::outerexits).
 struct OuterExit {
     FnSpec *target = nullptr;
-    set<VarDef *> assigned, maybeassigned;
+    map<VarDef *, RefPlace> assigned;
+    set<VarDef *> maybeassigned;
 };
 
 // The analysis a checked body exposes to its callers. A recursive round
