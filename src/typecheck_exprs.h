@@ -1007,11 +1007,11 @@ inline Val TypeCheck::CheckValue(Node *&n, TypeExpr *expected, bool callsite, bo
     auto run = construction && construction->run == n;
     // Control constructs pass the destination to the selected value. A
     // call can start writing it once its arguments have been evaluated.
-    // Other expressions compute their operands separately. A literal
-    // built in place can write before all its initializers return.
-    if (construction && reachable && construction->literal && !run && (Is<StructLit>(n) || Is<ArrayLit>(n)))
-        construction->started = true;
-    auto forwards = construction && (run || IsBranchConstruct(n) || Is<Call>(n));
+    // In-place literals pass it to their fields or elements. A literal
+    // materialized separately reaches the destination only on completion.
+    auto literal = construction && construction->literal && (Is<StructLit>(n) || Is<ArrayLit>(n)) &&
+                   (!expected || expected->kind == TY_VOID || BuiltInPlace(expected));
+    auto forwards = construction && (literal || run || IsBranchConstruct(n) || Is<Call>(n));
     Saved writing(curdst.construction, forwards ? construction : nullptr);
     auto v = CheckV(n, expected);
     // A branch delivers its value before its scope's defers run.
@@ -3209,6 +3209,16 @@ inline TypeCheck::LitDeep TypeCheck::CheckInits(StructLit *sl, vector<Field> &fi
     // Every initializer is in place before any is checked: each is an
     // operand of the literal, the ones before it held and the ones after it
     // still to run (HeldOperands, LaterOperands).
+    auto construction = curdst.construction;
+    if (construction && reachable) {
+        // A tag, an omitted optional, or leading padding emitted on the
+        // stack can write before the first explicit field is evaluated.
+        auto first = sl->fieldindices.empty() ? fields.size() : (size_t)sl->fieldindices.front();
+        construction->started |= selft->kind == TY_ENUM ||
+            any_of(fields.begin(), fields.begin() + first, [&](const Field &f) {
+                return !f.ispad || (construction->stack && f.padsize > 0);
+            });
+    }
     for (size_t k = 0; k < sl->inits.size(); k++) {
         auto &fi = sl->inits[k];
         auto ft = ftypes[sl->fieldindices[k]];
@@ -3219,7 +3229,10 @@ inline TypeCheck::LitDeep TypeCheck::CheckInits(StructLit *sl, vector<Field> &fi
         if (!component && curdst.fieldsteps && (curdst.field.base || curdst.result) && HasRelRefT(ft))
             Append(curdst.field.path, ".", fields[sl->fieldindices[k]].name);
         curdst.place.intail |= IsArrayKind(ft, A_GROW);
-        if (Is<SelfRef>(fi.val)) CheckSelfInit(fi.val, ft, selft);
+        if (Is<SelfRef>(fi.val)) {
+            CheckSelfInit(fi.val, ft, selft);
+            if (construction && reachable) construction->started = true;
+        }
         else {
             SlotScope ss(*this, true);
             auto fv = fi.fromdefault

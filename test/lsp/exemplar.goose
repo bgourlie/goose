@@ -54,6 +54,11 @@ fn main() {
     print(scale(n, 3));
 }
 
+fn replay<T>(arg: T) {
+    let product = scale(arg, scale(2, 3));
+    let after: i64 = 42;
+}
+
 // lsp: error 45
 // lsp: error 50
 // lsp: hover 22:12 "let item: T"
@@ -67,6 +72,7 @@ fn main() {
 // lsp: hover 33:9 "a: type of a"
 // lsp: hover 34:16 "parameter a: type of a"
 // lsp: hover 36:17 "Not checked: the exemplar instantiation ends before this code."
+// lsp: hover 59:9 "let after: i64"
 // lsp: definition 22:20 -> 19:40
 // lsp: definition 22:12 -> 21:9
 // lsp: definition 25:14 -> 16:4

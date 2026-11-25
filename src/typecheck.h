@@ -341,6 +341,7 @@ struct TypeCheck {
     struct Construction {
         bool literal;  // A literal starts building in the slot itself.
         ArrayLit *run = nullptr;  // An append builds only this literal's elements.
+        bool stack = false;  // Stack construction also writes explicit layout padding.
         bool started = false;
     };
     // The destination of the value under construction (for reference stores):
@@ -620,6 +621,8 @@ struct TypeCheck {
     bool RelativeDestination(const Roots &source, Dest dest, TypeExpr *pointee, Node *at,
                              bool record, bool forwarding = false);
     void CheckCalleeRelative(Call *call, FnSpec *spec, vector<Val> &args);
+    void ApplyRelativeStore(Node *call, FnSpec *spec, vector<Val> &args,
+                            const RelativeStore &store, bool survives);
     bool ResultLayoutFits(TypeExpr *from, TypeExpr *to);
     // A declaration's immediate initializer and its owner, for root construction
     // and direct result bindings. A block or call can inherit the destination.
@@ -3044,6 +3047,9 @@ struct TypeCheck {
         // (CheckGrowsSince).
         vector<GrowEvent> growlog;
         LinkFlow links;
+        // Writes already made by enclosing return expressions. A nested
+        // return can leave before it finishes replacing their result.
+        vector<RelativeStore> interruptedresults;
         // (program event, summary index) for ordinary class writes in this body.
         vector<pair<size_t, int>> classwrites;
         DeferredLinks *deferring = nullptr; // Relative effects of the defer body being checked.

@@ -388,7 +388,8 @@ inline Val TypeCheck::ResolveCall(Call *c, vector<SFunction *> &cands, FnSpec *e
             // Only a waiting call, a branch rebound to storage, or an untyped
             // [] viewed by a slice parameter can need its own entry for replay.
             auto literal = Is<ArrayLit>(a);
-            if (!argnodes.empty() && (Is<Call>(a) || IsBranchConstruct(a) ||
+            auto waiting = exemplarbase >= 0 && Is<Call>(a);  // Opaque exemplar fallback below.
+            if (!argnodes.empty() && (waiting || IsBranchConstruct(a) ||
                 (literal && literal->elems.empty() && !literal->fillval && !literal->capexpr)))
                 inputs.later.emplace(argnodes.size(), SaveFlow());
             Val v;
@@ -2031,6 +2032,9 @@ inline void TypeCheck::NoteExit(int tf, const vector<RetRoot> &results, const Fn
         if (!mine) return;
         FnRecord::OuterExit x { target };
         x.links = exitlinks();
+        for (auto writes : { &cur.interruptedresults, &cur.links.resultlinks })
+            for (auto &link : *writes)
+                if (link.resultowner != target) link.AddTo(x.partialresults);
         for (size_t i = 0; i < mine->vars.size(); i++) {
             auto v = mine->vars[i];
             if (isassigned(v)) x.assigned.emplace(v, assignedplace(v));
@@ -2051,6 +2055,7 @@ inline void TypeCheck::NoteExit(int tf, const vector<RetRoot> &results, const Fn
             }
             o.maybeassigned.insert(x.maybeassigned.begin(), x.maybeassigned.end());
             o.links.Join(x.links);
+            for (auto &link : x.partialresults) link.AddTo(o.partialresults);
             merge(o.results);
             return;
         }
@@ -3045,6 +3050,7 @@ inline bool TypeCheck::SameRecord(const FnRecord &a, const FnRecord &b, const Fn
     if (!is_permutation(a.outerexits.begin(), a.outerexits.end(), b.outerexits.begin(), b.outerexits.end(),
             [&](const auto &p, const auto &q) {
                 return p.target == q.target && p.links == q.links && p.assigned == q.assigned &&
+                       RelativeStore::SameSet(p.partialresults, q.partialresults, Roots::Compare::Cycle) &&
                        p.maybeassigned == q.maybeassigned && sameresults(p.results, q.results);
             })) return why("nonlocal exits");
     auto sameeffect = [&](const ShrinkEffect &p, const ShrinkEffect &q) {
@@ -3609,7 +3615,8 @@ inline void TypeCheck::FinishReturn(int tf, const vector<Val> &vals, Node *at) {
     }
     vector<RetRoot> results(vals.size());
     for (auto &link : cur.links.resultlinks)
-        if ((size_t)link.result < results.size()) results[link.result].resultlinks.push_back(link);
+        if (link.resultowner == tspec && (size_t)link.result < results.size())
+            results[link.result].resultlinks.push_back(link);
     for (size_t i = 0; i < vals.size(); i++) {
         auto rt = tspec->rets[i];
         auto &rr = results[i];
@@ -3949,7 +3956,11 @@ inline void TypeCheck::CheckReturn(Return *r) {
     for (auto i = tf + 1; i < (int)frames.size(); i++) AddNeed(frames[i].spec, tspec);
     // Values.
     vector<Val> vals;
+    // Only this expression supplies the completed result. Earlier field
+    // stores can still be visible if this expression itself exits nonlocally.
     Saved links(cur.links.resultlinks, vector<RelativeStore> {});
+    Saved interrupted(cur.interruptedresults, cur.interruptedresults);
+    for (auto &s : links.saved) s.AddTo(cur.interruptedresults);
     auto expectone = [&](size_t i) -> TypeExpr * {
         return tspec->retsknown && i < tspec->rets.size() ? tspec->rets[i] : nullptr;
     };
@@ -4295,6 +4306,7 @@ inline bool TypeCheck::RelativeDestination(const Roots &source, Dest dest, TypeE
     rs.pointee = pointee;
     rs.source.Set(have, true);
     if (dest.result) {
+        rs.resultowner = dest.result;
         rs.result = dest.resultindex;
         rs.field = dest.field.path;
     } else rs.destination.Set(want, true);
@@ -4309,54 +4321,60 @@ inline void TypeCheck::CheckCalleeRelative(Call *call, FnSpec *spec, vector<Val>
     if (!rec) return;
     // A recursive call may append to this very record through its caller.
     auto stores = rec->relativestores;
+    for (auto &s : stores) {
+        auto i = (size_t)s.result;
+        auto survives = i < rec->retroots.size() && s.RecordedIn(rec->retroots[i].resultlinks);
+        ApplyRelativeStore(call, spec, args, s, survives);
+    }
+}
+
+// Check the location of a relative store and project its link onto the
+// receiving slot when the store survives the exit being applied.
+inline void TypeCheck::ApplyRelativeStore(Node *call, FnSpec *spec, vector<Val> &args,
+                                          const RelativeStore &s, bool survives) {
     auto mapped = [&](const Roots &roots) {
         Roots out;
         for (auto &a : roots.alts)
             out.Add(RetAltVal(spec, a, args, ast.voidtype, call).AsRoots());
         return out;
     };
-    for (auto &s : stores) {
-        auto source = mapped(s.source);
-        Dest dest;
-        if (s.result < 0) dest = Dest(mapped(s.destination));
-        else {
-            auto i = (size_t)s.result;
-            if (i < callresultdsts.size()) dest = callresultdsts[i];
-            else if (callforwarding && !callresultdsts.empty() && callresultdsts[0].result) {
-                dest = callresultdsts[0];
-                dest.resultindex += s.result;
-            }
-            if (dest.fill)
-                Error(call, "a result containing relative links to its destination cannot be a "
-                            "resize fill value, which is constructed once and copied");
-            auto want = i == 0 ? callresulttype : nullptr;
-            if (!want && dest.result && (size_t)dest.resultindex < dest.result->rets.size())
-                want = dest.result->rets[dest.resultindex];
-            if (i < spec->rets.size()) {
-                if (!ResultLayoutFits(spec->rets[i], want))
-                    Error(call, "a result containing relative links to its destination cannot change "
-                                "representation; return the receiver's type");
-                if (!dest.reached) dest.reached = spec->rets[i];
-            }
-            if (dest.fieldsteps) dest.field.path += s.field;
-            // Every construction must fit the receiver. Only a store from
-            // a completing return leaves its link in that receiver.
-            dest.discarded |= i >= rec->retroots.size() ||
-                              !s.RecordedIn(rec->retroots[i].resultlinks);
+    auto source = mapped(s.source);
+    Dest dest;
+    if (s.result < 0) dest = Dest(mapped(s.destination));
+    else {
+        auto i = (size_t)s.result;
+        if (i < callresultdsts.size()) dest = callresultdsts[i];
+        else if (callforwarding && !callresultdsts.empty() && callresultdsts[0].result) {
+            dest = callresultdsts[0];
+            dest.resultindex += s.result;
         }
-        dest.place.intail |= s.intail;
-        if (!RelativeDestination(source, dest, s.pointee, call, true, true)) {
-            auto target = source.Root() ? string(source.Root()->name) : string("static data");
-            auto receiver = dest.result ? cat("result ", dest.resultindex + 1, " of ", dest.result->sf->name)
-                : dest.roots.Root() ? string(dest.roots.Root()->name) : string("a temporary or argument slot");
-            Error(call, cat("a relative reference must point within the same root as its location "
-                            "(§3.9); call of ", spec->sf->name, " links a target rooted at ",
-                            target, " to receiving storage ", receiver));
+        if (dest.fill)
+            Error(call, "a result containing relative links to its destination cannot be a "
+                        "resize fill value, which is constructed once and copied");
+        auto want = i == 0 ? callresulttype : nullptr;
+        if (!want && dest.result && (size_t)dest.resultindex < dest.result->rets.size())
+            want = dest.result->rets[dest.resultindex];
+        if (i < spec->rets.size()) {
+            if (!ResultLayoutFits(spec->rets[i], want))
+                Error(call, "a result containing relative links to its destination cannot change "
+                            "representation; return the receiver's type");
+            if (!dest.reached) dest.reached = spec->rets[i];
         }
-        if (s.result >= 0 && dest.reached && !dest.result && !dest.discarded && !source.None())
-            RecordLinkStore(dest.roots, dest.reached,
-                            { s.pointee, dest.appended ? EL_BACKWARD : EL_ANY }, call, dest.place, dest.field);
+        if (dest.fieldsteps) dest.field.path += s.field;
+        dest.discarded |= !survives;
     }
+    dest.place.intail |= s.intail;
+    if (!RelativeDestination(source, dest, s.pointee, call, true, true)) {
+        auto target = source.Root() ? string(source.Root()->name) : string("static data");
+        auto receiver = dest.result ? cat("result ", dest.resultindex + 1, " of ", dest.result->sf->name)
+            : dest.roots.Root() ? string(dest.roots.Root()->name) : string("a temporary or argument slot");
+        Error(call, cat("a relative reference must point within the same root as its location "
+                        "(§3.9); call of ", spec->sf->name, " links a target rooted at ",
+                        target, " to receiving storage ", receiver));
+    }
+    if (s.result >= 0 && dest.reached && !dest.result && !dest.discarded && !source.None())
+        RecordLinkStore(dest.roots, dest.reached,
+                        { s.pointee, dest.appended ? EL_BACKWARD : EL_ANY }, call, dest.place, dest.field);
 }
 
 inline TypeExpr *TypeCheck::SubstEnv(TypeExpr *t, FnSpec *env) {

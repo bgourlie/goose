@@ -235,6 +235,11 @@ inline Val ArrayLit::Check(TypeCheck &tc, TypeExpr *expected) {
     }
     TypeCheck::FlagScope inelement(tc.curdst.place.intail, tc.curdst.place.intail || (expected && IsArrayKind(expected, A_GROW)));
     TypeCheck::FlagScope nofieldsteps(tc.curdst.fieldsteps, false);
+    // A fixed array and an appended run write their elements in order.
+    // Other array representations write their length before the elements.
+    if (auto c = tc.curdst.construction; c && c->run != this && expected &&
+        expected->kind == TY_ARRAY && !IsArrayKind(expected, A_FIXED) && tc.reachable)
+        c->started = true;
     if (fillval) {
         auto cnt = tc.FillCount(fillcount);
         if (cnt < 0) tc.Error(this, "array fill count cannot be negative");
@@ -247,6 +252,7 @@ inline Val ArrayLit::Check(TypeCheck &tc, TypeExpr *expected) {
         TypeCheck::SlotScope ss(tc, true);
         auto dest = tc.curdst;
         dest.discarded |= cnt == 0;
+        if (!cnt) dest.construction = nullptr;
         auto ev = tc.CheckValueAt(fillval, elem, dest);
         if (!elem) {
             tc.NoUntypedEmptyArray(ev, fillval, "the array literal around it");
@@ -341,6 +347,8 @@ inline Val StructLit::Check(TypeCheck &tc, TypeExpr *expected) {
     if (t->kind == TY_STRUCT) {
         auto st = t->struc->st;
         if (t->struc->args.empty() && !st->generics.empty()) {
+            // Inferring generic arguments evaluates no receiving-slot stores.
+            TypeCheck::Saved<TypeCheck::Construction *> writing(tc.curdst.construction, nullptr);
             // Infer the struct's generics from the field initializers as
             // written, in the order written: the first to bind a parameter
             // binds it. A check after the first finds them as CheckInits

@@ -2443,12 +2443,14 @@ struct LiveShrink {
 // name parameter classes or lexical storage, mapped as return roots are.
 struct RelativeStore {
     Roots source, destination;
+    FnSpec *resultowner = nullptr; // Whose receiving slot, including for a nonlocal return.
     string field;  // Enclosing struct field path in the result, if any.
     bool intail = false;
     TypeExpr *pointee = nullptr;
     int result = -1;
     bool Same(const RelativeStore &other, Roots::Compare how = Roots::Compare::All) const {
-        return result == other.result && intail == other.intail && pointee == other.pointee &&
+        return resultowner == other.resultowner && result == other.result &&
+               intail == other.intail && pointee == other.pointee &&
                field == other.field && source.Same(other.source, how) && destination.Same(other.destination, how);
     }
 
@@ -2645,6 +2647,7 @@ struct FnRecord {
         set<VarDef *> maybeassigned;
         vector<RetRoot> results; // As evaluated before unwinding, in the target's coordinates.
         ExitLinks links;         // Stores and overwrites in this activation's coordinates.
+        vector<RelativeStore> partialresults; // Writes into results whose construction was interrupted.
     };
     vector<OuterExit> outerexits;
     size_t eventstart = 0;         // storeevents.size() when the body's check began.

@@ -28,10 +28,27 @@ fn overwritten(early: bool) {
     nodes.clear();
     nodes.push(Node {});
 }
+
+struct Entry { n: i64, next: Entry&<u32>? }
+fn leave() -> i64 { return from install; }
+fn init(other: Entry&, early: bool) -> Entry {
+    return Entry { n: if early { leave() } else { 42 }, next: other };
+}
+fn install(entries: Entry[>..]&, early: bool) {
+    entries[0] = init(entries[1], early);
+    assert(entries[0].next .== entries[1]);
+    entries.clear();
+    entries.push(Entry { n: 42 });
+    entries.push(Entry { n: 2 });
+}
 fn main() {
     for early in [true, false] {
         separate(early);
         overwritten(early);
+        var entries: Entry[>..] = [Entry { n: 1 }, Entry { n: 2 }];
+        install(entries, early);
+        entries.pop_n(1);
+        assert(entries.len == 1 && entries[0].next == null);
     }
     print("ok");
 }

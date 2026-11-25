@@ -313,8 +313,8 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
             if (c->defaultinit) {
                 // A nominal default with relative fields becomes a literal
                 // built at its receiving slot.
-                if (Is<StructLit>(c->defaultinit) && HasRelRefT(t, true))
-                    NoteCallConstruction(c->rettypes);
+                auto inplace = Is<StructLit>(c->defaultinit) && HasRelRefT(t, true) && !callresultdsts.empty();
+                Saved writing(curdst.construction, inplace ? callresultdsts.front().construction : nullptr);
                 auto v = CheckValue(c->defaultinit, t->kind == TY_ARRAY ? t->arr->sub : t);
                 v.type = t;
                 // An array is filled with its element's default in a
@@ -608,7 +608,7 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
                 // its expression runs (§1.3(4)).
                 auto logbase = cur.growlog.size();
                 auto inplace = BuiltInPlace(elem);
-                Construction construction { true };
+                Construction construction { true, nullptr, ak != A_LIMITED };
                 auto dest = elementdest();
                 if (inplace && hasdefers) {
                     if (d.kind == B_PUSH) dest.construction = &construction;
@@ -631,7 +631,7 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
                 // receiver's, constructed into its storage (§4.2).
                 auto al = Is<ArrayLit>(an);
                 if (al && al->capexpr) al = nullptr;
-                Construction construction { true, al };
+                Construction construction { true, al, al ? ClassOf(elem) != SC_FIXED : ak != A_LIMITED };
                 Val av;
                 if (al) {
                     auto dest = elementdest();
@@ -4383,9 +4383,13 @@ inline void TypeCheck::ApplyCalleeShrinks(Node *at, FnSpec *spec, vector<Val> &a
     };
     for (auto &exit : rec->outerexits) {
         auto tf = FrameOfSpec(exit.target);
-        if (tf < 0) continue;
+        if (tf < 0 || !reachable) continue;
         auto flow = SaveFlow();
         projectexit(exit.links);
+        for (auto &s : exit.partialresults) {
+            if (s.resultowner == spec) ApplyRelativeStore(at, spec, argvals, s, true);
+            else s.AddTo(cur.links.resultlinks); // Already in the enclosing result owner's coordinates.
+        }
         ReplayOuterExit(tf, spec, exit, flow);
         RestoreFlow(flow);
     }
