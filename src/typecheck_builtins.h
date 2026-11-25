@@ -459,10 +459,10 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
         for (size_t i = 1; i < args.size(); i++) CheckPrintable(c, d.name, args, i, &rv);
         return VoidVal();
     }
+    auto elementplace = recvarr ? rv.refplace.Inside(ak == A_GROW) : RefPlace {};
     auto elementdest = [&] {
-        Dest dest(rv, false, rv.reached);
+        Dest dest(rv, elementplace);
         dest.fill = d.kind == B_RESIZE;
-        dest.place.intail = ak == A_GROW;
         dest.appended = ak == A_GROW && (d.kind == B_PUSH || d.kind == B_APPEND);
         return dest;
     };
@@ -693,8 +693,7 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
             v.TakeAlts(rv);
             v.ClearReads();
             v.writable = rv.writable;
-            v.refplace.location = rv.refplace.location;
-            v.refplace.location.intail |= ak == A_GROW;
+            v.refplace = elementplace;
             // What a receiver that decays the reference loads through.
             c->rettypes.push_back(v.type);
             break;
@@ -1279,7 +1278,7 @@ inline void TypeCheck::CheckGrowShrink(Node *at, const char *op, Node *recv, con
     if (!ShrinkRootsKnown(roots))
         Error(at, cat(op, " through a reference whose array is not known (§5.1)"));
     if (empties && HasRelRefT(at_type))
-        NoteOverwrite(recv, roots, storeevents.size(), true, at_type);
+        NoteOverwrite(recv, roots, storeevents.size(), at_type, &rv.refplace);
     ShrinkThrough(at, op, ExprStr(recv), roots, at_type, { SB_UNBALANCED, empties ? at_type : nullptr });
 }
 
@@ -1315,7 +1314,8 @@ inline bool TypeCheck::RetainsRelativeSlot(TypeExpr *part, TypeExpr *array, Type
 inline ValueLinks TypeCheck::LiveElementLinks(VarDef *owner, TypeExpr *target, TypeExpr *replaced,
                                               bool callerchecks) {
     if (!owner->elementlinks) return {};
-    auto t = owner->type ? LoadType(owner->type) : target;
+    auto storage = OwnerType(owner);
+    auto t = storage ? LoadType(storage) : target;
     auto arr = target ? ResizableArrayIn(target) : nullptr;
     if (t && !RetainsRelativeSlot(t, arr, replaced)) return {};
     size_t since = 0;
@@ -1328,7 +1328,7 @@ inline ValueLinks TypeCheck::LiveElementLinks(VarDef *owner, TypeExpr *target, T
     };
     for (auto &[part, at] : cur.links.live) {
         if (part.owner != owner) continue;
-        if (owner->type && cleared && at < since) continue;
+        if (storage && cleared && at < since) continue;
         retain(part.link);
     }
     auto spec = CurRealFrame().spec;
@@ -1465,8 +1465,11 @@ inline bool TypeCheck::KillPath(Node *n, VarDef *&base, string &path) {
         auto vd = id->vdef;
         if (!vd || vd->istemp) return false;
         if (IsRefOrSlice(vd->type) && (vd->type->kind != TY_REF || vd->isvar)) return false;
-        base = vd->refplace.base ? vd->refplace.base : vd;
-        path = vd->refplace.path;
+        base = vd;
+        if (vd->refplace.base && !vd->refplace.enclosing) {
+            base = vd->refplace.base;
+            path = vd->refplace.path;
+        }
         return true;
     }
     auto d = Is<Dot>(n);
@@ -1485,36 +1488,45 @@ inline bool TypeCheck::KillPath(Node *n, VarDef *&base, string &path) {
 // An exact location of the owner's own value type can only be the whole
 // owner. Record that identity even if the reference used to reach it is
 // rebound later. For a subobject we still need a stable field path.
+inline RefPlace TypeCheck::StoragePlace(const Roots &roots, TypeExpr *target, RefPlace place) {
+    if (roots.Exact()) {
+        auto owner = roots.Root();
+        if (owner && !IsTemp(owner)) {
+            auto t = OwnerType(owner);
+            if (t && !IsRefOrSlice(t) && TopConstEq(t, target))
+                return { place.location, owner };
+            auto base = place.base;
+            if (base == owner || (base && base->type && IsAddressRef(base->type) && !base->isvar &&
+                                  base->ref.Exact() && base->ref.Root() == owner))
+                return place;
+        }
+    }
+    return { place.location, nullptr, {}, place.nullonly };
+}
+
 inline std::optional<TypeCheck::Kill> TypeCheck::OverwrittenPart(Node *n, const Roots &loc,
-                                                TypeExpr *target, bool relative, size_t at,
-                                                const RefPlace *place) {
+                                        TypeExpr *target, size_t at, const RefPlace *place) {
+    if (place) {
+        auto part = StoragePlace(loc, target, *place);
+        if (!part.base || part.enclosing) return {};
+        Kill kill { loc.Root(), part.base, string(part.path), at, true };
+        // A reference field names its slot. An overwrite through it affects its pointee.
+        if (KillNamesType(kill, target)) return kill;
+        return {};
+    }
     if (!loc.Exact()) return {};
     auto owner = loc.Root();
     if (!owner || IsTemp(owner)) return {};
-    if (relative && owner->type && !IsRefOrSlice(owner->type) && TopConstEq(owner->type, target))
-        return Kill { owner, owner, "", at, true };
     VarDef *base = nullptr;
     string path;
-    if (place && place->base) {
-        base = place->base;
-        path = place->path;
-    } else if (!KillPath(n, base, path)) return {};
-    if (!IsRefOrSlice(base->type) && base != owner) return {};
-    Kill kill { owner, base, std::move(path), at, relative };
-    // A reference field names its slot. An overwrite through it affects its pointee.
-    if (relative && !KillNamesType(kill, target)) return {};
-    return kill;
+    if (!KillPath(n, base, path)) return {};
+    if (base != owner && (!base->type || !IsRefOrSlice(base->type))) return {};
+    return Kill { owner, base, std::move(path), at, false };
 }
 
-// The same exact paths identify a write of a link and a later overwrite.
-inline TypeCheck::Dest TypeCheck::AssignmentDest(Node *path, const LVal &lv, TypeExpr *target) {
+inline TypeCheck::Dest TypeCheck::AssignmentDest(const LVal &lv, TypeExpr *target) {
     if (lv.var && IsRefOrSlice(target)) return Dest(lv.var, true);
-    Dest dest(lv, false, lv.reached);
-    if (HasRelRefT(target)) {
-        if (auto part = OverwrittenPart(path, lv, target, true, 0))
-            dest.field = { part->base, std::move(part->path) };
-    }
-    return dest;
+    return Dest(lv, StoragePlace(lv, target, lv.place));
 }
 
 // Express an overwrite through a reference parameter in its argument's
@@ -1523,17 +1535,16 @@ inline TypeCheck::Dest TypeCheck::AssignmentDest(Node *path, const LVal &lv, Typ
 inline std::optional<TypeCheck::Kill> TypeCheck::ArgumentKill(Node *arg, const Val &v,
                                                 TypeExpr *pointee, bool relative, size_t at) {
     if (auto u = Is<Unary>(arg); u && u->op == T_BITAND) arg = u->child;
-    auto kill = OverwrittenPart(arg, v, pointee, relative, at, relative ? &v.refplace : nullptr);
+    auto kill = OverwrittenPart(arg, v, pointee, at, relative ? &v.refplace : nullptr);
     if (!kill) return {};
     auto base = kill->base, owner = kill->container;
     if (!relative && (owner->isglobal || owner->captured)) return {};
-    if (IsRefOrSlice(base->type) && (!base->ref.Exact() || base->ref.Root() != owner))
+    if (base->type && IsRefOrSlice(base->type) && (!base->ref.Exact() || base->ref.Root() != owner))
         return {};
     return kill;
 }
 
-// Stores and guaranteed overwrites name the same subobject at a call:
-// the callee's field path starts where its reference argument points.
+// A guaranteed overwrite maps to the exact subobject its argument names.
 inline std::optional<TypeCheck::Kill> TypeCheck::MapParamPart(FnSpec *spec, const vector<Node *> &args,
         const vector<Val> &vals, size_t param, const string &path, bool relative, size_t at) {
     if (param >= args.size() || param >= vals.size() || param >= spec->params.size() ||
@@ -1550,23 +1561,23 @@ inline std::optional<TypeCheck::Kill> TypeCheck::MapParamPart(FnSpec *spec, cons
 // here on, which the stores into it before event `at`, the one at which the
 // value began to be checked, then did not put there. Only the part of
 // storage one known container holds is so emptied.
-inline void TypeCheck::NoteKill(Node *lval, const Roots &loc, TypeExpr *target, const Val &v,
+inline void TypeCheck::NoteKill(Node *lval, const LVal &loc, TypeExpr *target, const Val &v,
                                 size_t at) {
     if (!target) return;
-    if (HasRelRefT(target)) NoteOverwrite(lval, loc, at, true, target);
+    if (HasRelRefT(target)) NoteOverwrite(lval, loc, at, target, &loc.place);
     if (!HoldsPlainRef(target)) return;
     auto held = ContentsOf(v);
-    if (held.OnlyStatic() && !held.unknown) NoteOverwrite(lval, loc, at, false, target);
+    if (held.OnlyStatic() && !held.unknown) NoteOverwrite(lval, loc, at, target);
 }
 
-inline void TypeCheck::NoteOverwrite(Node *lval, const Roots &loc, size_t at, bool relative,
-                                     TypeExpr *target) {
+inline void TypeCheck::NoteOverwrite(Node *lval, const Roots &loc, size_t at, TypeExpr *target,
+                                     const RefPlace *place) {
     if (!reachable) return;
-    auto kill = OverwrittenPart(lval, loc, target, relative, at);
-    if (!kill || (!relative && (kill->container->isglobal || kill->base->isglobal))) return;
+    auto kill = OverwrittenPart(lval, loc, target, at, place);
+    if (!kill || (!kill->relative && (kill->container->isglobal || kill->base->isglobal))) return;
     erase_if(cur.kills, [&](const Kill &k) { return k.SamePart(*kill); });
     cur.kills.push_back(std::move(*kill));
-    if (relative) ApplyLinkKill(cur.kills.back());
+    if (cur.kills.back().relative) ApplyLinkKill(cur.kills.back());
 }
 
 // The assignment overwrites old links; the stores made in its RHS start at
@@ -1578,9 +1589,10 @@ inline void TypeCheck::ApplyLinkKill(const Kill &k) {
     // Two fixed-size parameters of the same type may name sibling fields.
     // A resizable pointee is unique in its owner (§3.3), so an overwrite
     // there can kill writes reached through that same type of pointee.
-    auto t = LoadType(owner->type ? owner->type : k.base->type->ref->sub);
+    auto storage = OwnerType(owner);
+    auto t = LoadType(storage ? storage : k.base->type->ref->sub);
     size_t since;
-    bool all = (owner->type || ClassOf(t) == SC_RESIZABLE) &&
+    bool all = (storage || ClassOf(t) == SC_RESIZABLE) &&
                KilledFor(owner, owner, t, nullptr, since, true);
     auto part = KillPartType(k);
     bool tail = part && ResizableArrayIn(part);
@@ -1591,7 +1603,7 @@ inline void TypeCheck::ApplyLinkKill(const Kill &k) {
         if (tail && place.link.intail && at < k.at) return true;
         if (!all || at >= since) return false;
         auto reached = storeevents[at].reached;
-        return owner->type || (reached && TopConstEq(t, LoadType(reached)));
+        return storage || (reached && TopConstEq(t, LoadType(reached)));
     });
 }
 
@@ -1647,7 +1659,7 @@ inline bool TypeCheck::KilledFor(VarDef *c, VarDef *base, TypeExpr *t, TypeExpr 
 
 // The type of the part kill k emptied, null where its path names no field.
 inline TypeExpr *TypeCheck::KillPartType(const Kill &k) {
-    auto t = k.base->type;
+    auto t = OwnerType(k.base);
     if (!t) return nullptr;
     if (t->kind == TY_REF) t = t->ref->sub;
     t = LoadType(t);
@@ -1953,38 +1965,16 @@ inline void TypeCheck::AddStoreEvent(const StoreEvent &e) {
     origin(evs.size() - 1);
 }
 
-// An address taken from a path can identify an exact part of its owner.
-// Keep it on the reference so a value-producing construct can join it.
-inline void TypeCheck::NoteRefPath(Node *n, Val &v) {
-    auto target = v.type->ref->sub;
-    if (v.refplace.nullonly || v.refplace.base || !HasRelRefT(target)) return;
-    if (auto k = ArgumentKill(n, v, target, true, 0)) {
-        v.refplace.base = k->base;
-        if (!k->path.empty()) v.refplace.path = ast.Intern(std::move(k->path));
-    }
-}
-
-// An immutable binding keeps both the location of the pointee and the exact
-// path a whole overwrite there can be expressed against.
-inline void TypeCheck::NoteRefPlace(VarDef *vd, Node *arg, const Val &v) {
+// An immutable binding can retain the field containing its pointee even
+// when writing through the binding only overwrites part of that field.
+inline void TypeCheck::NoteRefPlace(VarDef *vd, const Val &v) {
     if (vd->isvar || !IsAddressRef(vd->type) || !HasRelRefT(vd->type->ref->sub)) return;
-    if (v.refplace.nullonly) {
-        vd->refplace = v.refplace;
-        return;
-    }
-    RefPlace place;
-    place.location = v.refplace.location;
+    auto place = StoragePlace(v, vd->type->ref->sub, v.refplace);
     // A captured let can be initialized in a shorter-lived scope. Keep
     // facts expressed in bindings that will still exist wherever it is read.
     if (place.location.param && Depth(place.location.param) > Depth(vd)) place.location.param = nullptr;
-    if (!vd->isglobal) {
-        auto k = ArgumentKill(arg, v, vd->type->ref->sub, true, 0);
-        if (k && Depth(k->base) <= Depth(vd)) {
-            place.base = k->base;
-            if (k->path == v.refplace.path) place.path = v.refplace.path;
-            else if (!k->path.empty()) place.path = ast.Intern(std::move(k->path));
-        }
-    }
+    if (place.base && (vd->isglobal || Depth(place.base) > Depth(vd)))
+        place = { place.location, nullptr, {}, place.nullonly };
     vd->refplace = place;
 }
 
@@ -2161,7 +2151,7 @@ inline Roots TypeCheck::ClassArgRoots(TypeExpr *pt, const Val &v) {
 // names assigns the slice variable each such storage may be (StoreIntoSlot).
 // A store into a holder grows its contents as the caller's own would, which
 // a loop around the call feeds back (NoteFact).
-inline void TypeCheck::ApplyCalleeStores(FnSpec *spec, const vector<Node *> &args, vector<Val> &argvals, Node *at,
+inline void TypeCheck::ApplyCalleeStores(FnSpec *spec, vector<Val> &argvals, Node *at,
                                        vector<int> *origins) {
     auto base = storeevents.size();
     // The class event each store added from `from` on replays.
@@ -2586,12 +2576,22 @@ inline void TypeCheck::ApplyCalleeStores(FnSpec *spec, const vector<Node *> &arg
                             ? argvals[p].refplace.location : LinkLocation {};
             }
             auto field = e.linkfield;
-            if (field.base && field.base->ownerspec == spec) {
+            auto owners = mapped(e.container, !e.bound);
+            if (field.base == e.container && e.container->componentbase) {
+                field.base = ExactComponent(owners);
+                if (!field.base) field = {};
+            } else if (field.base && field.base->ownerspec == spec) {
                 auto it = find(spec->params.begin(), spec->params.end(), field.base);
-                auto part = MapParamPart(spec, args, argvals, it - spec->params.begin(), field.path, true, 0);
-                field = part ? LinkField { part->base, std::move(part->path) } : LinkField {};
+                auto p = (size_t)(it - spec->params.begin());
+                RefPlace part;
+                if (it != spec->params.end() && p < argvals.size() && IsAddressRef((*it)->type))
+                    part = StoragePlace(argvals[p], (*it)->type->ref->sub, argvals[p].refplace);
+                // An indexed argument names the whole array field only as a
+                // containing field. The callee's suffix is inside its element.
+                if (!part.base) field = {};
+                else field = { part.base, part.enclosing ? string(part.path) : cat(part.path, field.path) };
             }
-            RecordLinkStore(mapped(e.container, !e.bound), e.reached, e.elementlink, at, place, field);
+            RecordLinkStore(owners, e.reached, e.elementlink, at, place, field);
         } else {
             applystore(e, mapped(e.root, e.exact), true);
         }
@@ -3231,7 +3231,12 @@ inline vector<FnRecord::CallerKill> TypeCheck::CallerKills(FnSpec *spec, bool re
     if (cur.kills.empty()) return out;
     for (auto &k : cur.kills) {
         auto base = k.base;
-        if (!k.relative || !base->type || (!base->isglobal && base->ownerspec == spec)) continue;
+        if (!k.relative) continue;
+        if (base == k.container && base->componentbase && IsClassRoot(base)) {
+            out.push_back({ -1, k.path, true, base, base });
+            continue;
+        }
+        if (!base->type || (!base->isglobal && base->ownerspec == spec)) continue;
         if (base != k.container && (base->isvar || !IsAddressRef(base->type) ||
                                     !base->ref.Exact() || RefRootOf(base) != k.container))
             continue;
@@ -3856,8 +3861,7 @@ inline void TypeCheck::ApplyCalleeLiveShrinks(Node *at, FnSpec *spec, vector<Val
     // resizable value, which a shrink of the class shrinks: the type an
     // argument's root that only bounds it leads to (ApplyCalleeShrinks).
     auto storage = [&](VarDef *r) -> TypeExpr * {
-        if (r && r->componentbase)
-            return LoadType(GetStructInst(r->componentbase)->ftypes[r->componentfield]);
+        if (auto t = ComponentType(r)) return LoadType(t);
         for (size_t p = 0; r && p < spec->params.size() && p < spec->argtypes.size(); p++) {
             auto pt = spec->argtypes[p];
             if (spec->params[p]->ref.Root() == r && pt->kind == TY_REF &&
@@ -4025,6 +4029,11 @@ inline void TypeCheck::ApplyCalleeShrinks(Node *at, FnSpec *spec, vector<Val> &a
     // value names keep the events of an earlier check of its body, which no
     // order says anything of, so a kill never empties one.
     auto mapkill = [&](const FnRecord::CallerKill &k) -> std::optional<Kill> {
+        if (k.external && k.external == k.base && k.external->componentbase && IsClassRoot(k.external)) {
+            auto owner = ExactComponent(MapClass(spec, k.external, argvals));
+            if (!owner) return {};
+            return Kill { owner, owner, k.path, storesbase, k.relative };
+        }
         if (k.external) return Kill { k.external, k.base, k.path, storesbase, k.relative };
         auto mapped = MapParamPart(spec, argnodes, argvals, k.param, k.path, k.relative, storesbase);
         if (!mapped) return {};
@@ -4113,7 +4122,7 @@ inline void TypeCheck::ApplyCalleeShrinks(Node *at, FnSpec *spec, vector<Val> &a
             ~Restore() { r = saved; }
         } restore { replay, replay };
         replay = { -1, &classorigins, classbase };
-        ApplyCalleeStores(spec, argnodes, argvals, at, &origins);
+        ApplyCalleeStores(spec, argvals, at, &origins);
     }
     // The record read: none in a cycle's first round (RecordOf), whose back
     // edge shrinks nothing yet.
@@ -4231,9 +4240,8 @@ inline void TypeCheck::ApplyCalleeShrinks(Node *at, FnSpec *spec, vector<Val> &a
         shrink(roots, b.type, "may shrink", b.effect, orderof(b.key, nullptr, b.type), true);
     }
     for (auto &[vd, balance] : rec->shrinkexternals) {
-        auto storage = vd->componentbase
-                           ? LoadType(GetStructInst(vd->componentbase)->ftypes[vd->componentfield])
-                           : nullptr;
+        auto t = ComponentType(vd);
+        auto storage = t ? LoadType(t) : nullptr;
         shrink(MapClass(spec, vd, argvals), storage, "shrinks", balance,
                orderof(-1, vd, nullptr));
     }

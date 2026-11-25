@@ -700,13 +700,21 @@ struct LinkLocation {
     bool operator==(const LinkLocation &) const = default;
 };
 
-// Facts about the pointee of a stable binding. The containing location can
-// be known even when the exact base and field path differ between branches.
+// A storage location. A field path can name the slot itself or a field
+// containing it, e.g. the array when the slot is one of its elements.
 struct RefPlace {
     LinkLocation location;
     VarDef *base = nullptr;
     string_view path;
     bool nullonly = false;  // No pointee on this path. The default is an unknown place.
+    bool enclosing = false;
+
+    RefPlace Inside(bool intail = false) const {
+        auto part = *this;
+        part.enclosing = base != nullptr;
+        part.location.intail |= intail;
+        return part;
+    }
 
     RefPlace Common(const RefPlace &other) const {
         if (nullonly) return other;
@@ -717,6 +725,7 @@ struct RefPlace {
         if (base == other.base && path == other.path) {
             common.base = base;
             common.path = path;
+            common.enclosing = enclosing || other.enclosing;
         }
         return common;
     }
@@ -1812,6 +1821,11 @@ struct VarDef {
     int globalindex = 0;
     bool isparam = false;
     RefPlace refplace;       // Pointee of a stable reference binding.
+    RefPlace PointeePlace() {
+        auto place = refplace;
+        if (!isvar && !istemp && !place.base && !place.nullonly) place.base = this;
+        return place;
+    }
     // Independently owned fields of a root declaration. These synthetic
     // variables have the owner's scope and stable identities across loop
     // checking passes, but are not source-level bindings.

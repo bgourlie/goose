@@ -128,7 +128,7 @@ struct TypeCheck {
     // provenance names the storage's owner, and `writable` whether the whole
     // path admits writes.
     struct LVal : Prov {
-        LinkLocation place;
+        RefPlace place;
         TypeExpr *type = nullptr;    // The location's own type (varints undecoded).
         VarDef *var = nullptr;       // Set when the path is a bare variable name.
         // The location is a `let` binding or field itself, which is not
@@ -344,8 +344,12 @@ struct TypeCheck {
         Dest() {}
         Dest(const Roots &r, bool vb = false, TypeExpr *re = nullptr)
             : roots(r), varbind(vb), reached(re), unknown(r.None()) {}
-        Dest(const LVal &lv, bool vb, TypeExpr *re)
-            : Dest(static_cast<const Roots &>(lv), vb, re) { place = lv.place; }
+        Dest(const Prov &storage, const RefPlace &part)
+            : Dest(storage, false, storage.reached) {
+            place = part.location;
+            field = { part.base, string(part.path) };
+            fieldsteps = !part.enclosing;
+        }
         // A variable's own storage.
         Dest(VarDef *vd, bool vb = false) : varbind(vb) {
             roots.Set(vd, true);
@@ -1495,6 +1499,17 @@ struct TypeCheck {
     Prov RefProvOf(VarDef *vd);
     VarDef *ResetLocal(VarDef *previous);
     VarDef *RootComponent(VarDef *owner, TypeExpr *t, int field);
+    TypeExpr *ComponentType(VarDef *root) {
+        return root && root->componentbase
+                   ? GetStructInst(root->componentbase)->ftypes[root->componentfield] : nullptr;
+    }
+    TypeExpr *OwnerType(VarDef *root) {
+        return root->type ? root->type : ComponentType(root);
+    }
+    static VarDef *ExactComponent(const Roots &roots) {
+        auto root = roots.Exact() ? roots.Root() : nullptr;
+        return root && root->componentbase ? root : nullptr;
+    }
     // Root metadata has no packed value layout, but an owner whose fields
     // are all fixed needs no dynamic storage across a recursive call.
     bool NeedsCycleStack(TypeExpr *t) {
@@ -2569,7 +2584,7 @@ struct TypeCheck {
     void CheckCycleInit(VarDef *d, int fi, int calls);
     void AssignableClassCheck(TypeExpr *t, Node *at);
     void CheckAssign(Assign *a);
-    Val CheckAssignedValue(Assign *a, TypeExpr *target, TypeExpr *arr, const Roots &built,
+    Val CheckAssignedValue(Assign *a, TypeExpr *target, TypeExpr *arr, const LVal &built,
                            Dest dest);
     void CheckRebind(Assign *a, LVal &lv);
     bool InGenericBody();
@@ -2646,14 +2661,16 @@ struct TypeCheck {
     // in force empty every slot of a `t` at `base` in container c that can
     // hold a view into an `arr`'s elements, since which event.
     bool KillPath(Node *n, VarDef *&base, string &path);
-    std::optional<Kill> OverwrittenPart(Node *n, const Roots &loc, TypeExpr *target, bool relative,
-                                        size_t at, const RefPlace *place = nullptr);
-    Dest AssignmentDest(Node *path, const LVal &lv, TypeExpr *target);
+    std::optional<Kill> OverwrittenPart(Node *n, const Roots &loc, TypeExpr *target,
+                                        size_t at, const RefPlace *place);
+    RefPlace StoragePlace(const Roots &roots, TypeExpr *target, RefPlace place);
+    Dest AssignmentDest(const LVal &lv, TypeExpr *target);
     std::optional<Kill> ArgumentKill(Node *arg, const Val &v, TypeExpr *pointee, bool relative, size_t at);
     std::optional<Kill> MapParamPart(FnSpec *spec, const vector<Node *> &args, const vector<Val> &vals,
                                      size_t param, const string &path, bool relative, size_t at);
-    void NoteKill(Node *lval, const Roots &loc, TypeExpr *target, const Val &v, size_t at);
-    void NoteOverwrite(Node *path, const Roots &loc, size_t at, bool relative, TypeExpr *target);
+    void NoteKill(Node *lval, const LVal &loc, TypeExpr *target, const Val &v, size_t at);
+    void NoteOverwrite(Node *path, const Roots &loc, size_t at, TypeExpr *target,
+                       const RefPlace *place = nullptr);
     bool KilledFor(VarDef *c, VarDef *base, TypeExpr *t, TypeExpr *arr, size_t &since,
                    bool relative = false, TypeExpr *replaced = nullptr);
     TypeExpr *KillPartType(const Kill &k);
@@ -2709,8 +2726,7 @@ struct TypeCheck {
     void NoteLitElem(LitDeep &deep, Node *at, const Val &v, TypeExpr *t);
     void HolderFromLit(Val &v, const LitDeep &deep);
     void AddStoreEvent(const StoreEvent &e);
-    void NoteRefPath(Node *n, Val &v);
-    void NoteRefPlace(VarDef *vd, Node *arg, const Val &v);
+    void NoteRefPlace(VarDef *vd, const Val &v);
     void RecordElementLinks(const Roots &owners, TypeExpr *reached, const ValueLinks &links, Node *at,
                             LinkLocation place = {}, const LinkField &field = {});
     void RecordLinkStore(const Roots &owners, TypeExpr *reached, ElementLink link, Node *at,
@@ -2744,7 +2760,7 @@ struct TypeCheck {
                                      set<VarDef *> &seen);
     // `origins`: for each store event the call adds, the index of the class
     // event it replays, -1 for any other (CallOrder).
-    void ApplyCalleeStores(FnSpec *spec, const vector<Node *> &args, vector<Val> &argvals, Node *at,
+    void ApplyCalleeStores(FnSpec *spec, vector<Val> &argvals, Node *at,
                            vector<int> *origins = nullptr);
     void NoteHolderBinding(VarDef *d, const Val &v, Node *at);
 

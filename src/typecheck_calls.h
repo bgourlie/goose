@@ -4144,7 +4144,7 @@ inline Val TypeCheck::CheckFunValCall(Call *c, const FnValBind &fb, TypeExpr *ex
         if (IsRefOrSlice(ptypes[i])) {
             BindRefProvenance(vd, argvals[i]);
             if (ptypes[i]->cq) vd->ref.writable = false;
-            NoteRefPlace(vd, c->args[i], argvals[i]);
+            NoteRefPlace(vd, argvals[i]);
         } else {
             if (argvals[i].elementlinks)
                 RecordElementLinks(RootsOf(vd), ptypes[i], argvals[i].elementlinks, c->args[i]);

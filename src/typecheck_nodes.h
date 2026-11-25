@@ -92,11 +92,7 @@ inline Val Ident::Check(TypeCheck &tc, TypeExpr *) {
         v.type = tc.LoadType(t);
         if (IsRefOrSlice(t)) {
             v.SetProv(tc.RefProvOf(vd));
-            if (t->kind == TY_REF) {
-                v.refplace = vd->refplace;
-                if (!vd->isvar && !vd->istemp && !v.refplace.base && !v.refplace.nullonly)
-                    v.refplace.base = vd;
-            }
+            if (t->kind == TY_REF) v.refplace = vd->PointeePlace();
             v.lvalue = t->kind == TY_SLICE;   // A slice variable is storage; a reference is the pointee's path.
             if (v.lvalue) {
                 v.slot.Set(vd, true);
@@ -111,6 +107,7 @@ inline Val Ident::Check(TypeCheck &tc, TypeExpr *) {
             v.unsizedparam = vd->unsizedorigin ? vd->unsizedorigin : vd;
         } else {
             v.Set(vd, true);
+            if (!vd->istemp) v.refplace.base = vd;
             v.byteview = vd->contentbyteview;
             v.elementlinks = tc.LiveElementLinks(vd);
             v.writable = !vd->copybind && !(vd->type && vd->type->cq);
@@ -502,7 +499,7 @@ inline Val Dot::Check(TypeCheck &tc, TypeExpr *) {
     TypeCheck::LVal lv;
     lv.type = t;
     lv.SetProv(ov);
-    lv.place = ov.refplace.location;
+    lv.place = ov.refplace;
     lv.intemp = tc.TempContents(ov, lv.contents);
     tc.ResolveMemberLValue(lv, this);
     if (lv.intemp) tc.NoRelRefTempRead(obj, t, lv.type);

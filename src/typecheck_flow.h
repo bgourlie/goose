@@ -1664,7 +1664,7 @@ inline Val TypeCheck::CheckMatch(MatchExpr *m, TypeExpr *expected, bool wantvalu
                                             " ", arm.pat.binder));
                     binder->type = ast.RefTo(vt, m->line);
                     BindProv(binder, sv);
-                    binder->refplace.location = sv.refplace.location;
+                    binder->refplace = sv.refplace.Inside();
                     ReadBack held;
                     if (TempContents(sv, held)) NoRelRefTempRead(m->scrutinee, enumtype, vt);
                 } else {
@@ -1973,7 +1973,7 @@ inline void TypeCheck::CheckFor(ForLoop *x) {
     TypeExpr *bindtype = nullptr;
     TypeExpr *elemtype = nullptr;   // The array's element type, where it has one.
     Prov iterprov;   // What a reference binding points into.
-    LinkLocation elementplace;
+    RefPlace elementplace;
     ReadBack contents;   // Where the elements point, when the array is a temporary.
     auto intemp = false;
     // A binder's written integer type (§6.5).
@@ -2088,8 +2088,7 @@ inline void TypeCheck::CheckFor(ForLoop *x) {
             // either way, there being no references to references (§3.8).
             if (byref && elem->kind != TY_REF) {
                 if (t->kind == TY_ARRAY) {
-                    elementplace = iv.refplace.location;
-                    elementplace.intail |= IsArrayKind(t, A_GROW);
+                    elementplace = iv.refplace.Inside(IsArrayKind(t, A_GROW));
                 }
                 bindtype = ast.RefTo(elem, x->line);
             } else {
@@ -2160,7 +2159,7 @@ inline void TypeCheck::CheckFor(ForLoop *x) {
         }
         if (IsRefOrSlice(bindtype)) {
             BindProv(vd, iterprov);
-            vd->refplace.location = elementplace;
+            vd->refplace = elementplace;
         }
         x->vdef = vd;
         if (!x->idxvar.empty()) {
@@ -2753,7 +2752,7 @@ inline void TypeCheck::CheckVarDecl(VarDecl *vd, bool global) {
         if (global) CheckVarExtent(d, vd);
         if (v && IsRefOrSlice(t)) {
             BindRefProvenance(d, *v);
-            NoteRefPlace(d, init, *v);
+            NoteRefPlace(d, *v);
             if (t->cq) d->ref.writable = false;
             // An annotated one's binding FitsAt has noted.
             if (global && !ann && !v->isnull)
@@ -2994,7 +2993,7 @@ inline void TypeCheck::AssignableClassCheck(TypeExpr *t, Node *at) {
 // it follows through a variable it takes one out of leads into the array
 // being built (rebuilding, ExposedLater).
 inline Val TypeCheck::CheckAssignedValue(Assign *a, TypeExpr *target, TypeExpr *arr,
-                                         const Roots &built, Dest dest) {
+                                         const LVal &built, Dest dest) {
     if (arr) {
         {
             struct Restore {
@@ -3002,7 +3001,8 @@ inline Val TypeCheck::CheckAssignedValue(Assign *a, TypeExpr *target, TypeExpr *
                 ~Restore() { flag = saved; }
             } restore { rebuilding, rebuilding };
             rebuilding = true;
-            if (HasRelRefT(target)) NoteOverwrite(a->lval, built, storeevents.size(), true, target);
+            if (HasRelRefT(target))
+                NoteOverwrite(a->lval, built, storeevents.size(), target, &built.place);
             ShrinkThrough(a, "assign", ExprStr(a->lval), built, target,
                           { SB_UNBALANCED, target });
         }
@@ -3120,16 +3120,14 @@ inline void TypeCheck::CheckAssign(Assign *a) {
     // An uninitialized local's first assignment constructs it; every other
     // assignment of a resizable array, or of a value holding one, replaces
     // elements that are already there.
-    Roots built;
     auto arr = ResizableArrayIn(target);
     if (arr && (!lv.var || lv.var->assigned)) {
-        if (lv.var) built.Set(lv.var, true); else built = lv;
-        if (arr->arr->akind == A_GROW) GrowOnlyAssignKnown(a, built, arr == target);
+        if (arr->arr->akind == A_GROW) GrowOnlyAssignKnown(a, lv, arr == target);
     } else {
         arr = nullptr;
     }
     auto killat = storeevents.size();
-    auto v = CheckAssignedValue(a, target, arr, built, AssignmentDest(a->lval, lv, target));
+    auto v = CheckAssignedValue(a, target, arr, lv, AssignmentDest(lv, target));
     NoteKill(a->lval, lv, target, v, killat);
     if (lv.var) {
         NoLetReassign(a, lv.var, "assign to", "assigned");
@@ -3174,7 +3172,7 @@ inline void TypeCheck::CheckRebind(Assign *a, LVal &lv) {
     bool wasplain;
     auto killat = storeevents.size();
     {
-        DestScope ds(*this, AssignmentDest(a->lval, lv, target));
+        DestScope ds(*this, AssignmentDest(lv, target));
         // `r .= &x` is the documented spelling of a rebind (§3.8), so an
         // explicit & is not redundant here as it is at a binding destination.
         SlotScope ss(*this, true);
@@ -3188,7 +3186,7 @@ inline void TypeCheck::CheckRebind(Assign *a, LVal &lv) {
         NoLetReassign(a, lv.var, "rebind", "bound");
         if (!lv.var->refrootknown || lv.var->ref.Unknown()) BindRefProvenance(lv.var, v);
         else if (!v.isnull) CheckRefRebindRoot(a, lv.var, v);
-        NoteRefPlace(lv.var, a->rhs, v);
+        NoteRefPlace(lv.var, v);
         lv.var->assigned = lv.var->maybeassigned = true;
         // Rebinding an optional settles its nullness — narrowed only when
         // the new value is provably non-null (a plain reference).
@@ -3231,13 +3229,11 @@ inline void TypeCheck::PointeeAssign(Assign *a, LVal &lv, const LVal &at) {
         Error(a, "varint fields are written only at construction (§3.6)");
     AssignableClassCheck(pt, a);
     auto arr = ResizableArrayIn(pt);
-    Roots built;
-    if (arr) built = at;
-    if (arr && arr->arr->akind == A_GROW) GrowOnlyAssignKnown(a, built, arr == pt);
-    auto dest = AssignmentDest(a->lval, at, pt);
+    if (arr && arr->arr->akind == A_GROW) GrowOnlyAssignKnown(a, at, arr == pt);
+    auto dest = AssignmentDest(at, pt);
     dest.slot = pt->kind == TY_SLICE;
     auto killat = storeevents.size();
-    auto v = CheckAssignedValue(a, pt, arr, built, dest);
+    auto v = CheckAssignedValue(a, pt, arr, at, dest);
     // Through a reference variable the part written is its whole pointee; a
     // reference loaded out of a field names no part KillPath can.
     if (Is<Ident>(a->lval)) NoteKill(a->lval, at, pt, v, killat);
