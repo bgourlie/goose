@@ -963,19 +963,25 @@ inline void TypeCheck::CheckRenderable(Call *c, const char *what, TypeExpr *t, N
     } popwalk { *this, walk };
     // A part lies in the value's storage, or where the value points: a slice
     // part's slot is the value, as writable as that is (UserFormatIn).
-    auto child = [&](TypeExpr *ft, bool throughref, int component = -1) {
+    auto child = [&](TypeExpr *ft, bool throughref, const FieldRun *run = nullptr, size_t i = 0) {
         auto v = value;
-        v.refplace = {};  // The hook receives a part or a stored reference.
-        if (component >= 0) v.TakeAlts(ProjectRoots(value, t, component));
+        if (run) ProjectField(v, v.refplace, t, *run, i);
+        else if (t->kind == TY_ARRAY) v.refplace = value.refplace.Inside(IsArrayKind(t, A_GROW));
+        else if (t->kind == TY_SLICE) v.refplace = {};
         v.hasslot = ft->kind == TY_SLICE;
         if (v.hasslot) v.slot = v;
         if (throughref) {
+            v.refplace = {};  // The loaded view points beyond its slot.
             ReadBack contents;
             auto hascontents = TempContents(value, contents);
             v.TakeAlts(ReadBackRoot(ft, v, value.byteview, hascontents ? &contents : nullptr));
             v.writable = SlotLoadWritable(ft, value.writable);
         }
         CheckRenderable(c, what, ft, at, seen, v, out);
+    };
+    auto fields = [&](const FieldRun &run) {
+        for (size_t i = 0; i < run.ftypes->size(); i++)
+            if (auto ft = (*run.ftypes)[i]) child(ft, IsRefOrSlice(ft), &run, i);
     };
     switch (t->kind) {
         case TY_INT: case TY_FLT: case TY_BOOL: return;
@@ -1011,12 +1017,6 @@ inline void TypeCheck::CheckRenderable(Call *c, const char *what, TypeExpr *t, N
             return;
         }
         case TY_STRUCT: case TY_ENUM: case TY_VARIANT:
-            if (ClassOf(t) == SC_ROOT) {
-                auto si = GetStructInst(t);
-                for (size_t i = 0; i < si->ftypes.size(); i++)
-                    if (auto ft = si->ftypes[i]) child(ft, IsRefOrSlice(ft), (int)i);
-                return;
-            }
             // An overload rendering one part of a fixed-mode value may
             // overwrite it with another variant, and nothing may refer into
             // its payload meanwhile (§3.5): the parts lie in a copy codegen
@@ -1028,13 +1028,13 @@ inline void TypeCheck::CheckRenderable(Call *c, const char *what, TypeExpr *t, N
                 std::optional<FlowState> exit;
                 for (auto &variant : FieldRuns(t)) {
                     RestoreFlow(entry);
-                    for (auto ft : *variant.ftypes) if (ft) child(ft, IsRefOrSlice(ft));
+                    fields(variant);
                     exit = exit ? JoinFlow(*exit, SaveFlow()) : SaveFlow();
                 }
                 if (exit) RestoreFlow(*exit);
                 return;
             }
-            EachField(t, [&](TypeExpr *ft) { child(ft, IsRefOrSlice(ft)); });
+            for (const auto &run : FieldRuns(t)) fields(run);
             return;
         default:
             Error(at, cat(what, " cannot render a value of type ", TypeStr(t)));
@@ -1636,7 +1636,7 @@ inline bool TypeCheck::KilledFor(VarDef *c, VarDef *base, TypeExpr *t, TypeExpr 
             auto kb = whole(k.base);
             if (kb != c || !k.path.empty()) {
                 if (kb != base) continue;
-                if (k.path != path && !(relative && path.starts_with(k.path + "."))) continue;
+                if (k.path != path && !(relative && FieldPathWithin(path, k.path))) continue;
             }
             latest = latest ? std::max(*latest, k.at) : k.at;
         }

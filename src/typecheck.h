@@ -246,12 +246,19 @@ struct TypeCheck {
         string path;
         size_t at = 0;
         bool relative = false;
-        bool SamePart(const Kill &other) const {
-            return container == other.container && base == other.base && path == other.path &&
-                   relative == other.relative;
+        bool SameStorage(const Kill &other) const {
+            return container == other.container && base == other.base && relative == other.relative;
         }
+        bool SamePart(const Kill &other) const { return SameStorage(other) && path == other.path; }
         bool operator==(const Kill &) const = default;
     };
+    static vector<Kill> IntersectKills(const vector<Kill> &a, const vector<Kill> &b) {
+        return CommonOverwrites(a, b, [](Kill &out, const Kill &left, const Kill &right, bool first) {
+            // Each pair proves the earlier cutoff. Keep the strongest proof for this field.
+            auto since = std::min(left.at, right.at);
+            out.at = first ? since : std::max(out.at, since);
+        });
+    }
     // Snapshot of assigned/narrowed for the variables the code between a
     // save and its restore can name (NamedFrames): those of the current
     // frame, of the frames it is lexically nested in, and of the frames the
@@ -1884,6 +1891,7 @@ struct TypeCheck {
     Val ContainerRead(LVal lv);
     void CheckAccessorOwner(Node *at, TypeExpr *owner, TypeExpr *t, StructLit *lit = nullptr);
     void ResolveMemberLValue(LVal &lv, Dot *d);
+    void ProjectField(Prov &storage, RefPlace &place, TypeExpr *owner, const FieldRun &fields, size_t i);
     // Where a holder value's references point: what was derived for it, else
     // for a reference or slice its own roots, and for a by-value holder what
     // they bound (a temporary's outlive nothing). A value whose own type

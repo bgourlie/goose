@@ -700,6 +700,12 @@ struct LinkLocation {
     bool operator==(const LinkLocation &) const = default;
 };
 
+// Field paths start with a dot and the empty path names the whole value.
+inline bool FieldPathWithin(string_view path, string_view enclosing) {
+    return path.starts_with(enclosing) &&
+           (path.size() == enclosing.size() || path[enclosing.size()] == '.');
+}
+
 // A storage location. A field path can name the slot itself or a field
 // containing it, e.g. the array when the slot is one of its elements.
 struct RefPlace {
@@ -722,10 +728,12 @@ struct RefPlace {
         RefPlace common;
         common.location.intail = location.intail && other.location.intail;
         if (location.param == other.location.param) common.location.param = location.param;
-        if (base == other.base && path == other.path) {
+        if (base && base == other.base) {
             common.base = base;
             common.path = path;
-            common.enclosing = enclosing || other.enclosing;
+            while (!FieldPathWithin(other.path, common.path))
+                common.path = common.path.substr(0, common.path.rfind('.'));
+            common.enclosing = enclosing || other.enclosing || path != other.path;
         }
         return common;
     }
@@ -2231,11 +2239,32 @@ struct LinkField {
     VarDef *base = nullptr;
     string path;  // Dot-separated fields of this variable or stable parameter's pointee.
     bool Within(VarDef *owner, string_view enclosing) const {
-        return base && base == owner && path.starts_with(enclosing) &&
-               (path.size() == enclosing.size() || path[enclosing.size()] == '.');
+        return base && base == owner && FieldPathWithin(path, enclosing);
     }
     auto operator<=>(const LinkField &) const = default;
 };
+
+// Each pair of relative overwrites guarantees its common storage: the
+// narrower field if one contains the other. Ordinary holder overwrites
+// describe exact paths. Several pairs can prove the same field.
+template<typename K, typename F>
+vector<K> CommonOverwrites(const vector<K> &a, const vector<K> &b, F evidence) {
+    vector<K> common;
+    for (const auto &left : a) for (const auto &right : b) {
+        if (!left.SameStorage(right)) continue;
+        auto part = &left;
+        if (left.path != right.path) {
+            if (!left.relative) continue;
+            if (FieldPathWithin(right.path, left.path)) part = &right;
+            else if (!FieldPathWithin(left.path, right.path)) continue;
+        }
+        auto it = find_if(common.begin(), common.end(), [&](const K &k) { return k.SamePart(*part); });
+        bool first = it == common.end();
+        auto &out = first ? common.emplace_back(*part) : *it;
+        evidence(out, left, right, first);
+    }
+    return common;
+}
 
 // A reference, slice or holder value stored into a container (§9.2): what
 // the shrink rules (§5.1) consult to know whether the container may point
@@ -2461,21 +2490,19 @@ struct FnRecord {
         VarDef *external = nullptr;
         VarDef *base = nullptr;
         set<int> writes; // Ordinary class stores that may survive this overwrite at the shrink.
-        bool SamePart(const CallerKill &k) const {
+        bool SameStorage(const CallerKill &k) const {
             return param == k.param && external == k.external && base == k.base &&
-                   path == k.path && relative == k.relative;
+                   relative == k.relative;
         }
+        bool SamePart(const CallerKill &k) const { return SameStorage(k) && path == k.path; }
         bool operator==(const CallerKill &) const = default;
     };
     static void IntersectKills(vector<CallerKill> &a, const vector<CallerKill> &b) {
-        for (auto it = a.begin(); it != a.end();) {
-            auto match = find_if(b.begin(), b.end(), [&](const auto &k) { return it->SamePart(k); });
-            if (match == b.end()) it = a.erase(it);
-            else {
-                it->writes.insert(match->writes.begin(), match->writes.end());
-                ++it;
-            }
-        }
+        a = CommonOverwrites(a, b, [](CallerKill &out, const CallerKill &left,
+                                      const CallerKill &right, bool) {
+            out.writes.insert(left.writes.begin(), left.writes.end());
+            out.writes.insert(right.writes.begin(), right.writes.end());
+        });
     }
     struct ShrinkOrder {
         set<int> linkstores;       // Relative class stores still live at this shrink.

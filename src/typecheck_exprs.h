@@ -664,27 +664,39 @@ inline void TypeCheck::CheckAccessorOwner(Node *at, TypeExpr *owner, TypeExpr *t
         Error(at, cat("const for accessor belongs to ", TypeStr(owner), ", not ", TypeStr(t)));
 }
 
+// Project an inline field before deciding whether to load its contents.
+// Root fields own their storage. A variant field stays within its payload.
+inline void TypeCheck::ProjectField(Prov &storage, RefPlace &place, TypeExpr *owner,
+                                    const FieldRun &fields, size_t i) {
+    if (owner->kind == TY_STRUCT && owner->struc->st->isroot) {
+        storage.TakeAlts(ProjectRoots(storage, owner, (int)i));
+        place = {};
+        place.base = ExactComponent(storage);
+    } else if (owner->kind != TY_STRUCT) {
+        place = place.Inside();
+    } else if (place.base && !place.enclosing) {
+        if (HasRelRefT((*fields.ftypes)[i]))
+            place.path = ast.Intern(cat(place.path, ".", (*fields.fields)[i].name));
+        else place = { place.location };
+    }
+}
+
 // Field / builtin-property resolution on an lvalue path, whose accessor the
 // caller has checked (CheckAccessorOwner).
 inline void TypeCheck::ResolveMemberLValue(LVal &lv, Dot *d) {
     auto t = lv.type;
     // Steps the path into the named field of a field run; a frame
     // object's resizable tail has a header of its own to address (C.2).
-    auto step = [&](const vector<Field> &fields, const vector<TypeExpr *> &ftypes,
-                    bool inframe) {
-        for (auto i = 0; i < (int)fields.size(); i++) {
-            auto &f = fields[i];
+    auto step = [&](const FieldRun &run, bool inframe) {
+        for (auto i = 0; i < (int)run.fields->size(); i++) {
+            auto &f = (*run.fields)[i];
             if (f.ispad || f.name != d->name) continue;
             d->fieldidx = i;
             if (lv.type->cq) lv.writable = false;   // A field of a const value.
             lv.letbound = f.isconst;
             lv.letname = f.name;
-            lv.type = ftypes[i];
-            if (t->kind == TY_VARIANT) lv.place = lv.place.Inside();
-            if (lv.place.base && !lv.place.enclosing) {
-                if (HasRelRefT(lv.type)) lv.place.path = ast.Intern(cat(lv.place.path, ".", f.name));
-                else lv.place = { lv.place.location };
-            }
+            lv.type = (*run.ftypes)[i];
+            ProjectField(lv, lv.place, t, run, i);
             lv.var = nullptr;
             lv.fromstorage = true;
             lv.isslot = true;
@@ -696,24 +708,14 @@ inline void TypeCheck::ResolveMemberLValue(LVal &lv, Dot *d) {
     };
     if (t->kind == TY_STRUCT) {
         auto inst = GetStructInst(t);
-        if (inst->st->isroot) {
-            auto parent = lv.AsRoots();
-            if (step(inst->st->fields, inst->ftypes, true)) {
-                lv.TakeAlts(ProjectRoots(parent, t, d->fieldidx));
-                // A root field owns its storage, including when the root
-                // is a parameter whose concrete owner is known at the call.
-                lv.place = {};
-                lv.place.base = ExactComponent(lv);
-                return;
-            }
-        } else if (step(inst->st->fields, inst->ftypes, FieldsInFrame(d))) return;
+        if (step(inst->run, inst->st->isroot || FieldsInFrame(d))) return;
         if (inst->st->broken) throw Abandoned {};
         Error(d, cat("struct ", inst->st->name, " has no field ", d->name));
     }
     if (t->kind == TY_VARIANT) {
         auto inst = GetEnumInst(t->var->adt);
         auto vi = inst->en->VariantIndex(t->var->variant);
-        if (step(t->var->variant->fields, inst->vftypes[vi], false)) return;
+        if (step(inst->runs[vi], false)) return;
         Error(d, cat("variant ", inst->en->name, ".", t->var->variant->name,
                      " has no field ", d->name));
     }
@@ -1918,12 +1920,10 @@ inline Val TypeCheck::CheckLogical(Binary *b) {
     auto rightlinks = std::move(cur.links);
     auto rightreturns = reachable;
     RestoreFlow(snap);
-    if (rightreturns) cur.links.Join(rightlinks);
-    erase_if(cur.kills, [&](const Kill &k) {
-        return none_of(rightkills.begin(), rightkills.end(), [&](const Kill &l) {
-            return k.SamePart(l);
-        });
-    });
+    if (rightreturns) {
+        cur.links.Join(rightlinks);
+        cur.kills = IntersectKills(cur.kills, rightkills);
+    }
     for (auto kv : b->rightkills) kv->narrowed = nullptr;
     for (auto v : mayassign) v->maybeassigned = true;
     Val v;

@@ -1011,13 +1011,7 @@ inline TypeCheck::FlowState TypeCheck::JoinFlow(const FlowState &a, const FlowSt
     // earlier of the two kills.
     if (!a.reachable) joined.kills = b.kills;
     else if (!b.reachable) joined.kills = a.kills;
-    else {
-        joined.kills.clear();
-        for (auto &k : a.kills)
-            for (auto &l : b.kills)
-                if (k.SamePart(l))
-                    joined.kills.push_back({ k.container, k.base, k.path, std::min(k.at, l.at), k.relative });
-    }
+    else joined.kills = IntersectKills(a.kills, b.kills);
     joined.links = a.reachable ? a.links : b.links;
     if (a.reachable && b.reachable) joined.links.Join(b.links);
     erase_if(joined.links.live, [&](const auto &entry) {
