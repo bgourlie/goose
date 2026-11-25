@@ -252,8 +252,12 @@ inline Val ArrayLit::Check(TypeCheck &tc, TypeExpr *expected) {
         TypeCheck::SlotScope ss(tc, true);
         auto dest = tc.curdst;
         dest.discarded |= cnt == 0;
-        if (!cnt) dest.construction = nullptr;
+        // FreezeFill evaluates the operand once, including every field of
+        // a relative literal, before writing the first repeated element.
+        dest.construction = nullptr;
         auto ev = tc.CheckValueAt(fillval, elem, dest);
+        if (cnt && tc.reachable && tc.curdst.construction)
+            tc.curdst.construction->started = true;
         if (!elem) {
             tc.NoUntypedEmptyArray(ev, fillval, "the array literal around it");
             elem = ev.type;

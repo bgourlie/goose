@@ -31,6 +31,14 @@ fn fixed_numbers(n: i64) -> i64[2] { [n, stop()] }
 struct Linked { n: i64, next: Linked&<u32>? }
 fn linked(n: i64) -> Linked { Linked { n: n } }
 struct DefaultLinked { n: i64 = stop(), next: DefaultLinked&<u32>? }
+struct FillItem { n: i64, other: i64, next: FillItem&<u32>? }
+
+fn stopped_fill(flag: bool) -> FillItem[>..] {
+    var out: FillItem[>..] = [FillItem { n: 41, other: 0 }];
+    let alias .= out;
+    defer { if flag { alias.append([FillItem { n: 1, other: stop() }; 2]); } }
+    return out;
+}
 
 fn stopped_push(flag: bool) -> Linked[>..] {
     var out: Linked[>..] = [linked(41)];
@@ -129,6 +137,7 @@ fn main() {
     assert(unchanged[0] == 41);
     assert(stopped_builtin(false)[0] == 41);
     assert(stopped_push(false)[0].n == 41);
+    assert(stopped_fill(false)[0].n == 41);
     assert(stopped_default(false).len == 0);
     assert(stopped_format(false)[0] == 41);
     assert(stopped_limited_format(false).len == 0);

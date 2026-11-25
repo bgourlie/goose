@@ -3012,8 +3012,9 @@ inline Val TypeCheck::CheckAssignedValue(Assign *a, TypeExpr *target, TypeExpr *
                 ~Restore() { flag = saved; }
             } restore { rebuilding, rebuilding };
             rebuilding = true;
-            if (HasRelRefT(target))
-                NoteOverwrite(a->lval, built, storeevents.size(), target, &built.place);
+            // The shrink excludes the value being replaced. Publish its
+            // overwrite only once the assignment completes (NoteKill):
+            // an exit from the RHS can still encounter the old header.
             ShrinkThrough(a, "assign", ExprStr(a->lval), built, target,
                           { SB_UNBALANCED, target });
         }
@@ -3254,9 +3255,11 @@ inline void TypeCheck::PointeeAssign(Assign *a, LVal &lv, const LVal &at) {
     dest.slot = pt->kind == TY_SLICE;
     auto killat = storeevents.size();
     auto v = CheckAssignedValue(a, pt, arr, at, dest);
-    // Through a reference variable the part written is its whole pointee; a
-    // reference loaded out of a field names no part KillPath can.
+    // A reference variable can name its whole pointee. For a reference
+    // loaded out of a field, only an exact location identifies what was
+    // replaced; the field path itself names the reference slot.
     if (Is<Ident>(a->lval)) NoteKill(a->lval, at, pt, v, killat);
+    else if (arr && HasRelRefT(pt)) NoteOverwrite(a->lval, at, killat, pt, &at.place);
 }
 
 // A slice v stored into the slot a reference to a slice names, which lies in
