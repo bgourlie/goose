@@ -242,6 +242,11 @@ struct TypeCheck {
         VarDef *base = nullptr;
         string path;
         size_t at = 0;
+        bool relative = false;
+        bool SamePart(const Kill &other) const {
+            return container == other.container && base == other.base && path == other.path &&
+                   relative == other.relative;
+        }
         bool operator==(const Kill &) const = default;
     };
     // Snapshot of assigned/narrowed for the variables the code between a
@@ -295,6 +300,8 @@ struct TypeCheck {
         // A resize's fill value: built once and copied into each slot the
         // resize adds, so no position in the array is its own (§3.9).
         bool fill = false;
+        // New elements at the end of a grow-only array.
+        bool appended = false;
         Dest() {}
         Dest(const Roots &r, bool vb = false, TypeExpr *re = nullptr)
             : roots(r), varbind(vb), reached(re), unknown(r.None()) {}
@@ -503,8 +510,8 @@ struct TypeCheck {
                              bool forwarding = false);
     void CheckCalleeRelative(Call *call, FnSpec *spec, vector<Val> &args);
     bool ResultLayoutFits(TypeExpr *from, TypeExpr *to);
-    // Root owners construct only as a declaration's immediate initializer.
-    // A destination alone is insufficient: a block/call can inherit it.
+    // A declaration's immediate initializer and its owner, for root construction
+    // and direct result bindings. A block or call can inherit the destination.
     Node *rootinit = nullptr;
     VarDef *rootowner = nullptr;
     struct RootInitScope {
@@ -2444,6 +2451,7 @@ struct TypeCheck {
     struct LitDeep {
         Roots roots;
         bool byteview = false;
+        ElementLinks elementlinks = EL_NONE;
     };
     bool InitOrderStoreSafe(Node *n, TypeExpr *dest);
     bool InitOrderSafe(Node *n, set<FnSpec *> &visiting, FnSpec *callee = nullptr);
@@ -2522,8 +2530,12 @@ struct TypeCheck {
     StrLit *ConstStrLit(Node *n);
     const string *EmbedShader(Call *c, vector<Node *> &args);
     const string *EmbedFile(Call *c, vector<Node *> &args);
-    void CheckGrowShrink(Node *at, const char *op, Node *recv, const Val &rv);
+    void CheckGrowShrink(Node *at, const char *op, Node *recv, const Val &rv,
+                         bool empties);
     void GrowOnlyAssignKnown(Assign *a, const Roots &built, bool whole);
+    bool RetainsRelativeSlot(TypeExpr *part, TypeExpr *array, TypeExpr *replaced);
+    ElementLinks LiveElementLinks(VarDef *owner, TypeExpr *target = nullptr,
+                                  TypeExpr *replaced = nullptr);
     // Whether a shrink whose receiver has these roots knows the arrays it
     // frees: none is static data or a temporary (§5.1).
     static bool ShrinkRootsKnown(const Roots &roots) {
@@ -2535,17 +2547,24 @@ struct TypeCheck {
     // `viaclass`: judged here, recorded for the callers as a class's bound
     // (ShrinkTarget::viaclass).
     void GrowOnlyShrinkAt(Node *c, const string &op, VarDef *vd, const string &what,
-                          TypeExpr *bound = nullptr, TypeExpr *arr = nullptr,
-                          bool viaclass = false);
+                          TypeExpr *bound, TypeExpr *arr,
+                          bool viaclass, ShrinkEffect effect);
     // Kills (Kill): the part of a holder a checked location path names, a
     // whole assignment's of a value holding no references, and whether those
     // in force empty every slot of a `t` at `base` in container c that can
     // hold a view into an `arr`'s elements, since which event.
     bool KillPath(Node *n, VarDef *&base, string &path);
     void NoteKill(Node *lval, const Roots &loc, TypeExpr *target, const Val &v, size_t at);
-    bool KilledFor(VarDef *c, VarDef *base, TypeExpr *t, TypeExpr *arr, size_t &since);
+    void NoteOverwrite(Node *path, const Roots &loc, size_t at, bool relative, TypeExpr *target);
+    bool KilledFor(VarDef *c, VarDef *base, TypeExpr *t, TypeExpr *arr, size_t &since,
+                   bool relative = false, TypeExpr *replaced = nullptr);
     TypeExpr *KillPartType(const Kill &k);
+    bool KillNamesType(const Kill &k, TypeExpr *target) {
+        auto part = KillPartType(k);
+        return part && TopConstEq(part, LoadType(target));
+    }
     bool CallMayWrite(FnSpec *spec, const vector<Val> &argvals, const Kill &k);
+    vector<FnRecord::ParamKill> ParamKills(FnSpec *spec);
     void NoteShrinkOrder(VarDef *root, TypeExpr *bound);
     // While a callee's shrink is judged at a call: the store events the call
     // replayed from `base` on, each with the index of the callee's class
@@ -2577,7 +2596,7 @@ struct TypeCheck {
         return o >= 0 && (size_t)o >= callorder.before;
     }
     void DropKills(VarDef *container) {
-        erase_if(cur.kills, [&](const Kill &k) { return k.container == container; });
+        erase_if(cur.kills, [&](const Kill &k) { return k.container == container && !k.relative; });
     }
 
     // Every store of a reference, slice or holder value into a container
@@ -2591,6 +2610,7 @@ struct TypeCheck {
     void NoteLitElem(LitDeep &deep, Node *at, const Val &v, TypeExpr *t);
     void HolderFromLit(Val &v, const LitDeep &deep);
     void AddStoreEvent(const StoreEvent &e);
+    void RecordElementLinks(const Roots &owners, TypeExpr *reached, ElementLinks links, Node *at);
     void NoteSlotStore(const StoreEvent &e);
     // How NeverStoredError words a grow-shrink array `gs` a value pointing at
     // `roots` may point into: as the array itself where it is the value's one
@@ -2651,9 +2671,10 @@ struct TypeCheck {
         Line at;
         string prefix;
         vector<Diagnostic::Related> chain;
+        TypeExpr *replaced;
     };
     vector<GlobalShrink> globalshrinks;
-    void NoteGlobalShrink(Node *at, const string &prefix, VarDef *vd, TypeExpr *bound);
+    void NoteGlobalShrink(Node *at, const string &prefix, VarDef *vd, TypeExpr *bound, TypeExpr *replaced);
     [[noreturn]] void ThreadIndexError(Node *at, TypeExpr *t);
     void CheckGlobalShrinks();
     // Whether what a store record leads to may point into the array `arr`
@@ -2696,8 +2717,7 @@ struct TypeCheck {
     // external to), while a specialization's parameter roots map at calls
     // (`param` gets it and the parameter's index).
     template <typename P, typename X> void NoteRootEvent(VarDef *root, P param, X external);
-    void NoteShrink(VarDef *root, TypeExpr *bound = nullptr,
-                    ShrinkBalance balance = SB_UNBALANCED);
+    void NoteShrink(VarDef *root, TypeExpr *bound = nullptr, ShrinkEffect effect = {});
     void ShrinkGrowShrink(Node *at, const string &op, VarDef *root, const string &what,
                           TypeExpr *bound = nullptr, ShrinkBalance balance = SB_UNBALANCED);
     bool ResizesToMark(Node *recv, Node *len);
@@ -2717,12 +2737,12 @@ struct TypeCheck {
                                        bool classbound = false);
     string TargetStr(const ShrinkTarget &t);
     void ShrinkThrough(Node *at, const string &verb, const string &recv, const Roots &roots,
-                       TypeExpr *arr, ShrinkBalance balance = SB_UNBALANCED);
+                       TypeExpr *arr, ShrinkEffect effect = {});
     // `argnodes`: the argument expressions, aligned with argvals, which say
     // what part of the caller's holders a callee's kills empty (Kill); null
     // for an argument that is no expression of the call's.
     void ApplyCalleeShrinks(Node *at, FnSpec *spec, vector<Val> &argvals, string_view name,
-                            const vector<Node *> &argnodes);
+                            const vector<Node *> &argnodes, bool applyexits = false);
     // A shrink's scan sees the views of the activation only, and takes a
     // parameter's class for an array of its own: whether an argument was a
     // view of the shrunk array, or the shrunk array one the activation's
@@ -2834,6 +2854,9 @@ struct TypeCheck {
         // is checked against those logged while its expression ran
         // (CheckGrowsSince).
         vector<GrowEvent> growlog;
+        // A deduplicated class store can be made on both sides of an
+        // overwrite. Only its last occurrence can prove it fully overwritten.
+        vector<size_t> lastclassstore;
         // The parts of holders emptied on every path here (Kill), part of
         // the flow state, which a branch joins and a loop's head takes.
         vector<Kill> kills;
@@ -2925,7 +2948,7 @@ struct TypeCheck {
     // later check changes.
     map<FnSpec *, vector<VarDef *>> namedoutside;
     // `fill`: a resize's fill value (Dest::fill).
-    void ElemArg(Node *&n, TypeExpr *elem, Val &rv, bool fill = false);
+    void ElemArg(Node *&n, TypeExpr *elem, Dest dest);
 
     // ------------------------------------------------------------------
     // Calling a function value F(a): the body is cloned and checked inline

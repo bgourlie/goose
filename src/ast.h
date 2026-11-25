@@ -685,6 +685,10 @@ struct Prov : Roots {
     const Roots &AsRoots() const { return *this; }
 };
 
+// A relative link built into a newly appended element can reach only existing
+// storage. A decoded run or a rebind may also link into a later element.
+enum ElementLinks { EL_NONE, EL_BACKWARD, EL_ANY };
+
 // The checked value of an expression (typecheck.h): its type, where it
 // points when it is a reference or slice, and the constant folding used for
 // literal fit and array sizes. Lives here because every node's Check
@@ -698,6 +702,9 @@ struct Val : Prov {
     double fval = 0;
     bool strlit = false;         // String literal: adaptable to u8 array types.
     bool emptyarr = false;       // [] with as yet unknown element type.
+    // The array may hold self-relative links between its elements. Moving the
+    // complete element run preserves them, but a grow-shrink array cannot (§5.2).
+    ElementLinks elementlinks = EL_NONE;
     bool isnull = false;         // The null literal: adaptable to any optional.
     // A literal parameter read inside its specialization (§7.7): a constant
     // of unknown value at its nominal type, adapting to any type of its
@@ -1817,6 +1824,7 @@ struct VarDef {
     // that class's storage holds (RootAlt::classread).
     Roots contents;
     bool contentbyteview = false; // A stored reference may view raw typed storage.
+    ElementLinks elementlinks = EL_NONE; // A store into this owner may have linked its elements.
     // A store other than a parameter's binding has been made into it, in
     // any round of a cycle's check (TypeCheck::HeldParam).
     bool storedinto = false;
@@ -1992,6 +2000,7 @@ template<typename F> void NamedArraysIn(TypeExpr *t, set<TypeExpr *> &seen, F f)
 // its depth stands, and the provenance bits.
 struct RootArg {
     int cls = 0;
+    ElementLinks elementlinks = EL_NONE;  // Contents of a by-value argument at entry.
     int ownerparam = -1;
     int ownerfield = -1;
     bool writable = true;
@@ -2083,7 +2092,8 @@ struct RootArg {
     // whose classes differ only here still passes the arrays they describe.
     int depthkey = 0;
     bool operator==(const RootArg &o) const {
-        return cls == o.cls && ownerparam == o.ownerparam && ownerfield == o.ownerfield &&
+        return cls == o.cls && elementlinks == o.elementlinks &&
+               ownerparam == o.ownerparam && ownerfield == o.ownerfield &&
                writable == o.writable && reusable == o.reusable &&
                growshrink == o.growshrink && gsvia == o.gsvia && slotread == o.slotread &&
                byteview == o.byteview && pool == o.pool && heldexact == o.heldexact &&
@@ -2094,10 +2104,19 @@ struct RootArg {
 // How a body's shrinks of one array leave it (§5.2): balanced where each
 // resizes it back to a length it had during the call, or is a balanced call,
 // so that it is never shorter than when the call began and no view taken
-// before the call can tell; unbalanced where one may leave it shorter. A grow-only array's
-// shrinks are never balanced (§5.1): a callee may store references to its
+// before the call can tell; unbalanced where one may leave it shorter.
+// A grow-only array's shrinks are never balanced (§5.1): a callee may store references to its
 // new elements into the caller's holders before popping them.
 enum ShrinkBalance { SB_BALANCED, SB_UNBALANCED };
+
+// An emptying operation can discard both ends of an internal link. Keep
+// the part it replaces: clearing a struct's tail leaves its header live.
+struct ShrinkEffect {
+    ShrinkBalance balance;
+    TypeExpr *replaced;
+    ShrinkEffect(ShrinkBalance b = SB_UNBALANCED, TypeExpr *r = nullptr)
+        : balance(b), replaced(r) {}
+};
 
 // A shrink a body records against what one of its parameters' or outside
 // roots' storage only leads to, through the references it holds: an array
@@ -2105,7 +2124,7 @@ enum ShrinkBalance { SB_BALANCED, SB_UNBALANCED };
 template<typename K> struct BoundShrink {
     K key;
     TypeExpr *type = nullptr;
-    ShrinkBalance balance = SB_UNBALANCED;
+    ShrinkEffect effect;
 };
 
 // A reference, slice or holder value stored into a container (§9.2): what
@@ -2113,6 +2132,9 @@ template<typename K> struct BoundShrink {
 // into an array.
 struct StoreEvent {
     VarDef *container = nullptr;
+    // Links within this owner's storage, from either a relative store or a
+    // verified element run. Mapping this event requires only the destination.
+    ElementLinks elementlinks = EL_NONE;
     // What was stored: a reference to something rooted at `root`, or (a
     // copy of) the contents of container `src` -- a holder value read out
     // of it, whose own events say what it points at. Never a local reference
@@ -2198,6 +2220,7 @@ struct RetRoot {
     bool writable = true;      // Writable only where every return is (§9.5).
     bool byteview = false;
     bool freshview = false;    // Prov::freshview.
+    ElementLinks elementlinks = EL_NONE; // Any return may give an array with Val::elementlinks.
     bool set = false;          // A non-null return has recorded its root.
     // The by-value holder parameter every return gives as it was passed,
     // nothing stored into it since its binding: the result holds what the
@@ -2232,6 +2255,7 @@ struct EnvRead {
     Roots contents;
     bool contentbyteview = false;
     bool slotref = false;
+    ElementLinks elementlinks = EL_NONE;
 };
 
 // An exit of a body outside a specialization's activation that its check
@@ -2265,10 +2289,10 @@ struct FnRecord {
     // Arrays the body may shrink, itself or through its callees (§5.1,
     // §5.2): global/captured roots, and indices of parameters whose pointee
     // shrinks, each with how every shrink of it leaves it.
-    map<VarDef *, ShrinkBalance> shrinkexternals;
+    map<VarDef *, ShrinkEffect> shrinkexternals;
     // Effect keys below: [0, params.size()) names the argument's class;
     // [params.size(), 2 * params.size()) names its view's contents class.
-    map<int, ShrinkBalance> shrinkparams;
+    map<int, ShrinkEffect> shrinkparams;
     // Shrinks of an array of the given type that such a root's storage only
     // leads to, through the references it holds: the call counts each as a
     // shrink of any array of that type the root, or the argument's root,
@@ -2297,14 +2321,37 @@ struct FnRecord {
     // latest occurrence (the later ones were stored after it); and the parts
     // of reference parameters' pointees every occurrence had emptied
     // (TypeCheck::Kill), each a parameter's index and the part's path.
+    struct ParamKill {
+        int param;
+        string path;
+        bool relative;
+        size_t before;  // Class-store prefix entirely overwritten on this path.
+        bool SamePart(const ParamKill &k) const {
+            return param == k.param && path == k.path && relative == k.relative;
+        }
+        bool operator==(const ParamKill &) const = default;
+    };
+    static void IntersectKills(vector<ParamKill> &a, const vector<ParamKill> &b) {
+        for (auto it = a.begin(); it != a.end();) {
+            auto match = find_if(b.begin(), b.end(), [&](const auto &k) { return it->SamePart(k); });
+            if (match == b.end()) it = a.erase(it);
+            else {
+                it->before = std::min(it->before, match->before);
+                ++it;
+            }
+        }
+    }
     struct ShrinkOrder {
         int param = -1;
         VarDef *external = nullptr;
         TypeExpr *bound = nullptr;
         size_t before = 0;
-        vector<pair<int, string>> kills;
+        vector<ParamKill> kills;
     };
     vector<ShrinkOrder> shrinkorders;
+    // Parts of reference arguments overwritten on every normal return.
+    // Stores outside the overwritten prefix remain visible to the caller.
+    vector<ParamKill> exitoverwrites;
     size_t eventstart = 0;         // storeevents.size() when the body's check began.
     size_t eventend = 0;           // And when it ended.
     // Where those events pointed as the check left them, at the body's

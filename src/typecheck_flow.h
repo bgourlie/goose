@@ -1004,8 +1004,8 @@ inline TypeCheck::FlowState TypeCheck::JoinFlow(const FlowState &a, const FlowSt
         joined.kills.clear();
         for (auto &k : a.kills)
             for (auto &l : b.kills)
-                if (k.container == l.container && k.base == l.base && k.path == l.path)
-                    joined.kills.push_back({ k.container, k.base, k.path, std::min(k.at, l.at) });
+                if (k.SamePart(l))
+                    joined.kills.push_back({ k.container, k.base, k.path, std::min(k.at, l.at), k.relative });
     }
     joined.reachable = a.reachable || b.reachable;
     return joined;
@@ -1150,6 +1150,7 @@ inline Val TypeCheck::MergeVals(const Val &a, bool areach, const Val &b, bool br
     v.isnull = a.isnull && b.isnull;   // Both null: still a null, which names no root.
     // Both []: still a [], which takes the array type it meets (§6.4).
     v.emptyarr = a.emptyarr && b.emptyarr;
+    v.elementlinks = std::max(a.elementlinks, b.elementlinks);
     // Array literals of adaptable elements, of one type, adapt as one.
     if (a.litelems && b.litelems && TypeEq(a.type, b.type) && TypeEq(v.type, a.type)) {
         v.litelems = true;
@@ -1868,6 +1869,7 @@ inline TypeCheck::Scope TypeCheck::CheckLoopPasses(Node *x, FlowState &head,
                                                    const function<void()> &pass) {
     auto entry = head;
     auto firstbase = storeevents.size();
+    map<VarDef *, ElementLinks> carriedlinks;
     auto warnbase = cur.pendingwarnings.size();
     auto settled = false;
     Scope sc;
@@ -1895,6 +1897,20 @@ inline TypeCheck::Scope TypeCheck::CheckLoopPasses(Node *x, FlowState &head,
         cur.looppasses.pop_back();
         auto next = sc.backedges ? JoinFlow(entry, sc.backedge) : entry;
         auto changed = lp.changed || !SameFlow(next, head);
+        // A link written after an overwrite can reach the next iteration
+        // even if the owner held the same kind of link before the loop.
+        if (sc.backedges) {
+            for (auto i = lp.eventbase; i < storeevents.size(); i++) {
+                auto &e = storeevents[i];
+                if (!e.elementlinks || Depth(e.container) > lp.scopeidx) continue;
+                if (e.elementlinks == EL_BACKWARD && IsClassRoot(e.container)) continue;
+                auto &links = carriedlinks[e.container];
+                if (links < e.elementlinks) {
+                    links = e.elementlinks;
+                    changed = true;
+                }
+            }
+        }
         head = next;
         if (changed) continue;
         if (settled || !(lp.sawunbound || lp.deferred)) break;
@@ -2713,6 +2729,7 @@ inline void TypeCheck::CheckBindingRoot(VarDef *d, const Val &v, Node *at) {
     auto t = v.type;
     if (!t || v.isnull) return;
     auto isrs = IsRefOrSlice(t);
+    if (v.elementlinks && !isrs) RecordElementLinks(RootsOf(d), t, v.elementlinks, at);
     if (!isrs && !HoldsPlainRef(t)) return;
     const Roots &roots = isrs ? v.AsRoots() : ContentsOf(v);
     // A global is storage, which no reference into a grow-shrink array is
@@ -2775,7 +2792,9 @@ inline Val TypeCheck::CheckAssignedValue(Assign *a, TypeExpr *target, TypeExpr *
                 ~Restore() { flag = saved; }
             } restore { rebuilding, rebuilding };
             rebuilding = true;
-            ShrinkThrough(a, "assign", ExprStr(a->lval), built, target);
+            if (HasRelRefT(target)) NoteOverwrite(a->lval, built, storeevents.size(), true, target);
+            ShrinkThrough(a, "assign", ExprStr(a->lval), built, target,
+                          { SB_UNBALANCED, target });
         }
         NoteGrow(a, built, cat("assign ", ExprStr(a->lval)), target);
     }

@@ -2740,8 +2740,11 @@ a writable reference noted later an error. The resize's balance is recorded
 by then, and a loop checked in one pass, or a nested function checked once,
 can run the write before the resize's next run, which nothing judges again.
 No other shrink in a body is balanced: `pop`, `pop_n`, `clear`, other
-resizes, whole assignment, and a grow-only array's shrinks
-(`GrowOnlyShrinkAt` records every shrink unbalanced). The body's own scans
+resizes, whole assignment, and a grow-only array's shrinks.
+`ShrinkEffect::replaced` identifies the part a grow-only shrink replaces
+in full, such as the tail array on a clear or the enclosing struct on a
+whole assignment. A partial shrink has no such part. External views into
+the removed elements are checked in all three cases. The body's own scans
 are unchanged, a balanced resize included, and so are the pairs
 `NoteLiveViews` keeps for it.
 
@@ -3657,6 +3660,28 @@ return or an inlined body's exit ever copies such a local instead
   array, is built at the receiver);
 * at a return inferring the result type (`CheckInferredResult`);
 * at `copy(x)`.
+
+A verified array can contain links between elements. A non-null
+self-relative store also records a link on the receiving storage. A store
+into a newly pushed grow-only element can refer back to existing elements,
+whereas decoding or rebinding can introduce forward links.
+`RecordElementLinks` records these stores on the owner and replays them at
+calls through the destination parameter. `LiveElementLinks` consults the
+stores since the last guaranteed overwrite of the relevant slots. A shrink
+checks the slots it retains, including a byte link into an image-safe
+element (§5.1). The existing call and branch summaries intersect the
+overwritten paths. For relative links they also keep the prefix of class
+stores wholly before the overwrite, so a later store remains visible even
+when the two stores share a summary entry.
+
+`Val::elementlinks` carries the owner's links through branches, by-value
+arguments, named results and each forwarded result slot. The by-value
+argument's link state is part of the specialization key. `FitsAt` checks
+the links when the result changes array kind. A grow-shrink array cannot
+hold a link into its elements (§5.2), and an adapter that copies a
+limited array's live prefix can discard a target (§5.3). An array initialized
+with null links and returned by name uses the ordinary named-result entry when adapting it.
+The element-run entry would copy the local on return.
 
 A rejected un-annotated declaration of storage or of a reference result
 suggests the `.=` binding it most likely meant. The same rule rejects

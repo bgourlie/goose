@@ -485,13 +485,15 @@ inline Val TypeCheck::ResolveCall(Call *c, vector<SFunction *> &cands, FnSpec *e
         BindBranchesByRef(argnodes, argvals, best.paramtypes, best.sf, -1, best.nwritten);
     }
     auto spec = GetOrCreateSpec(best, argvals, c);
-    ApplyCalleeShrinks(c, spec, argvals, name, argnodes);
-    ApplyCalleeGrows(c, spec, argvals, name);
     // Phase 2 starts at the call's entry again: a later argument may have
     // diverged during discovery, but earlier arguments still execute before
     // it.
     auto argsreach = reachable;
     RecheckArgs(c, cands, best, denv, argnodes, -1, {}, entryreach);
+    // An argument can overwrite the same storage that the callee links.
+    // Apply the body effects after both passes over the arguments.
+    ApplyCalleeShrinks(c, spec, argvals, name, argnodes, true);
+    ApplyCalleeGrows(c, spec, argvals, name);
     // A C function's parameters are what they say (§7.10): a read-only
     // reference or slice needs the parameter declared const.
     if (best.sf->isextern) {
@@ -1304,15 +1306,15 @@ inline Val TypeCheck::TryDispatch(Call *c, vector<SFunction *> &cands, FnSpec *e
     LoadSliceArgs(argvals, matches[0].paramtypes);
     RefSliceArgs(argvals, matches[0].paramtypes, c->line);
     vector<Val> armvals = argvals;
+    vector<TypeExpr *> caseargs;
     FnSpec *first = nullptr;
     for (size_t vi = 0; vi < en->variants.size(); vi++) {
         auto &mi = matches[vi];
         auto vt = ast.VariantTypeOf(enumtype, &en->variants[vi], c->line);
         armvals[found] = argvals[found];
         armvals[found].type = byref ? ast.RefTo(vt, c->line) : vt;
+        caseargs.push_back(armvals[found].type);
         auto spec = GetOrCreateSpec(mi, armvals, c);
-        ApplyCalleeShrinks(c, spec, armvals, name, argnodes);
-        ApplyCalleeGrows(c, spec, armvals, name);
         if (first) {
             if (spec->rets.size() != first->rets.size())
                 Error(c, cat("case functions of ", name, " disagree on return counts"));
@@ -1360,12 +1362,19 @@ inline Val TypeCheck::TryDispatch(Call *c, vector<SFunction *> &cands, FnSpec *e
         RecordVal(argnodes[found], byreference ? argvals[found] : DecayRef(argvals[found]));
     }, entryreach);
     // Like an ordinary call's, the cases' rebinds follow the argument checks.
+    for (size_t vi = 0; vi < c->dispatch.size(); vi++) {
+        auto spec = c->dispatch[vi];
+        armvals[found] = argvals[found];
+        armvals[found].type = caseargs[vi];
+        ApplyCalleeShrinks(c, spec, armvals, name, argnodes);
+        ApplyCalleeGrows(c, spec, armvals, name);
+    }
     for (auto spec : c->dispatch) CheckCalleeRelative(c, spec, argvals);
     CalleesReturn(c->dispatch, argsreach);
     // The cases are alternatives of one call, like a match's arms: the result
     // is only as long-lived, exact and writable as every case's result. A case
-    // checked without recording a root for a result only returns null there or
-    // never returns, and like such an arm it does not constrain the result.
+    // with neither a recorded root nor links between result elements adds
+    // no provenance to the result.
     vector<Val> results;
     vector<bool> reached;
     for (auto spec : c->dispatch) {
@@ -1373,7 +1382,7 @@ inline Val TypeCheck::TryDispatch(Call *c, vector<SFunction *> &cands, FnSpec *e
         results.resize(lastcallrets.size());
         reached.resize(lastcallrets.size());
         for (size_t r = 0; r < lastcallrets.size(); r++) {
-            auto reaches = spec->inprogress ||
+            auto reaches = spec->inprogress || lastcallrets[r].elementlinks ||
                            (r < spec->record.retroots.size() && spec->record.retroots[r].set);
             results[r] = MergeVals(results[r], reached[r], lastcallrets[r], reaches, c, true);
             reached[r] = reached[r] || reaches;
@@ -1519,6 +1528,7 @@ inline FnSpec *TypeCheck::GetOrCreateSpec(MatchInfo &mi, vector<Val> &argvals, N
     for (size_t i = 0; i < mi.paramtypes.size(); i++) {
         auto pt = mi.paramtypes[i];
         auto isrs = IsRefOrSlice(pt);
+        if (!isrs) roots[i].elementlinks = argvals[i].elementlinks;
         // A by-value parameter holding references (§9.2's holder values)
         // is keyed by the root bounding its contents, as the spec's
         // "implicitly generic over those fields' roots" says.
@@ -1746,6 +1756,12 @@ inline FnSpec *TypeCheck::GetOrCreateSpec(MatchInfo &mi, vector<Val> &argvals, N
                 onearrayok = onearrayok && has;
             }
         if (!onearrayok) continue;
+        // A recursive back edge may vary root identities, but it cannot
+        // reuse a body checked for fewer links in a by-value parameter.
+        if (spec->inprogress && !rootsok &&
+            !equal(roots.begin(), roots.end(), spec->roots.begin(), spec->roots.end(),
+                   [](const auto &a, const auto &b) { return a.elementlinks <= b.elementlinks; }))
+            continue;
         auto depthsok = rootsok;
         for (size_t i = 0; depthsok && i < roots.size(); i++)
             depthsok = spec->roots[i].depthkey == roots[i].depthkey &&
@@ -1876,7 +1892,7 @@ inline vector<VarDef *> TypeCheck::NarrowedOptionals(const MatchInfo &mi) {
 
 inline EnvRead TypeCheck::EnvReadOf(VarDef *vd) {
     return { vd, vd->assigned, vd->maybeassigned, vd->refrootknown, vd->ref, vd->contents,
-             vd->contentbyteview, vd->slotref };
+             vd->contentbyteview, vd->slotref, vd->elementlinks };
 }
 
 // A body names vd outside its activation: a nested function one of its
@@ -1916,7 +1932,8 @@ inline bool TypeCheck::EnvIs(const VarDef *vd, const EnvRead &r) {
            (vd->isvar || vd->maybeassigned == r.maybeassigned) &&
            vd->refrootknown == r.refrootknown &&
            vd->ref == r.ref && vd->contents == r.contents &&
-           vd->contentbyteview == r.contentbyteview && vd->slotref == r.slotref;
+           vd->contentbyteview == r.contentbyteview && vd->slotref == r.slotref &&
+           vd->elementlinks == r.elementlinks;
 }
 
 // Whether each variable the body read outside its activation is as it was
@@ -1954,6 +1971,8 @@ inline void TypeCheck::ReplayEnvExits(FnSpec *spec) {
         v->ref = x.ref;
         v->contents = x.contents;
         v->contentbyteview = x.contentbyteview;
+        if (x.elementlinks > v->elementlinks)
+            RecordElementLinks(RootsOf(v), v->type, x.elementlinks, spec->body);
         v->slotref = v->slotref || x.slotref;
         NoteFact(v);
     }
@@ -1979,8 +1998,20 @@ inline void TypeCheck::NoteExit(int tf, const OuterExit *added) {
         e->assigned[i] = (!e->reached || e->assigned[i]) && isassigned(e->vars[i]);
         e->maybeassigned[i] = (e->reached && e->maybeassigned[i]) || maybe(e->vars[i]);
     }
-    e->reached = true;
     auto target = frames[tf].spec;
+    if (target) {
+        // A nonlocal exit or a callback need not have this activation's
+        // current paths. Only export overwrites that every exit proves.
+        vector<FnRecord::ParamKill> out;
+        if (!added && tf == RealFrameIndex() && !frames.back().isfunval) {
+            out = ParamKills(target);
+            erase_if(out, [](const auto &k) { return !k.relative; });
+        }
+        auto &all = target->record.exitoverwrites;
+        if (!e->reached) all = std::move(out);
+        else FnRecord::IntersectKills(all, out);
+    }
+    e->reached = true;
     for (auto k = tf + 1; k < (int)frames.size(); k++) {
         auto mine = frames[k].exits;
         if (!mine) continue;
@@ -2963,14 +2994,24 @@ inline bool TypeCheck::SameRecord(const FnRecord &a, const FnRecord &b, const Fn
             }))
             return why("relative destinations");
     if (a.mayreturn != b.mayreturn) return why("normal completion");
+    if (a.exitoverwrites != b.exitoverwrites) return why("overwritten arguments");
     if (a.retroots.size() != b.retroots.size()) return why("returns");
     for (size_t i = 0; i < a.retroots.size(); i++) {
         auto &p = a.retroots[i], &q = b.retroots[i];
         if (!sameroots(p.alts, q.alts) || p.writable != q.writable || p.byteview != q.byteview ||
-            p.freshview != q.freshview || p.set != q.set || p.heldparam != q.heldparam)
+            p.freshview != q.freshview || p.elementlinks != q.elementlinks ||
+            p.set != q.set || p.heldparam != q.heldparam)
             return why("return roots");
     }
-    if (a.shrinkexternals != b.shrinkexternals || a.shrinkparams != b.shrinkparams)
+    auto sameeffect = [&](const ShrinkEffect &p, const ShrinkEffect &q) {
+        return p.balance == q.balance && sametype(p.replaced, q.replaced);
+    };
+    auto sameshrinks = [&](const auto &x, const auto &y) {
+        return x.size() == y.size() && equal(x.begin(), x.end(), y.begin(), [&](auto &p, auto &q) {
+            return p.first == q.first && sameeffect(p.second, q.second);
+        });
+    };
+    if (!sameshrinks(a.shrinkexternals, b.shrinkexternals) || !sameshrinks(a.shrinkparams, b.shrinkparams))
         return why("shrinks");
     auto samegrows = [&](const auto &x, const auto &y) {
         if (x.size() != y.size()) return false;
@@ -2987,7 +3028,7 @@ inline bool TypeCheck::SameRecord(const FnRecord &a, const FnRecord &b, const Fn
     auto samebounds = [&](const auto &x, const auto &y) {
         if (x.size() != y.size()) return false;
         for (size_t i = 0; i < x.size(); i++)
-            if (x[i].key != y[i].key || x[i].balance != y[i].balance ||
+            if (x[i].key != y[i].key || !sameeffect(x[i].effect, y[i].effect) ||
                 !sametype(x[i].type, y[i].type))
                 return false;
         return true;
@@ -3006,7 +3047,8 @@ inline bool TypeCheck::SameRecord(const FnRecord &a, const FnRecord &b, const Fn
             return why("live shrinks");
     }
     auto sameevents = [&](const StoreEvent &p, const StoreEvent &q) {
-        return p.container == q.container && p.root == q.root && p.src == q.src &&
+        return p.container == q.container && p.elementlinks == q.elementlinks &&
+               p.root == q.root && p.src == q.src &&
                p.exact == q.exact && p.byteview == q.byteview && p.bound == q.bound &&
                p.slot == q.slot && p.sliceref == q.sliceref && p.classread == q.classread &&
                sametype(p.pointee, q.pointee) && sametype(p.reached, q.reached);
@@ -3112,6 +3154,8 @@ inline void TypeCheck::CheckSpecBodyOnce(FnSpec *spec, vector<Val> *argvals, Lin
         auto vd = NewVar(p.name, pt, p.line.line ? p.line : sf->line, p.isvar,
                          i < oldparams.size() ? oldparams[i] : nullptr);
         vd->isparam = true;
+        if (auto links = spec->roots[i].elementlinks)
+            RecordElementLinks(RootsOf(vd), pt, links, sf->body);
         vd->assigned = vd->maybeassigned = true;
         for (auto li : spec->litparams) if (li == (int)i) vd->unsized = true;
         if (IsRefOrSlice(pt)) {
@@ -3512,6 +3556,8 @@ inline void TypeCheck::RecordReturn(FnSpec *tspec, vector<Val> &vals, Node *at) 
         tspec->record.retroots.resize(tspec->rets.size());
     for (size_t i = 0; i < vals.size(); i++) {
         auto rt = tspec->rets[i];
+        auto &rr = tspec->record.retroots[i];
+        rr.elementlinks = std::max(rr.elementlinks, vals[i].elementlinks);
         auto isrs = IsRefOrSlice(rt);
         auto holder = !isrs && HoldsPlainRef(rt);
         if (!isrs && !holder) continue;
@@ -3526,7 +3572,6 @@ inline void TypeCheck::RecordReturn(FnSpec *tspec, vector<Val> &vals, Node *at) 
         // activation it was read out of, which a cycle's next round would
         // take for its own (RecordStore).
         for (auto &a : roots.alts) a.from = nullptr;
-        auto &rr = tspec->record.retroots[i];
         for (auto &a : roots.alts) {
             auto root = a.root;
             // Anything whose storage the callee's frame owns dies on return;
@@ -3623,10 +3668,10 @@ inline Val TypeCheck::CallResult(Call *c, FnSpec *spec, vector<Val> &argvals) {
     for (size_t i = 0; i < spec->rets.size(); i++) {
         Val v;
         v.type = spec->rets[i];
+        RetRoot none;
+        auto &ri = rec && i < rec->retroots.size() ? rec->retroots[i] : none;
         auto holder = !IsRefOrSlice(v.type) && HoldsPlainRef(v.type);
         if (IsRefOrSlice(v.type) || holder) {
-            RetRoot none;
-            auto &ri = rec && i < rec->retroots.size() ? rec->retroots[i] : none;
             auto backedge = spec->inprogress;
             if (backedge && holder && unkeyed) {
                 // A root of this activation's own that outlives nothing it
@@ -3691,6 +3736,7 @@ inline Val TypeCheck::CallResult(Call *c, FnSpec *spec, vector<Val> &argvals) {
             v.Set(TempRoot(), false);
             v.writable = false;
         }
+        v.elementlinks = ri.elementlinks;
         lastcallrets.push_back(v);
     }
     if (spec->rets.empty()) return VoidVal();
@@ -3864,6 +3910,14 @@ inline void TypeCheck::CheckReturn(Return *r) {
         // written in a named function must conservatively be rooted at
         // globals/static.
         if (tf != (int)frames.size() - 1) {
+            // These links are recorded in the target's summary. Recheck the
+            // intervening calls if a later round rebuilds that summary.
+            if (any_of(vals.begin(), vals.end(), [](const Val &v) { return v.elementlinks; })) {
+                for (auto k = tf + 1; k < (int)frames.size(); k++) {
+                    auto s = frames[k].spec;
+                    if (!frames[k].isfunval && s && s != tspec) s->storesout = true;
+                }
+            }
             for (auto &v : vals) {
                 if (frames.back().isfunval) {
                     ReturnThroughCalls(v, tf, r);
@@ -4028,8 +4082,10 @@ inline Val TypeCheck::CheckFunValCall(Call *c, const FnValBind &fb, TypeExpr *ex
         if (IsRefOrSlice(ptypes[i])) {
             BindRefProvenance(vd, argvals[i]);
             if (ptypes[i]->cq) vd->ref.writable = false;
-        } else if (HoldsPlainRef(ptypes[i])) {
-            NoteHolderBinding(vd, argvals[i], c->args[i]);
+        } else {
+            if (argvals[i].elementlinks)
+                RecordElementLinks(RootsOf(vd), ptypes[i], argvals[i].elementlinks, c->args[i]);
+            if (HoldsPlainRef(ptypes[i])) NoteHolderBinding(vd, argvals[i], c->args[i]);
         }
         // A literal parameter handed to the block stays one inside it.
         if (argvals[i].unsized && !params[i].type && !params[i].isvar) {
@@ -4174,9 +4230,12 @@ inline void TypeCheck::CheckCalleeRelative(Call *call, FnSpec *spec, vector<Val>
             auto want = i == 0 ? callresulttype : nullptr;
             if (!want && dest.result && (size_t)dest.resultindex < dest.result->rets.size())
                 want = dest.result->rets[dest.resultindex];
-            if (i < spec->rets.size() && !ResultLayoutFits(spec->rets[i], want))
-                Error(call, "a result containing relative links to its destination cannot change "
-                            "representation; return the receiver's type");
+            if (i < spec->rets.size()) {
+                if (!ResultLayoutFits(spec->rets[i], want))
+                    Error(call, "a result containing relative links to its destination cannot change "
+                                "representation; return the receiver's type");
+                if (!dest.reached) dest.reached = spec->rets[i];
+            }
         }
         if (!RelativeDestination(source, dest, call, true, true)) {
             auto target = source.Root() ? string(source.Root()->name) : string("static data");
@@ -4186,6 +4245,8 @@ inline void TypeCheck::CheckCalleeRelative(Call *call, FnSpec *spec, vector<Val>
                             "(§3.9); call of ", spec->sf->name, " links a target rooted at ",
                             target, " to receiving storage ", receiver));
         }
+        if (s.result >= 0 && dest.reached && !dest.result && !source.None())
+            RecordElementLinks(dest.roots, dest.reached, dest.appended ? EL_BACKWARD : EL_ANY, call);
     }
 }
 
