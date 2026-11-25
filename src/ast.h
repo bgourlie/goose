@@ -2417,10 +2417,14 @@ struct FnRecord {
         int param;
         string path;
         bool relative;
-        VarDef *external = nullptr; // A directly named global or captured owner.
+        // A global or captured part keeps its storage owner and the binding
+        // that names it. Through a captured reference these can differ.
+        VarDef *external = nullptr;
+        VarDef *base = nullptr;
         set<int> writes; // Ordinary class stores that may survive this overwrite at the shrink.
         bool SamePart(const CallerKill &k) const {
-            return param == k.param && external == k.external && path == k.path && relative == k.relative;
+            return param == k.param && external == k.external && base == k.base &&
+                   path == k.path && relative == k.relative;
         }
         bool operator==(const CallerKill &) const = default;
     };

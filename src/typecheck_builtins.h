@@ -3189,10 +3189,14 @@ inline void TypeCheck::NoteShrink(VarDef *root, TypeExpr *bound, ShrinkEffect ef
 inline vector<FnRecord::CallerKill> TypeCheck::CallerKills(FnSpec *spec, bool relativeonly) {
     vector<FnRecord::CallerKill> out;
     if (cur.kills.empty()) return out;
-    for (auto &k : cur.kills)
-        if (k.relative && k.base == k.container && k.base->type &&
-            (k.base->isglobal || k.base->ownerspec != spec))
-            out.push_back({ -1, k.path, true, k.base });
+    for (auto &k : cur.kills) {
+        auto base = k.base;
+        if (!k.relative || !base->type || (!base->isglobal && base->ownerspec == spec)) continue;
+        if (base != k.container && (base->isvar || !IsPlainRef(base->type) ||
+                                    !base->ref.Exact() || RefRootOf(base) != k.container))
+            continue;
+        out.push_back({ -1, k.path, true, k.container, base });
+    }
     for (size_t p = 0; p < spec->params.size(); p++) {
         auto param = spec->params[p];
         if (!IsPlainRef(param->type)) continue;
@@ -3981,7 +3985,7 @@ inline void TypeCheck::ApplyCalleeShrinks(Node *at, FnSpec *spec, vector<Val> &a
     // value names keep the events of an earlier check of its body, which no
     // order says anything of, so a kill never empties one.
     auto mapkill = [&](const FnRecord::CallerKill &k) -> std::optional<Kill> {
-        if (k.external) return Kill { k.external, k.external, k.path, storesbase, true };
+        if (k.external) return Kill { k.external, k.base, k.path, storesbase, k.relative };
         auto p = k.param;
         if (p < 0 || (size_t)p >= argnodes.size() || (size_t)p >= argvals.size()) return {};
         auto mapped = ArgumentKill(argnodes[p], argvals[p], spec->params[p]->type->ref->sub,
