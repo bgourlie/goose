@@ -3129,8 +3129,7 @@ inline void TypeCheck::CheckAssign(Assign *a) {
         arr = nullptr;
     }
     auto killat = storeevents.size();
-    auto v = CheckAssignedValue(a, target, arr, built,
-                                Dest(lv, lv.var && IsRefOrSlice(target), lv.reached));
+    auto v = CheckAssignedValue(a, target, arr, built, AssignmentDest(a->lval, lv, target));
     NoteKill(a->lval, lv, target, v, killat);
     if (lv.var) {
         NoLetReassign(a, lv.var, "assign to", "assigned");
@@ -3175,7 +3174,7 @@ inline void TypeCheck::CheckRebind(Assign *a, LVal &lv) {
     bool wasplain;
     auto killat = storeevents.size();
     {
-        DestScope ds(*this, lv.var ? Dest(lv.var, true) : Dest(lv, false, lv.reached));
+        DestScope ds(*this, AssignmentDest(a->lval, lv, target));
         // `r .= &x` is the documented spelling of a rebind (§3.8), so an
         // explicit & is not redundant here as it is at a binding destination.
         SlotScope ss(*this, true);
@@ -3235,7 +3234,7 @@ inline void TypeCheck::PointeeAssign(Assign *a, LVal &lv, const LVal &at) {
     Roots built;
     if (arr) built = at;
     if (arr && arr->arr->akind == A_GROW) GrowOnlyAssignKnown(a, built, arr == pt);
-    Dest dest(at, false, at.reached);
+    auto dest = AssignmentDest(a->lval, at, pt);
     dest.slot = pt->kind == TY_SLICE;
     auto killat = storeevents.size();
     auto v = CheckAssignedValue(a, pt, arr, built, dest);

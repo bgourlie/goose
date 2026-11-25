@@ -1061,7 +1061,8 @@ inline void TypeCheck::MustFit(Val &v, Node *n, TypeExpr *dt) {
     if (FitsAt(v, dt)) {
         if (v.elementlinks && !IsRefOrSlice(dt) && !curdst.roots.None())
             RecordElementLinks(curdst.roots, curdst.reached ? curdst.reached : dt, v.elementlinks,
-                               n, { curdst.place.intail || IsArrayKind(dt, A_GROW), curdst.place.param });
+                               n, { curdst.place.intail || IsArrayKind(dt, A_GROW), curdst.place.param },
+                               curdst.field);
         if (IsIntT(dt) && !TypeEq(from, dt)) {
             RelyOnNamed(v, n);
             if (v.flexint && dt->intstorage != IS_VARINT) RetypeFlexInt(n, dt);
@@ -1429,7 +1430,7 @@ inline bool TypeCheck::FitsAt(Val &v, TypeExpr *dt) {
                 if (recordingrelative && !dt->ref->pool && !curdst.result)
                     RecordLinkStore(curdst.roots, curdst.reached ? curdst.reached : dt,
                                     { pointee, curdst.appended ? EL_BACKWARD : EL_ANY },
-                                    fitnode, curdst.place);
+                                    fitnode, curdst.place, curdst.field);
                 v.type = dt;
                 return true;
             }
@@ -3186,6 +3187,9 @@ inline TypeCheck::LitDeep TypeCheck::CheckInits(StructLit *sl, vector<Field> &fi
         auto component = selft->kind == TY_STRUCT && selft->struc->st->isroot
                              ? RootComponent(rootowner, selft, sl->fieldindices[k]) : nullptr;
         DestScope ds(*this, component ? Dest(component) : curdst);
+        curdst.fieldsteps &= selft->kind == TY_STRUCT;
+        if (!component && curdst.fieldsteps && (curdst.field.base || curdst.result) && HasRelRefT(ft))
+            Append(curdst.field.path, ".", fields[sl->fieldindices[k]].name);
         curdst.place.intail |= IsArrayKind(ft, A_GROW);
         if (Is<SelfRef>(fi.val)) CheckSelfInit(fi.val, ft, selft);
         else {

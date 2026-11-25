@@ -2213,6 +2213,16 @@ template<typename K> struct BoundShrink {
     ShrinkEffect effect;
 };
 
+struct LinkField {
+    VarDef *base = nullptr;
+    string path;  // Dot-separated fields of this variable or stable parameter's pointee.
+    bool Within(VarDef *owner, string_view enclosing) const {
+        return base && base == owner && path.starts_with(enclosing) &&
+               (path.size() == enclosing.size() || path[enclosing.size()] == '.');
+    }
+    auto operator<=>(const LinkField &) const = default;
+};
+
 // A reference, slice or holder value stored into a container (§9.2): what
 // the shrink rules (§5.1) consult to know whether the container may point
 // into an array.
@@ -2221,6 +2231,7 @@ struct StoreEvent {
     // Links within this owner's storage, from either a relative store or a
     // verified element run. Mapping this event requires only the destination.
     ElementLink elementlink;
+    LinkField linkfield;  // The part containing the written slot, when known.
     VarDef *linkparam = nullptr; // Direct destination parameter, even when parameters share a class.
     int linkclass = -1;          // Its index in the current body's class-store summary.
     // What was stored: a reference to something rooted at `root`, or (a
@@ -2366,9 +2377,14 @@ struct FnRecord {
     // name parameter classes or lexical storage, mapped as return roots are.
     struct RelativeStore {
         Roots source, destination;
+        string field;  // Enclosing struct field path in the result, if any.
         bool intail = false;
         TypeExpr *pointee = nullptr;
         int result = -1;
+        bool Same(const RelativeStore &other, Roots::Compare how = Roots::Compare::All) const {
+            return result == other.result && intail == other.intail && pointee == other.pointee &&
+                   field == other.field && source.Same(other.source, how) && destination.Same(other.destination, how);
+        }
     };
     vector<RelativeStore> relativestores;
     // Storage a write through a parameter or capture may change (§6.6).

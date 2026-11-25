@@ -279,12 +279,13 @@ struct TypeCheck {
         struct Part {
             VarDef *owner;
             ElementLink link;
+            LinkField field;
             int summary;
             auto operator<=>(const Part &) const = default;
         };
         map<Part, size_t> live;
         void Add(const StoreEvent &e, size_t index) {
-            live[{e.container, e.elementlink, e.linkclass}] = index;
+            live[{e.container, e.elementlink, e.linkfield, e.linkclass}] = index;
         }
         void Join(const LinkFlow &other) {
             for (auto &[part, at] : other.live) {
@@ -318,6 +319,8 @@ struct TypeCheck {
     // where the storage the value lands in may be (an lvalue's roots).
     struct Dest {
         LinkLocation place;
+        LinkField field;
+        bool fieldsteps = true;  // An element or variant can only name its enclosing field.
         Roots roots;
         FnSpec *result = nullptr;
         int resultindex = 0;
@@ -344,7 +347,10 @@ struct TypeCheck {
         Dest(const LVal &lv, bool vb, TypeExpr *re)
             : Dest(static_cast<const Roots &>(lv), vb, re) { place = lv.place; }
         // A variable's own storage.
-        Dest(VarDef *vd, bool vb = false) : varbind(vb) { roots.Set(vd, true); }
+        Dest(VarDef *vd, bool vb = false) : varbind(vb) {
+            roots.Set(vd, true);
+            if (!vb) field.base = vd;
+        }
     };
     // Relative writes that survive a block, and parts it overwrites on every path.
     struct LinkEffects {
@@ -2642,7 +2648,10 @@ struct TypeCheck {
     bool KillPath(Node *n, VarDef *&base, string &path);
     std::optional<Kill> OverwrittenPart(Node *n, const Roots &loc, TypeExpr *target, bool relative,
                                         size_t at, const RefPlace *place = nullptr);
+    Dest AssignmentDest(Node *path, const LVal &lv, TypeExpr *target);
     std::optional<Kill> ArgumentKill(Node *arg, const Val &v, TypeExpr *pointee, bool relative, size_t at);
+    std::optional<Kill> MapParamPart(FnSpec *spec, const vector<Node *> &args, const vector<Val> &vals,
+                                     size_t param, const string &path, bool relative, size_t at);
     void NoteKill(Node *lval, const Roots &loc, TypeExpr *target, const Val &v, size_t at);
     void NoteOverwrite(Node *path, const Roots &loc, size_t at, bool relative, TypeExpr *target);
     bool KilledFor(VarDef *c, VarDef *base, TypeExpr *t, TypeExpr *arr, size_t &since,
@@ -2703,9 +2712,9 @@ struct TypeCheck {
     void NoteRefPath(Node *n, Val &v);
     void NoteRefPlace(VarDef *vd, Node *arg, const Val &v);
     void RecordElementLinks(const Roots &owners, TypeExpr *reached, const ValueLinks &links, Node *at,
-                            LinkLocation place = {});
+                            LinkLocation place = {}, const LinkField &field = {});
     void RecordLinkStore(const Roots &owners, TypeExpr *reached, ElementLink link, Node *at,
-                         LinkLocation place = {});
+                         LinkLocation place = {}, const LinkField &field = {});
     void NoteSlotStore(const StoreEvent &e);
     // How NeverStoredError words a grow-shrink array `gs` a value pointing at
     // `roots` may point into: as the array itself where it is the value's one
@@ -2735,7 +2744,8 @@ struct TypeCheck {
                                      set<VarDef *> &seen);
     // `origins`: for each store event the call adds, the index of the class
     // event it replays, -1 for any other (CallOrder).
-    void ApplyCalleeStores(FnSpec *spec, vector<Val> &argvals, Node *at, vector<int> *origins = nullptr);
+    void ApplyCalleeStores(FnSpec *spec, const vector<Node *> &args, vector<Val> &argvals, Node *at,
+                           vector<int> *origins = nullptr);
     void NoteHolderBinding(VarDef *d, const Val &v, Node *at);
 
     // Whether a global may hold a reference into a global array is known
@@ -2767,6 +2777,7 @@ struct TypeCheck {
         vector<Diagnostic::Related> chain;
         TypeExpr *replaced;
         bool incoming; // Links from before this activation may still survive.
+        set<string> clearedfields;  // Global fields overwritten on every path to this shrink.
     };
     vector<GlobalShrink> globalshrinks;
     void NoteGlobalShrink(Node *at, const string &prefix, VarDef *vd, TypeExpr *bound, TypeExpr *replaced);

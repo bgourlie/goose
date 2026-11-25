@@ -3036,8 +3036,7 @@ inline bool TypeCheck::SameRecord(const FnRecord &a, const FnRecord &b, const Fn
     if (a.relativestores.size() != b.relativestores.size()) return why("relative destinations");
     for (auto &p : a.relativestores)
         if (none_of(b.relativestores.begin(), b.relativestores.end(), [&](const auto &q) {
-                return p.intail == q.intail && p.pointee == q.pointee && p.result == q.result &&
-                       sameroots(p.source, q.source) && sameroots(p.destination, q.destination);
+                return p.Same(q, Roots::Compare::Cycle);
             }))
             return why("relative destinations");
     if (a.mayreturn != b.mayreturn) return why("normal completion");
@@ -3096,6 +3095,7 @@ inline bool TypeCheck::SameRecord(const FnRecord &a, const FnRecord &b, const Fn
     }
     auto sameevents = [&](const StoreEvent &p, const StoreEvent &q) {
         return p.container == q.container && p.elementlink == q.elementlink && p.linkparam == q.linkparam &&
+               p.linkfield == q.linkfield &&
                p.root == q.root && p.src == q.src &&
                p.exact == q.exact && p.byteview == q.byteview && p.bound == q.bound &&
                p.slot == q.slot && p.sliceref == q.sliceref && p.classread == q.classread &&
@@ -4256,14 +4256,13 @@ inline bool TypeCheck::RelativeDestination(const Roots &source, Dest dest, TypeE
     rs.intail = dest.place.intail;
     rs.pointee = pointee;
     rs.source.Set(have, true);
-    if (dest.result) rs.result = dest.resultindex;
-    else rs.destination.Set(want, true);
+    if (dest.result) {
+        rs.result = dest.resultindex;
+        rs.field = dest.field.path;
+    } else rs.destination.Set(want, true);
     auto &stores = spec->record.relativestores;
-    if (none_of(stores.begin(), stores.end(), [&](const auto &s) {
-            return s.intail == rs.intail && s.pointee == rs.pointee && s.result == rs.result &&
-                   s.source == rs.source && s.destination == rs.destination;
-        }))
-        stores.push_back(rs);
+    if (none_of(stores.begin(), stores.end(), [&](const auto &s) { return s.Same(rs); }))
+        stores.push_back(std::move(rs));
     return true;
 }
 
@@ -4302,6 +4301,7 @@ inline void TypeCheck::CheckCalleeRelative(Call *call, FnSpec *spec, vector<Val>
                                 "representation; return the receiver's type");
                 if (!dest.reached) dest.reached = spec->rets[i];
             }
+            if (dest.fieldsteps) dest.field.path += s.field;
         }
         dest.place.intail |= s.intail;
         if (!RelativeDestination(source, dest, s.pointee, call, true, true)) {
@@ -4314,7 +4314,7 @@ inline void TypeCheck::CheckCalleeRelative(Call *call, FnSpec *spec, vector<Val>
         }
         if (s.result >= 0 && dest.reached && !dest.result && !source.None())
             RecordLinkStore(dest.roots, dest.reached,
-                            { s.pointee, dest.appended ? EL_BACKWARD : EL_ANY }, call, dest.place);
+                            { s.pointee, dest.appended ? EL_BACKWARD : EL_ANY }, call, dest.place, dest.field);
     }
 }
 
