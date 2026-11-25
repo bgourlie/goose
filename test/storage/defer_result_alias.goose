@@ -34,6 +34,35 @@ fn stopped_store(flag: bool) -> i64[] {
     return out;
 }
 
+fn stopped_builtin(flag: bool) -> i64[>..] {
+    var out: i64[>..] = [41];
+    let alias .= out;
+    defer { if flag { alias.pop_n(stop()); } }
+    defer { if flag { alias.push(stop()); } }
+    defer { if flag { alias.append([1, stop()]); } }
+    defer { if flag { alias.resize(2, stop()); } }
+    return out;
+}
+
+fn stopped_format(flag: bool) -> u8[>..] {
+    var out: u8[>..] = [41];
+    let alias .= out;
+    defer { if flag { alias.format(stop()); } }
+    defer { if flag { alias.format(Stop {}); } }
+    return out;
+}
+
+struct Stop {}
+struct Message { field: Stop }
+fn format(out: u8[>..]&, value: Stop) { abort("stop"); }
+
+fn stopped_limited_format(flag: bool) -> u8[..] {
+    var out: u8[..] = [..32];
+    let alias .= out;
+    defer { if flag { alias.format(Message { field: Stop {} }); } }
+    return out;
+}
+
 var slot: i64 = 7;
 inline fn read_before_store() -> i64 {
     defer { assert(slot == 7); }
@@ -48,6 +77,9 @@ fn main() {
     assert(numbers[0] == 42);
     let unchanged = stopped_store(false);
     assert(unchanged[0] == 41);
+    assert(stopped_builtin(false)[0] == 41);
+    assert(stopped_format(false)[0] == 41);
+    assert(stopped_limited_format(false).len == 0);
     slot = read_before_store();
     assert(slot == 42);
     print("ok");

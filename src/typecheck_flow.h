@@ -26,7 +26,7 @@ inline void TypeCheck::PopScope() {
     // A `var x = []` that nothing ever pushed into has no type to give
     // codegen; the scope ending is the last chance to say so.
     for (auto i = s.varbase; i < (int)vars.size(); i++) {
-        cur.links.ForgetLocal(vars[i]);
+        ForgetLocal(vars[i]);
         if (IsPendingArray(vars[i]->type))
             Error(vars[i]->line, cat("the element type of ", vars[i]->name,
                                      " was never determined: nothing was pushed or "
@@ -571,7 +571,7 @@ inline Prov TypeCheck::RefProvOf(VarDef *vd) {
 
 inline VarDef *TypeCheck::ResetLocal(VarDef *previous) {
     if (!previous) return ast.NewVarDef();
-    cur.links.ForgetOwner(previous);
+    ForgetOwner(previous);
     // Cached nested specializations capture this identity. Recompute its
     // checking state, but retain the capture discovered on an earlier pass,
     // and the marks no pass may lose (a nested function checked once set
@@ -964,10 +964,11 @@ inline TypeCheck::FlowState TypeCheck::SaveFlow() {
 
 inline void TypeCheck::RestoreFlow(const FlowState &f) {
     cur.links = f.links;
+    cur.kills = f.kills;
     for (auto &e : f.locals) {
         if (!InScope(e.var, e.index)) {
             // A snapshot taken at a break can outlive its local owners.
-            cur.links.ForgetLocal(e.var);
+            ForgetLocal(e.var);
             continue;
         }
         e.var->assigned = e.state.assigned;
@@ -978,7 +979,6 @@ inline void TypeCheck::RestoreFlow(const FlowState &f) {
     for (auto v : narrowedglobals) v->narrowed = nullptr;
     for (auto [v, narrowed] : f.globals) v->narrowed = narrowed;
     reachable = f.reachable;
-    cur.kills = f.kills;
 }
 
 inline TypeCheck::FlowState TypeCheck::JoinFlow(const FlowState &a, const FlowState &b) {
@@ -1023,6 +1023,7 @@ inline TypeCheck::FlowState TypeCheck::JoinFlow(const FlowState &a, const FlowSt
     erase_if(joined.links.live, [&](const auto &entry) {
         return Depth(entry.first.owner) > CurDepth();
     });
+    erase_if(joined.kills, [&](const Kill &k) { return Depth(k.container) > CurDepth(); });
     joined.reachable = a.reachable || b.reachable;
     return joined;
 }
@@ -2521,8 +2522,8 @@ inline void TypeCheck::NoteDeferMention(VarDef *v) {
 // The destination of an actual write. A read or the creation of a writable
 // reference alone does not change the named result. Writes in a named callee
 // are recorded on its external roots and mapped when a defer calls it.
-inline void TypeCheck::NoteStorageWrite(const Roots &storage, TypeExpr *type) {
-    if (!hasdefers || !reachable) return;
+inline void TypeCheck::NoteStorageWrite(const Roots &storage, TypeExpr *type, bool canwrite) {
+    if (!hasdefers || !canwrite) return;
     auto &frame = CurRealFrame();
     auto spec = frame.spec;
     if (!spec) return;
@@ -3148,6 +3149,7 @@ inline void TypeCheck::CheckAssign(Assign *a) {
         if (target->kind == TY_SLICE) {
             if (!lv.var->refrootknown || lv.var->ref.Unknown()) BindRefProvenance(lv.var, v);
             else CheckRefRebindRoot(a, lv.var, v);
+            NoteRefPlace(lv.var, v);
         }
         lv.var->assigned = lv.var->maybeassigned = true;
         KillNarrow(lv.var);

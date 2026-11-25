@@ -3670,9 +3670,11 @@ into a newly pushed grow-only element can refer back to existing elements,
 whereas decoding or rebinding can introduce forward links. `LinkFlow`
 records the writes that may still be live on each path, distinguishing
 slots known to lie in the resizable element run. A clear discards that
-run. Header links, including links into a byte view, may survive it.
-Scope exit runs defers and then removes the departing locals' entries,
-including their independently owned components. A write through a local
+run. A surviving header link can reach the removed run if an element
+contains its concrete pointee type, including a matched enum payload,
+or if the link points into a byte view of the run. Scope exit runs defers
+and then drops both writes and definite overwrites owned by the departing
+locals and their independently owned components. A write through a local
 alias stays live as long as the storage it changed.
 
 Branches and dispatch cases join the writes from each returning path.
@@ -4183,8 +4185,11 @@ before the `defer` and be reused there, so what such a callee names is read
 from its record of the variables outside its activation
 (`FnSpec::envreads`), which every call site fills, reused or not.
 The check also compares each named result with the storage written by
-the deferred body. Assignments and mutating builtins supply the receiving
-storage. A callee records writes to captures and parameter roots so each
+the deferred body. Assignments and mutating builtins record their receiving
+storage when the write can begin. A scalar push writes after its operand
+returns. In-place construction can write during initialization, and
+`format` can write each argument before evaluating the next. A callee
+records writes to captures and parameter roots so each
 call can map them to the storage supplied there. A write through a
 reference loaded from the result is checked against the pointee's storage.
 If a reference or holder used by the body gains another possible target

@@ -18,6 +18,12 @@ fn link(list: List&, first: bool) {
     target.next .= list.head;
 }
 
+fn link_through_slice(list: List&, first: bool) {
+    let view: Node[:];
+    if first { view = list.nodes[..]; } else { view = list.nodes[1..]; }
+    view[0].next .= list.head;
+}
+
 fn clear_after_nested_binding(nodes: Node[>..]&, first: bool, early: bool) {
     let alias: Node[>..]&;
     fn bind() {
@@ -52,6 +58,8 @@ fn main() {
     var list = List { head: Node {}, nodes: [Node {}, Node {}] };
     link(list, false);
     assert(list.nodes[1].next .== list.head);
+    link_through_slice(list, true);
+    assert(list.nodes[0].next .== list.head);
     list.nodes.clear();
     print("ok");
 }

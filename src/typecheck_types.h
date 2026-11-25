@@ -1226,9 +1226,7 @@ inline bool TypeCheck::CanContainWalk(TypeExpr *t, TypeExpr *of) {
 // of t by value may be an `of` (MaySameType), so a `const` pointee or a
 // loaded field type never makes two such types miss.
 inline bool TypeCheck::MayHoldValueOf(TypeExpr *t, TypeExpr *of) {
-    if (MaySameType(t, of)) return true;
-    if (t->kind == TY_ARRAY) return MayHoldValueOf(t->arr->sub, of);
-    return AnyField(t, [&](TypeExpr *ft) { return MayHoldValueOf(ft, of); });
+    return ContainsValue(t, [&](TypeExpr *part) { return MaySameType(part, of); });
 }
 
 // Whether a and b may be one type up to qualifiers and storage forms: of

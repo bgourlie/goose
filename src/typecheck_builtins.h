@@ -364,7 +364,6 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
         if ((d.flags & BF_WRITE) && !rv.writable)
             Error(c, cat("cannot .", d.name, " through a non-writable value "
                          "(let, const, or a read-only instantiation, §9.5)"));
-        if (d.flags & BF_WRITE) NoteStorageWrite(rv, rt->kind == TY_SLICE ? elem : rt);
         // A reference that may point at such a pool, but is not a pool
         // reference, says so.
         auto notpoolref = [&](int ru) -> string {
@@ -393,6 +392,7 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
             Error(c, cat(".move_from takes a slice of ", TypeStr(elem), ", got ", TypeStr(sv.type)));
         if (HasRelRefT(elem))
             Error(c, ".move_from cannot copy elements containing self-relative references");
+        NoteStorageWrite(rv, elem);
         AppendedCopies(args[1], sv, elem, rv);
         return VoidVal();
     }
@@ -540,6 +540,7 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
                 Error(args[2], cat(".", d.name, " takes its abort message as a string literal"));
         }
     }
+    bool writesduringargs = false;
     // A slice pool's operations (§5.4). A slice handed back must be one of
     // the pool's own, by the same exact root index_of needs, so that the
     // position it starts at is a whole index inside the length; the
@@ -575,6 +576,8 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
                              "and ", TypeStr(elem), " has none: ", why, " (§5.4)"));
             if (!c->defaultinit) c->defaultinit = DefaultCall(elem, c->line);
             auto logbase = cur.growlog.size();
+            // The pool claims its slots before constructing their defaults.
+            writesduringargs = reachable;
             ElemArg(c->defaultinit, elem, elementdest());
             CheckGrowsSince(logbase, rv, "the default elements allocated in a slice pool",
                             recvarr);
@@ -596,8 +599,10 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
                 // An element built in place is under construction while
                 // its expression runs (§1.3(4)).
                 auto logbase = cur.growlog.size();
+                auto inplace = BuiltInPlace(elem);
+                if (inplace) writesduringargs = reachable;
                 ElemArg(an, elem, elementdest());
-                if (BuiltInPlace(elem))
+                if (inplace)
                     CheckGrowsSince(logbase, rv,
                                     cat("the element ",
                                         d.kind == B_PUSH ? "pushed into " : "allocated in ",
@@ -607,6 +612,7 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
             }
             case 'a': {  // An array/slice of the receiver's element type.
                 auto logbase = cur.growlog.size();
+                auto entered = reachable;
                 // An array literal is the run appended: its elements are the
                 // receiver's, constructed into its storage (§4.2).
                 auto al = Is<ArrayLit>(an);
@@ -630,16 +636,25 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
                 // either form (at the top, or in a limited array's free
                 // slots): under construction while the call or the elements
                 // run (§1.3(4)).
-                auto inplace = al ? ClassOf(elem) != SC_FIXED || HasRelRefT(elem, true)
-                                  : Is<Call>(an) && ak != A_LIMITED && ClassOf(t2) != SC_FIXED;
-                if (inplace)
+                auto src = an;
+                if (auto cp = Is<Call>(src); cp && cp->builtin == B_COPY) src = cp->FirstArg();
+                auto inplace = Is<ArrayLit>(src) ? ClassOf(elem) != SC_FIXED || HasRelRefT(elem, true)
+                              : (Is<Call>(src) || IsBranchConstruct(src)) && ak != A_LIMITED &&
+                                src->exprtype->kind == TY_ARRAY && ClassOf(src->exprtype) != SC_FIXED;
+                if (inplace) {
                     CheckGrowsSince(logbase, rv, cat("the run appended to ", ExprStr(args[0])),
                                     recvarr);
+                    // Earlier elements can already occupy the receiver even
+                    // when a later initializer never returns.
+                    writesduringargs = entered;
+                }
                 break;
             }
             default: assert(false);
         }
     }
+    // Ordinary builtin stores follow evaluation of all their operands.
+    if (d.flags & BF_WRITE) NoteStorageWrite(rv, recvarr, reachable || writesduringargs);
     // A grow-only array shrinks only where nothing can still be rooted in
     // it (§5.1); pop, pop_n and resize also need an element the shrink can
     // find, which a sequential array has not got.
@@ -891,10 +906,16 @@ inline void TypeCheck::CheckPrintable(Call *c, const char *what, vector<Node *> 
     Val builder;
     builder.Set(buffer, true);
     builder.writable = true;
-    if (out && ClassOf(DecayedType(*out)) == SC_RESIZABLE) builder = *out;
-    auto context = ast.New<Call>(c->line, c->callee);
     RenderSeen seen;
+    auto receiver = out ? DecayedType(*out) : nullptr;
+    if (receiver && ClassOf(receiver) == SC_RESIZABLE) {
+        builder = *out;
+        seen.direct = receiver;
+    }
+    auto context = ast.New<Call>(c->line, c->callee);
     CheckRenderable(context, what, av.type, a, seen, av, builder);
+    // A limited receiver copies this argument's completed text from the temporary.
+    if (receiver && !seen.direct) NoteStorageWrite(*out, receiver);
     // A type that reaches itself through references is rendered below its
     // first level by a function of its own, which runs no format overload
     // (RenderFn): an overload for a part of it needs one for the type.
@@ -959,6 +980,10 @@ inline void TypeCheck::CheckRenderable(Call *c, const char *what, TypeExpr *t, N
         }
         return;
     }
+    // Direct rendering writes a scalar or an aggregate prefix here. A
+    // non-null reference forwards to its pointee, and a hook records its own writes.
+    if (seen.direct && seen.executes && (t->kind != TY_REF || t->ref->optional))
+        NoteStorageWrite(out, seen.direct);
     // The argument itself, unless an overload takes it whole, is read where
     // it lies, around the overloads its parts run, so that storage stays in
     // use meanwhile (HeldOperands, the argument being rendered).
@@ -1316,7 +1341,13 @@ inline void TypeCheck::GrowOnlyAssignKnown(Assign *a, const Roots &built, bool w
 // A relative reference may reach a removed element, one of its fields,
 // or a byte of the element run exposed by bytes_of.
 inline bool TypeCheck::LinkMayReachElements(TypeExpr *array, TypeExpr *pointee) {
-    return !array || MayHoldValueOf(array->arr->sub, pointee) || (IsU8(pointee) && Viewable(array));
+    if (!array || (IsU8(pointee) && Viewable(array))) return true;
+    return ContainsValue(array->arr->sub, [&](TypeExpr *part) {
+        // A match can expose an enum's payload as an addressable variant.
+        if (part->kind == TY_ENUM && pointee->kind == TY_VARIANT)
+            return SameAdt(part, AdtOf(pointee));
+        return LoadedTypeEq(part, pointee);
+    });
 }
 
 // Only a slot that survives the shrink can keep a link into the removed

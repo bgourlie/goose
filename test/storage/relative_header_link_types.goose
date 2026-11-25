@@ -21,6 +21,16 @@ fn mixed_directions() {
     assert(list.items.len == 1 && list.items[0].saved .== list.value);
 }
 
+struct Box<T> { item: T }
+struct Boxes { value: Box<i64>, saved: Box<i64>&<u32>?, tail: Box<bool>[>..] }
+
+fn generic_header() {
+    var boxes = Boxes { value: Box { item: 42 }, tail: [Box { item: true }] };
+    boxes.saved .= boxes.value;
+    boxes.tail.clear();
+    assert(boxes.tail.len == 0 && boxes.saved .== boxes.value);
+}
+
 fn main() {
     var list = List { value: 42, nodes: [Node { flag: true }] };
     link_header(list);
@@ -31,5 +41,6 @@ fn main() {
     clear_global();
     assert(global_list.saved .== global_list.value && global_list.nodes.len == 0);
     mixed_directions();
+    generic_header();
     print("ok");
 }

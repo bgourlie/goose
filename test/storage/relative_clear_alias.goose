@@ -34,6 +34,17 @@ fn main() {
     other.push(Node {});
     other.pop_n(1);
     assert(other.len == 0);
+    nodes.push(Node {});
+    nodes.push(Node {});
+    nodes[0].next .= nodes[1];
+    loop {
+        let alias .= nodes;
+        alias.clear();
+        break;
+    }
+    nodes.push(Node {});
+    nodes.pop_n(1);
+    assert(nodes.len == 0);
     for direct in [false, true] {
         nodes.push(Node {});
         nodes.push(Node {});

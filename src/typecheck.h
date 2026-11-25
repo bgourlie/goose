@@ -296,15 +296,6 @@ struct TypeCheck {
         void Add(const StoreEvent &e, size_t index) {
             live[{e.container, e.elementlink, e.linkfield, e.linkclass}] = index;
         }
-        void ForgetOwner(VarDef *v) {
-            auto [first, last] = live.equal_range(v);
-            live.erase(first, last);
-        }
-        void ForgetLocal(VarDef *v) {
-            if (live.empty()) return;
-            ForgetOwner(v);
-            for (auto c : v->components) if (c) ForgetLocal(c);
-        }
         void Join(const LinkFlow &other) {
             for (auto &link : other.resultlinks) link.AddTo(resultlinks);
             for (auto &[part, at] : other.live) {
@@ -1859,6 +1850,11 @@ struct TypeCheck {
                                               F walk);
     bool CanContain(TypeExpr *t, TypeExpr *of);
     bool CanContainWalk(TypeExpr *t, TypeExpr *of);
+    template<typename Matches> bool ContainsValue(TypeExpr *t, const Matches &matches) {
+        if (matches(t)) return true;
+        if (t->kind == TY_ARRAY) return ContainsValue(t->arr->sub, matches);
+        return AnyField(t, [&](TypeExpr *ft) { return ContainsValue(ft, matches); });
+    }
     bool MayHoldValueOf(TypeExpr *t, TypeExpr *of);
     bool MaySameType(TypeExpr *a, TypeExpr *b);
     void ReachedThroughRefs(TypeExpr *t, vector<TypeExpr *> &out);
@@ -2592,7 +2588,10 @@ struct TypeCheck {
     unordered_map<Defer *, set<const VarDef *>> deferwrites;
     vector<EnvRead> DeferBindings(Defer *d);
     static void CalledSpecs(Node *n, vector<FnSpec *> &to);
-    void NoteStorageWrite(const Roots &storage, TypeExpr *type);
+    void NoteStorageWrite(const Roots &storage, TypeExpr *type, bool canwrite);
+    void NoteStorageWrite(const Roots &storage, TypeExpr *type) {
+        NoteStorageWrite(storage, type, reachable);
+    }
     void ApplyCalleeWrites(FnSpec *spec, const vector<Val> &args);
     void CheckDefer(Defer *d);
     DeferredLinks CheckDeferredBody(Defer *d);
@@ -2657,6 +2656,7 @@ struct TypeCheck {
     struct RenderSeen {
         vector<TypeExpr *> path, recurring;
         bool executes = true;  // A fixed empty array still needs its element's rendering code.
+        TypeExpr *direct = nullptr;  // Receiver being rendered into, when no temporary intervenes.
     };
     TypeExpr *OverloadedPart(Call *c, TypeExpr *t, vector<TypeExpr *> &seen);
     void CheckRenderable(Call *c, const char *what, TypeExpr *t, Node *at, RenderSeen &seen,
@@ -2745,6 +2745,17 @@ struct TypeCheck {
     }
     void DropKills(VarDef *container) {
         erase_if(cur.kills, [&](const Kill &k) { return k.container == container && !k.relative; });
+    }
+    void ForgetOwner(VarDef *v) {
+        // A local alias can write or empty storage owned by an outer scope.
+        auto [first, last] = cur.links.live.equal_range(v);
+        cur.links.live.erase(first, last);
+        erase_if(cur.kills, [&](const Kill &k) { return k.container == v; });
+    }
+    void ForgetLocal(VarDef *v) {
+        if (cur.links.live.empty() && cur.kills.empty()) return;
+        ForgetOwner(v);
+        for (auto c : v->components) if (c) ForgetLocal(c);
     }
 
     // Every store of a reference, slice or holder value into a container
