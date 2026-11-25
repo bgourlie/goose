@@ -693,6 +693,8 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
             v.TakeAlts(rv);
             v.ClearReads();
             v.writable = rv.writable;
+            v.refplace.location = rv.refplace.location;
+            v.refplace.location.intail |= ak == A_GROW;
             // What a receiver that decays the reference loads through.
             c->rettypes.push_back(v.type);
             break;

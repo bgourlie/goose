@@ -510,9 +510,9 @@ inline Val Dot::Check(TypeCheck &tc, TypeExpr *) {
 
 inline Val Call::Check(TypeCheck &tc, TypeExpr *expected) {
     auto v = tc.CheckCall(this, expected);
-    // Return summaries map storage owners. An argument and the result can
-    // share an owner while denoting different subobjects.
-    v.refplace = {};
+    // An element-reference builtin computes its result's location. Other
+    // calls can share an argument's owner while returning a different part.
+    if (builtin < 0 || BuiltinByKind(builtin).rets[0] != 'r') v.refplace = {};
     for (auto &r : tc.lastcallrets) r.refplace = {};
     return v;
 }

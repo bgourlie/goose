@@ -19,5 +19,12 @@ fn main() {
     assert(list.nodes[0].next .== list.nodes[1]);
     list.nodes.clear();
     assert(list.nodes.len == 0 && list.head.next == null);
+    {
+        let added .= list.nodes.push(Node {});
+        added.next .= list.head;
+        assert(added.next .== list.head);
+    }
+    list.nodes.clear();
+    assert(list.nodes.len == 0 && list.head.next == null);
     print("ok");
 }
