@@ -1151,19 +1151,9 @@ inline Val TypeCheck::MergeVals(const Val &a, bool areach, const Val &b, bool br
     } else {
         v.type = UnifyBranch(a.type, b.type, at, wantvalue);
     }
-    // A holder value from either branch: what either's contents may point at.
-    if (a.holderset || b.holderset) {
-        v.holderset = true;
-        v.contents = ContentsOf(a);
-        v.contents.Add(ContentsOf(b));
-    }
-    if (v.type && v.type->kind == TY_REF) v.refplace = a.refplace.Common(b.refplace);
-    if (v.type && v.type->kind == TY_SLICE) v.sliceplace = a.sliceplace.Common(b.sliceplace);
     v.isnull = a.isnull && b.isnull;   // Both null: still a null, which names no root.
     // Both []: still a [], which takes the array type it meets (§6.4).
     v.emptyarr = a.emptyarr && b.emptyarr;
-    v.elementlinks = a.elementlinks;
-    v.elementlinks.Include(b.elementlinks);
     // Array literals of adaptable elements, of one type, adapt as one.
     if (a.litelems && b.litelems && TypeEq(a.type, b.type) && TypeEq(v.type, a.type)) {
         v.litelems = true;
@@ -1175,7 +1165,22 @@ inline Val TypeCheck::MergeVals(const Val &a, bool areach, const Val &b, bool br
     v.implicitcopy = a.implicitcopy ? a.implicitcopy : b.implicitcopy;
     v.refcopies = a.refcopies;
     v.refcopies.insert(v.refcopies.end(), b.refcopies.begin(), b.refcopies.end());
-    // Wherever either branch's value may point, the merged one may (§9.2).
+    // All constructed operands constrain the destination type. Only values
+    // delivered after their defers contribute provenance to the join.
+    if (a.stoppedbydefer || b.stoppedbydefer) {
+        v.stoppedbydefer = a.stoppedbydefer && b.stoppedbydefer;
+        if (!v.stoppedbydefer) v.TakeResultProvenance(a.stoppedbydefer ? b : a);
+        return v;
+    }
+    if (a.holderset || b.holderset) {
+        v.holderset = true;
+        v.contents = ContentsOf(a);
+        v.contents.Add(ContentsOf(b));
+    }
+    if (v.type && v.type->kind == TY_REF) v.refplace = a.refplace.Common(b.refplace);
+    if (v.type && v.type->kind == TY_SLICE) v.sliceplace = a.sliceplace.Common(b.sliceplace);
+    v.elementlinks = a.elementlinks;
+    v.elementlinks.Include(b.elementlinks);
     v.TakeAlts(a);
     v.Add(b);
     v.writable = a.writable && b.writable;
@@ -1195,8 +1200,8 @@ inline Val TypeCheck::MergeVals(const Val &a, bool areach, const Val &b, bool br
 // array a whole-array slice of itself, and they point where that says.
 inline Val TypeCheck::JoinBranches(const Val &a, bool areach, const Val &b, bool breach,
                                    Node *at, bool wantvalue, bool onjoin) {
-    if (!areach) return b;
-    if (!breach) return a;
+    if (!areach && !a.stoppedbydefer) return b;
+    if (!breach && !b.stoppedbydefer) return a;
     auto elem = [](const Val &x) -> TypeExpr * {
         if (!x.type) return nullptr;
         if (x.type->kind == TY_SLICE) return x.type->sub;
@@ -1215,9 +1220,10 @@ inline Val TypeCheck::JoinBranches(const Val &a, bool areach, const Val &b, bool
         // first branches not to agree.
         NoArrayJoin(a);
         NoArrayJoin(b);
-        return MergeVals(a, areach, b, breach, at, wantvalue);
+        return MergeVals(a, true, b, true, at, wantvalue);
     }
     Val v;
+    v.stoppedbydefer = a.stoppedbydefer && b.stoppedbydefer;
     v.type = ast.SliceOf(ea, at->line);
     // Read-only where a branch is: a const slice, or an array a view of
     // which would be (§9.5).
@@ -1264,7 +1270,7 @@ inline bool TypeCheck::CycleStorable(const Roots &r) {
 // temporaries outlive the value.
 inline void TypeCheck::CheckBranchRoot(const Val &v, int depth, Node *at, const char *construct) {
     auto t = v.type;
-    if (!t || v.isnull) return;
+    if (!t || v.isnull || v.stoppedbydefer) return;
     auto isrs = IsRefOrSlice(t);
     if (!isrs && !HoldsPlainRef(t)) return;
     const Roots &roots = isrs ? v.AsRoots() : ContentsOf(v);
@@ -1488,6 +1494,17 @@ inline Val TypeCheck::CheckIf(IfExpr *x, TypeExpr *expected, bool wantvalue) {
     return onjoin ? v : TempCopy(v);
 }
 
+// A block constructs its tail in the receiver before running its defers.
+// A path that never got as far as constructing a value is bottom.
+inline void TypeCheck::PopValueScope(Val &v) {
+    auto constructed = reachable && v.type && v.type->kind != TY_VOID;
+    PopScope();
+    if (!reachable) {
+        v.stoppedbydefer |= constructed;
+        if (!v.stoppedbydefer) v.type = nullptr;
+    }
+}
+
 inline Val TypeCheck::CheckBlockVal(Block *b, TypeExpr *expected, bool wantvalue) {
     auto onpath = argpath == b;
     auto onjoin = joinpath == b;
@@ -1506,8 +1523,7 @@ inline Val TypeCheck::CheckBlockVal(Block *b, TypeExpr *expected, bool wantvalue
     } else if (wantvalue && reachable && expected && expected->kind != TY_VOID) {
         Error(b, "block used as a value must end in an expression");
     }
-    PopScope();
-    if (!reachable) v.type = nullptr;  // Bottom: the block never produces.
+    PopValueScope(v);
     CheckBranchRoot(v, CurDepth(), b->tail, "block");
     b->exprtype = v.type ? v.type : ast.voidtype;
     return v;
@@ -1566,9 +1582,8 @@ inline Val TypeCheck::CheckMatch(MatchExpr *m, TypeExpr *expected, bool wantvalu
         } else {
             CheckStmtExpr(arm.body);
         }
+        PopValueScope(av);
         auto aflow = SaveFlow();
-        if (!reachable) av.type = nullptr;
-        PopScope();
         CheckBranchRoot(av, CurDepth(), arm.body, "match arm");
         if (first) {
             result = av;
@@ -1844,12 +1859,8 @@ inline Val TypeCheck::CheckEarlyBlock(EarlyBlock *x, TypeExpr *expected, bool wa
             CheckStmtExpr(x->body->tail);
         }
     }
-    if (!reachable) v.type = nullptr;
     auto sc = scopes.back();
-    PopScope();
-    // Even a tail whose defer aborts was constructed with the block's
-    // result type. Its links only reach the receiver if it completes.
-    if (!reachable) v.elementlinks = {};
+    PopValueScope(v);
     x->body->exprtype = v.type ? v.type : ast.voidtype;
     JoinBreakFlow(sc, true);
     reachable = reachable || sc.hasbreak;  // Exits via the tail or any break.
@@ -2239,10 +2250,9 @@ inline void TypeCheck::CheckBreak(Break *b) {
         // but for a number's: an integer constant, or a float of literals,
         // adapts as a branch's does (§6.4), relying on the named constants
         // it was read from (RelyOnNamed).
-        exit.SetProv(v);
+        exit.TakeResultProvenance(v);
         exit.type = v.type;
-        if (v.type && v.type->kind == TY_REF) exit.refplace = v.refplace;
-        if (v.type && v.type->kind == TY_SLICE) exit.sliceplace = v.sliceplace;
+        exit.stoppedbydefer = v.stoppedbydefer;
         if (IntConsts(v, exit.litlo, exit.lithi)) {
             exit.litint = true;
             exit.nonneg = exit.litlo >= 0;
@@ -2250,10 +2260,6 @@ inline void TypeCheck::CheckBreak(Break *b) {
         exit.litfloat = LitFloat(v);
         exit.constfrom = v.constfrom;
         exit.isnull = v.isnull;
-        exit.elementlinks = v.elementlinks;
-        exit.contents = v.contents;
-        exit.holderset = v.holderset;
-        exit.holderfrom = v.holderfrom;
         exit.storagebranches = v.storagebranches;
         exit.isvarint = v.isvarint;
         exit.implicitcopy = v.implicitcopy;
@@ -2268,15 +2274,18 @@ inline void TypeCheck::CheckBreak(Break *b) {
         // here: the construct's value does not carry the literal form.
         if (v.emptyarr) Error(b->val, "cannot infer array element type");
     }
+    auto constructed = reachable && exit.type && exit.type->kind != TY_VOID;
     ExitLinkDefers(si);
     auto &sc = scopes[si];
     if (b->val) {
         // All constructed values must agree on a type, including one whose
         // defer aborts after construction. Only completing breaks carry links.
-        if (!reachable) exit.elementlinks = {};
-        sc.breakvalue = JoinBranches(sc.breakvalue, sc.breaktype != nullptr, exit, true, b, true,
-                                     sc.onjoinpath);
-        if (!sc.breaktype) sc.breaktype = exit.type;
+        exit.stoppedbydefer |= constructed && !reachable;
+        if (reachable || exit.stoppedbydefer) {
+            sc.breakvalue = JoinBranches(sc.breakvalue, sc.hasbreak, exit, reachable, b, true,
+                                         sc.onjoinpath);
+            if (!sc.breaktype) sc.breaktype = exit.type;
+        }
         if (auto e = Is<EarlyBlock>(sc.node)) e->breaks.push_back(b);
         else if (auto l = Is<LoopExpr>(sc.node)) l->breaks.push_back(b);
     } else {
@@ -2590,11 +2599,7 @@ inline void TypeCheck::CalledSpecs(Node *n, vector<FnSpec *> &to) {
     auto add = [&](FnSpec *k) {
         if (k && find(to.begin(), to.end(), k) == to.end()) to.push_back(k);
     };
-    if (auto c = Is<Call>(n)) {
-        if (c->builtin < 0) add(c->spec);
-        for (auto k : c->dispatch) add(k);
-        for (auto &[t, k] : c->fmtspecs) add(k);
-    }
+    if (auto c = Is<Call>(n)) c->EachCallee(add);
     RunChildren(n, [&](Node *ch) { CalledSpecs(ch, to); });
 }
 

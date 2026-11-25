@@ -126,8 +126,9 @@ struct BaseCaseInliner {
                 return k && (k->incycle || k->sf->isrec || k->needs.count(o.curspec) ||
                              !k->envreads.empty());
             };
-            if (bad(c->spec)) return false;
-            for (auto d : c->dispatch) if (bad(d)) return false;
+            auto unsafe = c->builtin >= 0 && bad(c->spec);
+            c->EachCallee([&](FnSpec *k) { unsafe |= bad(k); });
+            if (unsafe) return false;
             for (auto p : c->fvparams) bound.insert(p);
         }
         auto ok = true;

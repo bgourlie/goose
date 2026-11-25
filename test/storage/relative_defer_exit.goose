@@ -77,6 +77,20 @@ fn block_tail(stop: bool) -> Node[] {
     }
 }
 
+fn match_result(index: i64) -> Node[] {
+    match index {
+        0 => { defer { abort("stop"); } linked() },
+        1 => { defer { abort("stop"); } linked() },
+        _ => [Node {}],
+    }
+}
+
+fn stop_before_break() { abort("stop"); }
+fn break_operand(stop: bool) -> i64 {
+    let value = if stop { loop { break stop_before_break(); } } else { 42 };
+    return value;
+}
+
 struct Stop { flag: bool }
 fn format(out: u8[>..]&, stop: Stop) { abort("stop"); }
 fn formatted_result(stop: bool) -> Node[] {
@@ -95,7 +109,9 @@ fn main() {
     var from_break: Node[>..<] = break_result(false);
     var from_tail: Node[>..<] = block_tail(false);
     var from_format: Node[>..<] = formatted_result(false);
-    assert(from_break.len == 1 && from_tail.len == 1 && from_format.len == 1);
+    var from_match: Node[>..<] = match_result(2);
+    assert(from_break.len == 1 && from_tail.len == 1 && from_format.len == 1 && from_match.len == 1);
+    assert(break_operand(false) == 42);
     stopped(false);
     var nodes: Node[>..] = [Node {}, Node {}];
     { defer { nodes[0].next .= nodes[1]; } }

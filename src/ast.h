@@ -809,6 +809,7 @@ struct Val : Prov {
     RefPlace sliceplace; // Storage containing the viewed elements, independent of the slice slot.
     TypeExpr *type = nullptr;
     ConstKind ck = CK_NONE;
+    bool stoppedbydefer = false; // Constructed into the destination before an exit defer stopped control flow.
     int64_t ival = 0;
     bool uns = false;            // CK_INT: ival's bits are a u64 above i64.max.
     double fval = 0;
@@ -923,6 +924,18 @@ struct Val : Prov {
     // any of several, or anywhere a root only bounds (TypeCheck::HolderSource).
     VarDef *holderfrom = nullptr;
     FnValBind fnv;               // When type is TY_FN.
+
+    // The value delivered by one exit keeps its pointee or viewed elements,
+    // and any links or references inside it. Its own storage is a new slot.
+    void TakeResultProvenance(const Val &from) {
+        SetProv(from);
+        if (from.type && from.type->kind == TY_REF) refplace = from.refplace;
+        if (from.type && from.type->kind == TY_SLICE) sliceplace = from.sliceplace;
+        elementlinks = from.elementlinks;
+        contents = from.contents;
+        holderset = from.holderset;
+        holderfrom = from.holderfrom;
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -1258,6 +1271,13 @@ NODE(Call)
     TypeExpr *qtype = nullptr;  // qlimit<T>: T, which names the queue (§11.2).
     const string *shaderblob = nullptr;  // embed_shader's compiled blob or embed_file's bytes, in Ast::shaders.
     Call(Line l, Node *_callee) : Node(l, NKind), callee(_callee) {}
+    // Specializations this call may run in the current thread. A spawned
+    // thread entry has its own control flow; a formatting hook runs here.
+    template<typename F> void EachCallee(F f) const {
+        if (builtin < 0 && spec) f(spec);
+        for (auto k : dispatch) f(k);
+        for (auto &[t, k] : fmtspecs) f(k);
+    }
     // What the call passes for the callee's free variable v (fvremap).
     VarDef *FreeVarArg(VarDef *v) const {
         for (auto &p : fvremap) if (p.first == v) return p.second;
@@ -2404,7 +2424,7 @@ struct RetRoot {
     bool freshview = false;    // Prov::freshview.
     ValueLinks elementlinks; // Any return may give an array with Val::elementlinks.
     vector<RelativeStore> resultlinks; // Links written into a result that reaches its caller.
-    bool set = false;          // A non-null return has recorded its root.
+    bool set = false;          // A return supplied provenance, including a known null.
     // The by-value holder parameter every return gives as it was passed,
     // nothing stored into it since its binding: the result holds what the
     // argument held (TypeCheck::CallResult). -1 where any return gives

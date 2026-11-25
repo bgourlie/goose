@@ -2327,6 +2327,7 @@ struct TypeCheck {
     Val TempCopy(Val v);
     Node *WholeSlice(Node *n);
     Val CheckIf(IfExpr *x, TypeExpr *expected, bool wantvalue);
+    void PopValueScope(Val &v);
     Val CheckBlockVal(Block *b, TypeExpr *expected, bool wantvalue);
     Val CheckMatch(MatchExpr *m, TypeExpr *expected, bool wantvalue);
     Val CheckEarlyBlock(EarlyBlock *x, TypeExpr *expected, bool wantvalue);

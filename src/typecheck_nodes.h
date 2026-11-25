@@ -511,7 +511,9 @@ inline Val Dot::Check(TypeCheck &tc, TypeExpr *) {
 
 inline Val Call::Check(TypeCheck &tc, TypeExpr *expected) {
     auto v = tc.CheckCall(this, expected);
-    if (spec || !dispatch.empty()) return v; // CallResult maps each returned place.
+    // Named calls map the returned place; an inline callback checked its
+    // result in this activation already. Builtins describe it by result kind.
+    if (spec || !dispatch.empty() || fvbody) return v;
     if (builtin < 0 || BuiltinByKind(builtin).rets[0] != 'r') v.refplace = {};
     if (builtin < 0 || BuiltinByKind(builtin).rets[0] != 's') v.sliceplace = {};
     for (auto &r : tc.lastcallrets) {

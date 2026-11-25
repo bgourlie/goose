@@ -12,6 +12,21 @@ fn link_view(view: Node[:], target: Node&) {
 }
 fn window(view: Node[:]) -> Node[:] { view[0..] }
 
+fn visit<F>(list: List&) {
+    {
+        let view = F(list.nodes[..]);
+        view[0].next .= list.head;
+        assert(view[0].next .== list.head);
+    }
+    list.nodes.clear();
+}
+
+fn absent() -> Node&? { null }
+fn maybe_node(n: Node&, present: bool) -> Node&? {
+    if present { return n; }
+    return absent();
+}
+
 fn slices(whole: bool) {
     var list = List { head: Node {}, nodes: [Node {}, Node {}] };
     for &n in list.nodes[0..] { n.next .= list.head; }
@@ -27,6 +42,14 @@ fn slices(whole: bool) {
     list.nodes.push(Node {});
     link_view(list.nodes, list.head);
     list.nodes.clear();
+    list.nodes.push(Node {});
+    {
+        let slot: Node&? = if whole { absent() } else { maybe_node(list.nodes[0], true) };
+        if slot { slot.next .= list.head; }
+    }
+    list.nodes.clear();
+    list.nodes.push(Node {});
+    visit(list) { s: Node[:] => s };
 }
 
 fn main() {

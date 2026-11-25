@@ -512,8 +512,7 @@ struct Optimizer {
             info.nodecount++;
             if (Is<Block>(n)) info.nest = max(info.nest, ++d);   // Its children sit inside it.
             if (auto c = Is<Call>(n)) {
-                auto callee = [&](FnSpec *k) {
-                    if (!k) return;
+                c->EachCallee([&](FnSpec *k) {
                     // A separate body referencing our locals that a copy
                     // of the call cannot point elsewhere (bound function
                     // values), or unwinding to us: our body must stay a
@@ -521,9 +520,7 @@ struct Optimizer {
                     if (!k->fnvals.empty()) noin = true;
                     if (k->needs.count(sp)) noin = true;
                     if (k->lexparent) info.nestedcalls = true;
-                };
-                if (c->builtin < 0) callee(c->spec);
-                for (auto k : c->dispatch) callee(k);
+                });
             }
             RunChildren(n, [&](Node *ch) { rec(ch, d + Around(n, ch)); });
         };

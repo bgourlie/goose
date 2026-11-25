@@ -3626,8 +3626,13 @@ inline void TypeCheck::FinishReturn(int tf, const vector<Val> &vals, Node *at) {
         auto isrs = IsRefOrSlice(rt);
         auto holder = !isrs && HoldsPlainRef(rt);
         if (!isrs && !holder) continue;
-        // A null return names no root: it agrees with every other return.
-        if (vals[i].isnull) continue;
+        // Null names no root, but is a known alternative when the caller
+        // joins this result with another location.
+        if (vals[i].isnull) {
+            rr.place.nullonly = true;
+            rr.set = true;
+            continue;
+        }
         // A holder value's contents must outlive the caller like a
         // returned reference would. What the result promises its callers is
         // about that same pointee: a holder variable's own storage is exact,

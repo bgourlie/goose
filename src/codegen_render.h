@@ -363,6 +363,7 @@ inline void CodeGen::EmitUserFormat(Loc &out, Loc lv, FnSpec *sp, Line ln) {
     for (auto &a : args) Append(argstr, argstr.empty() ? "" : ", ", a);
     L(ki.cname, "(", argstr, ");");
     MarkReload();   // The callee grew the builder's stack.
+    if (ki.hasrf) EmitRfCheck(sp);
     PopSc();
 }
 
