@@ -1158,6 +1158,7 @@ inline Val TypeCheck::MergeVals(const Val &a, bool areach, const Val &b, bool br
         v.contents.Add(ContentsOf(b));
     }
     if (v.type && v.type->kind == TY_REF) v.refplace = a.refplace.Common(b.refplace);
+    if (v.type && v.type->kind == TY_SLICE) v.sliceplace = a.sliceplace.Common(b.sliceplace);
     v.isnull = a.isnull && b.isnull;   // Both null: still a null, which names no root.
     // Both []: still a [], which takes the array type it meets (§6.4).
     v.emptyarr = a.emptyarr && b.emptyarr;
@@ -1505,8 +1506,8 @@ inline Val TypeCheck::CheckBlockVal(Block *b, TypeExpr *expected, bool wantvalue
     } else if (wantvalue && reachable && expected && expected->kind != TY_VOID) {
         Error(b, "block used as a value must end in an expression");
     }
-    if (!reachable) v.type = nullptr;  // Bottom: the block never produces.
     PopScope();
+    if (!reachable) v.type = nullptr;  // Bottom: the block never produces.
     CheckBranchRoot(v, CurDepth(), b->tail, "block");
     b->exprtype = v.type ? v.type : ast.voidtype;
     return v;
@@ -2083,7 +2084,7 @@ inline void TypeCheck::CheckFor(ForLoop *x) {
             if (byref && elem->kind != TY_REF) {
                 if (t->kind == TY_ARRAY) {
                     elementplace = iv.refplace.Inside(IsArrayKind(t, A_GROW));
-                }
+                } else if (iv.type->kind == TY_SLICE) elementplace = iv.sliceplace;
                 bindtype = ast.RefTo(elem, x->line);
             } else {
                 // An element that *is* a relative reference loads as a
@@ -2231,6 +2232,7 @@ inline void TypeCheck::CheckBreak(Break *b) {
         exit.SetProv(v);
         exit.type = v.type;
         if (v.type && v.type->kind == TY_REF) exit.refplace = v.refplace;
+        if (v.type && v.type->kind == TY_SLICE) exit.sliceplace = v.sliceplace;
         if (IntConsts(v, exit.litlo, exit.lithi)) {
             exit.litint = true;
             exit.nonneg = exit.litlo >= 0;
@@ -2277,9 +2279,10 @@ inline void TypeCheck::CheckBreak(Break *b) {
 // A break out of the loop or block of scope si: where it can be reached,
 // the construct exits in what holds here too.
 inline void TypeCheck::NoteBreak(int si) {
-    auto &sc = scopes[si];
     if (!reachable) return;
     ExitLinkDefers(si);
+    if (!reachable) return;
+    auto &sc = scopes[si];
     sc.hasbreak = true;
     sc.breakflow = sc.breakflows ? JoinFlow(sc.breakflow, SaveFlow()) : SaveFlow();
     sc.breakflows = true;
@@ -2305,6 +2308,7 @@ inline void TypeCheck::CheckContinue(Node *n) {
     if (si < 0) Error(n, "continue outside of a loop");
     if (!reachable) return;
     ExitLinkDefers(si);
+    if (!reachable) return;
     auto &sc = scopes[si];
     sc.backedge = sc.backedges ? JoinFlow(sc.backedge, SaveFlow()) : SaveFlow();
     sc.backedges = true;
@@ -2343,8 +2347,8 @@ inline void TypeCheck::CheckDefer(Defer *d) {
                 vars.size(), localfns.size(), scopes.back().defers.size(), blockpos, cur.nodepath,
                 SaveFlow(), std::move(bindings) });
         }
-        if (effects.env || !effects.shrinks.empty() || !effects.exit.writes.live.empty() ||
-            !effects.exit.overwrites.empty())
+        if (!effects.completes || effects.env || !effects.shrinks.empty() ||
+            !effects.exit.writes.live.empty() || !effects.exit.overwrites.empty())
             scopes.back().defers.push_back(std::move(effects));
     }
     d->exprtype = ast.voidtype;
@@ -2390,6 +2394,7 @@ inline TypeCheck::DeferredLinks TypeCheck::CheckDeferredBody(Defer *d) {
         CheckBlockVal(d->body, nullptr, false);
         deferbodies--;
         effects.exit = CurrentLinkEffects();
+        effects.completes = reachable;
     }
     PopScope();
     RestoreFlow(saved);
@@ -2402,7 +2407,8 @@ inline TypeCheck::DeferredLinks TypeCheck::CheckDeferredBody(Defer *d) {
 inline void TypeCheck::RefreshDeferredBody(DeferredLinks &effects) {
     auto env = effects.env;
     if (!env || none_of(env->bindings.begin(), env->bindings.end(), [](const EnvRead &r) {
-            return r.ref != r.var->ref || r.contents != r.var->contents;
+            return r.ref != r.var->ref || r.contents != r.var->contents ||
+                   r.slotref != r.var->slotref || r.refplace != r.var->refplace;
         })) return;
     auto exit = SaveFlow();
     {
@@ -2420,6 +2426,7 @@ inline void TypeCheck::RefreshDeferredBody(DeferredLinks &effects) {
         auto updated = CheckDeferredBody(env->body);
         effects.shrinks = std::move(updated.shrinks);
         effects.exit = std::move(updated.exit);
+        effects.completes = updated.completes;
         // The new binding may itself lead to a holder whose contents can change.
         effects.env = make_shared<DeferEnv>(*env);
         effects.env->bindings = DeferBindings(env->body);
@@ -2468,6 +2475,10 @@ inline void TypeCheck::ExitLinkDefers(int first) {
                 Saved kills(cur.kills, cur.kills);
                 ApplyLinkEffects(before);
                 CheckLinkShrink(shrink);
+            }
+            if (!it->completes) {
+                reachable = false;
+                return;
             }
             ApplyLinkEffects(it->exit);
         }

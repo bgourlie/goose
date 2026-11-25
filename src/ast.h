@@ -797,6 +797,7 @@ struct Val : Prov {
     // Storage denoted by an lvalue, or by a reference when non-null. A
     // copied value and a reference read back from a slot have no known place.
     RefPlace refplace;
+    RefPlace sliceplace; // Storage containing the viewed elements, independent of the slice slot.
     TypeExpr *type = nullptr;
     ConstKind ck = CK_NONE;
     int64_t ival = 0;
@@ -1828,7 +1829,8 @@ struct VarDef {
     // A global's position in ast.globals' definitions (TypeCheck::NoteNarrowed).
     int globalindex = 0;
     bool isparam = false;
-    RefPlace refplace;       // Pointee of a stable reference binding.
+    RefPlace refplace;       // Pointee or viewed elements of a stable binding.
+    RefPlace SlicePlace() const { return slotref ? RefPlace {} : refplace; }
     RefPlace PointeePlace() {
         auto place = refplace;
         if (!isvar && !istemp && !place.base && !place.nullonly) place.base = this;

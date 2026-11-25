@@ -379,6 +379,7 @@ struct TypeCheck {
     struct DeferredLinks {
         vector<pair<LinkShrink, LinkEffects>> shrinks;
         LinkEffects exit;
+        bool completes = true;
         shared_ptr<DeferEnv> env;
     };
     struct Scope {
@@ -2735,6 +2736,7 @@ struct TypeCheck {
     void HolderFromLit(Val &v, const LitDeep &deep);
     void AddStoreEvent(const StoreEvent &e);
     void NoteRefPlace(VarDef *vd, const Val &v);
+    RefPlace ArgumentPlace(TypeExpr *param, const Val &arg);
     void RecordElementLinks(const Roots &owners, TypeExpr *reached, const ValueLinks &links, Node *at,
                             LinkLocation place = {}, const LinkField &field = {});
     void RecordLinkStore(const Roots &owners, TypeExpr *reached, ElementLink link, Node *at,

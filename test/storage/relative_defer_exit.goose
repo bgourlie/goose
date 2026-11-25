@@ -6,7 +6,22 @@ fn reset(nodes: Node[>..]&, early: bool) {
     if early { return; }
 }
 
+fn stopped(stop: bool) {
+    var nodes: Node[>..] = [Node {}, Node {}];
+    nodes[0].next .= nodes[1];
+    if stop {
+        defer { nodes.pop_n(1); }
+        { defer { abort("stop"); } }
+    }
+    if stop {
+        defer { nodes.pop_n(1); }
+        defer { abort("stop"); }
+        return;
+    }
+}
+
 fn main() {
+    stopped(false);
     var nodes: Node[>..] = [Node {}, Node {}];
     { defer { nodes[0].next .= nodes[1]; } }
     nodes.clear();

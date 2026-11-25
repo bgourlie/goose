@@ -95,6 +95,7 @@ inline Val Ident::Check(TypeCheck &tc, TypeExpr *) {
             if (t->kind == TY_REF) v.refplace = vd->PointeePlace();
             v.lvalue = t->kind == TY_SLICE;   // A slice variable is storage; a reference is the pointee's path.
             if (v.lvalue) {
+                v.sliceplace = vd->SlicePlace();
                 v.slot.Set(vd, true);
                 // As writable as `&` of the variable is (CheckLValue, CheckRefOf).
                 v.slot.writable = v.writable && !vd->copybind && !(vd->type && vd->type->cq);
@@ -545,6 +546,7 @@ inline Val SliceExpr::Check(TypeCheck &tc, TypeExpr *) {
     if (hi) tc.CheckIntAny(hi);
     Val v;
     v.type = tc.ast.SliceOf(elem, line);
+    v.sliceplace = lv.place.Inside(IsArrayKind(lv.type, A_GROW));
     v.SetProv(lv);
     v.reusable = false;   // A view of a pool is not the pool.
     if (lv.type->cq) v.writable = false;   // A const field's or element's, as a variable's.

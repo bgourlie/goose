@@ -459,7 +459,8 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
         for (size_t i = 1; i < args.size(); i++) CheckPrintable(c, d.name, args, i, &rv);
         return VoidVal();
     }
-    auto elementplace = recvarr ? rv.refplace.Inside(ak == A_GROW) : RefPlace {};
+    auto elementplace = recvarr ? rv.refplace.Inside(ak == A_GROW)
+                                : rv.type && rv.type->kind == TY_SLICE ? rv.sliceplace : RefPlace {};
     auto elementdest = [&] {
         Dest dest(rv, elementplace);
         dest.fill = d.kind == B_RESIZE;
@@ -467,8 +468,24 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
         return dest;
     };
     // resize has two forms (§3.3); a target below zero is caught at runtime.
+    bool empties = d.kind == B_CLEAR;
     if (d.kind == B_RESIZE) {
-        CheckIntAny(args[1]);
+        auto length = CheckIntAny(args[1]);
+        int64_t lo, hi;
+        if (ak == A_GROW && IntConsts(length, lo, hi) && lo == 0 && hi == 0) {
+            empties = !length.constfrom;
+            // Rely on a named initializer only where clearing the tail can
+            // discharge a link. A local with no links needs no such promise.
+            auto owner = rv.Exact() ? rv.Root() : nullptr;
+            if (length.constfrom && HasRelRefT(elem) &&
+                (cur.deferring || !owner || !owner->ownerspec ||
+                 owner->ownerspec != CurRealFrame().spec || owner->elementlinks)) {
+                empties = true;
+                for (auto d = length.constfrom; d; d = d->constfrom)
+                    if (d->refwrite) empties = false;
+                if (empties) RelyOnNamed(length, args[1]);
+            }
+        }
         if (args.size() == 3) {
             ElemArg(args[2], elem, elementdest());
             // The fill value is built once and copied into every slot the
@@ -628,8 +645,6 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
     // find, which a sequential array has not got.
     auto shrink = (d.flags & BF_SHRINKS) != 0;
     if (ak == A_GROW && shrink) {
-        auto length = d.kind == B_RESIZE ? Is<IntLit>(args[1]) : nullptr;
-        auto empties = d.kind == B_CLEAR || (length && length->val == 0);
         CheckGrowShrink(c, d.name, args[0], rv, empties);
         if (d.kind != B_CLEAR && ClassOf(elem) != SC_FIXED)
             Error(c, cat(".", d.name, " needs fixed-size elements: ", TypeStr(rv.type),
@@ -699,6 +714,7 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
             break;
         case 's':
             v.type = ast.SliceOf(elem, c->line);
+            v.sliceplace = elementplace;
             v.TakeAlts(rv);
             v.ClearReads();
             v.writable = rv.writable;
@@ -967,7 +983,8 @@ inline void TypeCheck::CheckRenderable(Call *c, const char *what, TypeExpr *t, N
         auto v = value;
         if (run) ProjectField(v, v.refplace, t, *run, i);
         else if (t->kind == TY_ARRAY) v.refplace = value.refplace.Inside(IsArrayKind(t, A_GROW));
-        else if (t->kind == TY_SLICE) v.refplace = {};
+        else if (t->kind == TY_SLICE) v.refplace = value.sliceplace;
+        v.sliceplace = {};
         v.hasslot = ft->kind == TY_SLICE;
         if (v.hasslot) v.slot = v;
         if (throughref) {
@@ -1968,14 +1985,29 @@ inline void TypeCheck::AddStoreEvent(const StoreEvent &e) {
 // An immutable binding can retain the field containing its pointee even
 // when writing through the binding only overwrites part of that field.
 inline void TypeCheck::NoteRefPlace(VarDef *vd, const Val &v) {
-    if (vd->isvar || !IsAddressRef(vd->type) || !HasRelRefT(vd->type->ref->sub)) return;
-    auto place = StoragePlace(v, vd->type->ref->sub, v.refplace);
+    if (vd->isvar) return;
+    RefPlace place;
+    if (vd->type->kind == TY_SLICE && !vd->isglobal) place = v.sliceplace;
+    else if (IsAddressRef(vd->type) && HasRelRefT(vd->type->ref->sub))
+        place = StoragePlace(v, vd->type->ref->sub, v.refplace);
+    else return;
     // A captured let can be initialized in a shorter-lived scope. Keep
     // facts expressed in bindings that will still exist wherever it is read.
     if (place.location.param && Depth(place.location.param) > Depth(vd)) place.location.param = nullptr;
     if (place.base && (vd->isglobal || Depth(place.base) > Depth(vd)))
         place = { place.location, nullptr, {}, place.nullonly };
     vd->refplace = place;
+}
+
+// Map a parameter's pointee (or viewed elements) to the storage passed at
+// this particular call. An implicit whole-array view covers its elements.
+inline RefPlace TypeCheck::ArgumentPlace(TypeExpr *param, const Val &arg) {
+    if (param->kind == TY_SLICE) {
+        auto t = IsPlainRef(arg.type) ? arg.type->ref->sub : arg.type;
+        if (t->kind == TY_ARRAY) return arg.refplace.Inside(IsArrayKind(t, A_GROW));
+        return arg.type->kind == TY_SLICE ? arg.sliceplace : RefPlace {};
+    }
+    return IsAddressRef(param) ? StoragePlace(arg, param->ref->sub, arg.refplace) : RefPlace {};
 }
 
 // Internal links move with the complete element run. The destination alone
@@ -2573,7 +2605,7 @@ inline void TypeCheck::ApplyCalleeStores(FnSpec *spec, vector<Val> &argvals, Nod
                 auto it = find(spec->params.begin(), spec->params.end(), e.linkparam);
                 auto p = (size_t)(it - spec->params.begin());
                 place = it != spec->params.end() && p < argvals.size()
-                            ? argvals[p].refplace.location : LinkLocation {};
+                            ? ArgumentPlace((*it)->type, argvals[p]).location : LinkLocation {};
             }
             auto field = e.linkfield;
             auto owners = mapped(e.container, !e.bound);
@@ -2584,8 +2616,8 @@ inline void TypeCheck::ApplyCalleeStores(FnSpec *spec, vector<Val> &argvals, Nod
                 auto it = find(spec->params.begin(), spec->params.end(), field.base);
                 auto p = (size_t)(it - spec->params.begin());
                 RefPlace part;
-                if (it != spec->params.end() && p < argvals.size() && IsAddressRef((*it)->type))
-                    part = StoragePlace(argvals[p], (*it)->type->ref->sub, argvals[p].refplace);
+                if (it != spec->params.end() && p < argvals.size())
+                    part = ArgumentPlace((*it)->type, argvals[p]);
                 // An indexed argument names the whole array field only as a
                 // containing field. The callee's suffix is inside its element.
                 if (!part.base) field = {};

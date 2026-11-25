@@ -3207,7 +3207,13 @@ inline void TypeCheck::CheckSpecBodyOnce(FnSpec *spec, vector<Val> *argvals, Lin
         auto vd = NewVar(p.name, pt, p.line.line ? p.line : sf->line, p.isvar,
                          i < oldparams.size() ? oldparams[i] : nullptr);
         vd->isparam = true;
-        if (!vd->isvar && IsAddressRef(pt)) vd->refplace.location.param = vd;
+        if (!vd->isvar && (IsAddressRef(pt) || pt->kind == TY_SLICE)) {
+            vd->refplace.location.param = vd;
+            if (pt->kind == TY_SLICE) {
+                vd->refplace.base = vd;
+                vd->refplace.enclosing = true;
+            }
+        }
         if (auto links = spec->roots[i].elementlinks)
             RecordElementLinks(RootsOf(vd), pt, links, sf->body);
         vd->assigned = vd->maybeassigned = true;
@@ -3520,7 +3526,7 @@ inline void TypeCheck::CheckSpecBodyOnce(FnSpec *spec, vector<Val> *argvals, Lin
         ExitLinkDefers(frames[fi].scopebase);
         scopes.back().defers.clear();
         NoteExit(fi);
-        if (spec->retsknown && !spec->rets.empty())
+        if (reachable && spec->retsknown && !spec->rets.empty())
             Error(sf->body, cat("function ", sf->name,
                                 " can fall off the end without returning value(s)"));
     }

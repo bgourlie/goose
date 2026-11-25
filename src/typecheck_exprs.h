@@ -122,6 +122,7 @@ inline TypeCheck::LVal TypeCheck::LValueBase(Node *n, bool cmpview) {
     lv.type = v.type;
     lv.SetProv(v);
     if (v.type->kind == TY_REF) lv.place = v.refplace;
+    if (v.type->kind == TY_SLICE) lv.place = v.sliceplace;
     // A value result is materialized in its own temporary storage. References
     // and slices instead retain the (possibly inexact) owner they borrow.
     lv.intemp = TempContents(v, lv.contents);
@@ -211,14 +212,15 @@ inline void TypeCheck::RequireIndexArray(TypeExpr *t, Node *at, string_view what
 // sliced lies in the elements it views (Prov::reached).
 inline void TypeCheck::SliceProvenance(LVal &lv, Node *at) {
     if (lv.type->kind != TY_SLICE) return;
-    lv.place = {};
     if (!lv.var) {
+        if (lv.fromstorage || lv.throughref) lv.place = {};
         if (lv.fromstorage) ReadBackLVal(lv);
         else if (lv.throughref) lv.SetProv(SlotView(lv, lv.type));
         lv.reached = lv.type->sub;
         return;
     }
     RequireAssigned(lv.var, at);
+    lv.place = lv.var->SlicePlace();
     lv.SetProv(RefProvOf(lv.var));
     lv.reached = lv.type->sub;
     lv.var = nullptr;
@@ -820,6 +822,7 @@ inline void TypeCheck::SlotRoots(Val &v) {
     if (!v.hasslot || v.type->kind != TY_SLICE) return;
     v.held = v;
     v.hasheld = true;
+    v.sliceplace = {};
     v.TakeAlts(v.slot);
     v.writable = v.slot.writable;
     v.hasslot = false;
@@ -1137,6 +1140,7 @@ inline bool TypeCheck::FitsAt(Val &v, TypeExpr *dt) {
         auto at = IsPlainRef(t) && t->ref->sub->kind == TY_ARRAY ? t->ref->sub : t;
         if (at->kind == TY_ARRAY && TypeEq(at->arr->sub, dt->sub)) {
             if (at != t) v.ClearReads();   // As DerefLValue.
+            v.sliceplace = v.refplace.Inside(IsArrayKind(at, A_GROW));
             t = v.type = ast.SliceOf(at->arr->sub, dt->line);
             t->cq = !v.writable;
             v.lvalue = false;
