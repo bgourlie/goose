@@ -340,9 +340,12 @@ struct TypeExpr {
 inline bool IsRefOrSlice(const TypeExpr *t) { return t->kind == TY_REF || t->kind == TY_SLICE; }
 inline bool IsOptional(const TypeExpr *t) { return t->kind == TY_REF && t->ref->optional; }
 inline bool IsOpaque(const TypeExpr *t) { return t && t->kind == TY_GENERIC && t->named->opaque; }
-// A plain reference: an address, neither optional nor a relative offset.
+// An address can be optional. A plain reference is a non-optional address.
+inline bool IsAddressRef(const TypeExpr *t) {
+    return t->kind == TY_REF && t->ref->lenstorage < 0;
+}
 inline bool IsPlainRef(const TypeExpr *t) {
-    return t->kind == TY_REF && !t->ref->optional && t->ref->lenstorage < 0;
+    return IsAddressRef(t) && !t->ref->optional;
 }
 // A relative reference (§3.9): an offset stored in place of an address.
 inline bool IsRelRef(const TypeExpr *t) { return t->kind == TY_REF && t->ref->lenstorage >= 0; }
@@ -703,8 +706,11 @@ struct RefPlace {
     LinkLocation location;
     VarDef *base = nullptr;
     string_view path;
+    bool nullonly = false;  // No pointee on this path. The default is an unknown place.
 
     RefPlace Common(const RefPlace &other) const {
+        if (nullonly) return other;
+        if (other.nullonly) return *this;
         RefPlace common;
         common.location.intail = location.intail && other.location.intail;
         if (location.param == other.location.param) common.location.param = location.param;

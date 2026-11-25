@@ -1163,10 +1163,7 @@ inline Val TypeCheck::MergeVals(const Val &a, bool areach, const Val &b, bool br
         v.contents = ContentsOf(a);
         v.contents.Add(ContentsOf(b));
     }
-    if (v.type && v.type->kind == TY_REF) {
-        // Only arms that can produce a pointee constrain its location.
-        v.refplace = a.isnull ? b.refplace : b.isnull ? a.refplace : a.refplace.Common(b.refplace);
-    }
+    if (v.type && v.type->kind == TY_REF) v.refplace = a.refplace.Common(b.refplace);
     v.isnull = a.isnull && b.isnull;   // Both null: still a null, which names no root.
     // Both []: still a [], which takes the array type it meets (§6.4).
     v.emptyarr = a.emptyarr && b.emptyarr;

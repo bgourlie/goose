@@ -1939,7 +1939,7 @@ inline void TypeCheck::AddStoreEvent(const StoreEvent &e) {
 // Keep it on the reference so a value-producing construct can join it.
 inline void TypeCheck::NoteRefPath(Node *n, Val &v) {
     auto target = v.type->ref->sub;
-    if (!HasRelRefT(target) || v.refplace.base) return;
+    if (v.refplace.nullonly || v.refplace.base || !HasRelRefT(target)) return;
     if (auto k = ArgumentKill(n, v, target, true, 0)) {
         v.refplace.base = k->base;
         if (!k->path.empty()) v.refplace.path = ast.Intern(std::move(k->path));
@@ -1949,8 +1949,11 @@ inline void TypeCheck::NoteRefPath(Node *n, Val &v) {
 // An immutable binding keeps both the location of the pointee and the exact
 // path a whole overwrite there can be expressed against.
 inline void TypeCheck::NoteRefPlace(VarDef *vd, Node *arg, const Val &v) {
-    if (vd->isvar || vd->type->kind != TY_REF || IsRelRef(vd->type) ||
-        !HasRelRefT(vd->type->ref->sub)) return;
+    if (vd->isvar || !IsAddressRef(vd->type) || !HasRelRefT(vd->type->ref->sub)) return;
+    if (v.refplace.nullonly) {
+        vd->refplace = v.refplace;
+        return;
+    }
     RefPlace place;
     place.location = v.refplace.location;
     // A captured let can be initialized in a shorter-lived scope. Keep

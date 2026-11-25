@@ -36,6 +36,7 @@ inline Val BoolLit::Check(TypeCheck &tc, TypeExpr *) {
 inline Val NullLit::Check(TypeCheck &tc, TypeExpr *expected) {
     Val v;
     v.isnull = true;
+    v.refplace.nullonly = true;
     v.writable = true;   // Nothing to write: fits a writable slot or parameter.
     // Its own type only matters when nothing adapts it; FitsAt checks isnull.
     v.type = expected && expected->kind == TY_REF && expected->ref->optional
@@ -93,7 +94,8 @@ inline Val Ident::Check(TypeCheck &tc, TypeExpr *) {
             v.SetProv(tc.RefProvOf(vd));
             if (t->kind == TY_REF) {
                 v.refplace = vd->refplace;
-                if (!vd->isvar && !vd->istemp && !v.refplace.base) v.refplace.base = vd;
+                if (!vd->isvar && !vd->istemp && !v.refplace.base && !v.refplace.nullonly)
+                    v.refplace.base = vd;
             }
             v.lvalue = t->kind == TY_SLICE;   // A slice variable is storage; a reference is the pointee's path.
             if (v.lvalue) {
