@@ -2125,6 +2125,13 @@ inline void TypeCheck::CheckFor(ForLoop *x) {
     // stored there too, which the elements later iterations read may be.
     auto readback = IsRefOrSlice(bindtype) && elemtype && (!byref || elemtype->kind == TY_REF);
     if (readback) iterprov.writable = SlotLoadWritable(elemtype, iterprov.writable);
+    // GenLoc re-reads a sequence's lvalue path on each iteration. Once
+    // the body can repoint its base slice, the initial place no longer
+    // describes the elements a later iteration visits.
+    auto base = AddressedPath(x->iter);
+    while (auto obj = PathObject(base)) base = AddressedPath(obj);
+    auto id = Is<Ident>(base);
+    auto slice = id ? SliceVarOf(id->vdef) : nullptr;
     auto seqprov = iterprov;
     auto head = SaveFlow();
     auto sc = CheckLoopPasses(x, head, [&] {
@@ -2154,7 +2161,7 @@ inline void TypeCheck::CheckFor(ForLoop *x) {
         }
         if (IsRefOrSlice(bindtype)) {
             BindProv(vd, iterprov);
-            vd->refplace = elementplace;
+            vd->refplace = slice && slice->slotref ? RefPlace {} : elementplace;
         }
         x->vdef = vd;
         if (!x->idxvar.empty()) {

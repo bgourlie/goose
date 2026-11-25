@@ -513,6 +513,23 @@ void TypeCheck::HoldAs(Node *n, const Val &v, HoldKind kind, Node *parent, const
     }
 }
 
+// GenLoc addresses an explicit & of a value path in place. Any other
+// expression beyond the field and index steps is materialized once.
+inline Node *TypeCheck::AddressedPath(Node *n) {
+    auto u = Is<Unary>(n);
+    if (u && u->op == T_BITAND && (Is<Ident>(u->child) || Is<Dot>(u->child) ||
+                                   Is<Index>(u->child)) &&
+        u->child->exprtype && u->child->exprtype->kind != TY_REF)
+        return u->child;
+    return n;
+}
+
+inline Node *TypeCheck::PathObject(Node *n) {
+    if (auto d = Is<Dot>(n); d && d->IsField()) return d->obj;
+    if (auto ix = Is<Index>(n)) return ix->obj;
+    return nullptr;
+}
+
 // What a `for` over an array or slice, whose sequence has the value v, reads
 // on every iteration while its body runs (§6.5). Codegen spells the path to
 // the sequence into the loop (ForLoop::CgStmt, GenLoc): each reference or
@@ -530,16 +547,7 @@ template<typename F> void TypeCheck::HoldForSequence(ForLoop *fl, const Val &v, 
             if (IsTemp(a.root)) a.exact = true;
         f(Held { .node = n, .v = std::move(hv), .loop = fl, .reread = reread });
     };
-    // `&` of a path is that path.
-    auto unwrap = [](Node *n) {
-        auto u = Is<Unary>(n);
-        if (u && u->op == T_BITAND && (Is<Ident>(u->child) || Is<Dot>(u->child) ||
-                                       Is<Index>(u->child)) &&
-            u->child->exprtype && u->child->exprtype->kind != TY_REF)
-            return u->child;
-        return n;
-    };
-    auto path = unwrap(fl->iter);
+    auto path = AddressedPath(fl->iter);
     if (!Is<Ident>(path)) {
         auto seq = v;
         if (IsPlainRef(seq.type) && seq.type->ref->sub->kind != TY_SLICE) seq = DecayRef(seq);
@@ -551,11 +559,7 @@ template<typename F> void TypeCheck::HoldForSequence(ForLoop *fl, const Val &v, 
             hold(fl->iter, seq, false);
         }
     }
-    for (auto n = path;;) {
-        Node *obj;
-        if (auto d = Is<Dot>(n); d && !d->variantconst) obj = d->obj;
-        else if (auto ix = Is<Index>(n)) obj = ix->obj;
-        else break;
+    for (auto n = path; auto obj = PathObject(n); n = AddressedPath(obj)) {
         // The slot lies in what obj is, or leads to.
         auto ov = nodevals.find(obj);
         if (n->exprtype && IsRefOrSlice(n->exprtype) && ov) {
@@ -564,7 +568,6 @@ template<typename F> void TypeCheck::HoldForSequence(ForLoop *fl, const Val &v, 
             slot.type = ast.SliceOf(LoadType(n->exprtype), n->line);
             hold(n, slot, true);
         }
-        n = unwrap(obj);
     }
 }
 
@@ -826,8 +829,7 @@ inline void TypeCheck::SlotRoots(Val &v) {
     v.TakeAlts(v.slot);
     v.writable = v.slot.writable;
     v.hasslot = false;
-    for (auto &a : v.alts)
-        if (auto sv = SliceVarOf(a.root)) sv->slotref = true;
+    for (auto &a : v.alts) NoteSliceSlotRef(a.root);
 }
 
 // The type of the storage lvalue v denotes, or each branch of a construct v
@@ -1565,7 +1567,7 @@ inline Val TypeCheck::CheckRefOf(Unary *x) {
         v.writable = v.writable && RefProvOf(lv.var).writable;
     v.type->cq = !v.writable;   // `&x` of a const value is a `const T&` (§9.5).
     if (lv.var && v.writable) NoteWritableRef(lv.var, x);
-    if (auto sv = SliceVarOf(lv.var)) sv->slotref = true;
+    NoteSliceSlotRef(lv.var);
     return v;
 }
 

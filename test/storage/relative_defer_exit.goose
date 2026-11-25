@@ -6,9 +6,15 @@ fn reset(nodes: Node[>..]&, early: bool) {
     if early { return; }
 }
 
+fn stopped_unwind(nodes: Node[>..]&) {
+    defer { nodes.pop_n(1); }
+    defer { abort("stop"); }
+}
+
 fn stopped(stop: bool) {
     var nodes: Node[>..] = [Node {}, Node {}];
     nodes[0].next .= nodes[1];
+    if stop { stopped_unwind(nodes); }
     if stop {
         defer { nodes.pop_n(1); }
         { defer { abort("stop"); } }

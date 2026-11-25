@@ -372,7 +372,8 @@ struct TypeCheck {
         Node *at;
         string operation;
         VarDef *owner;
-        TypeExpr *bound, *array, *replaced;
+        TypeExpr *bound, *array;
+        ShrinkEffect effect;
         bool viaclass;
     };
     struct DeferEnv;
@@ -539,6 +540,8 @@ struct TypeCheck {
     template<typename F> void HoldAs(Node *n, const Val &v, HoldKind kind, Node *parent,
                                      const char *render, F f);
     template<typename F> void HoldForSequence(ForLoop *fl, const Val &v, F f);
+    static Node *AddressedPath(Node *n);
+    static Node *PathObject(Node *n);
     template<typename F> void HeldOperands(F f);
     template<typename F> void LaterOperands(F f);
     template<typename F> void AfterHead(Node *n, Node *next, F f);
@@ -2613,6 +2616,12 @@ struct TypeCheck {
     // may name; null for any other storage.
     static VarDef *SliceVarOf(VarDef *r) {
         return r && r->type && r->type->kind == TY_SLICE ? r : nullptr;
+    }
+    void NoteSliceSlotRef(VarDef *r) {
+        if (auto v = SliceVarOf(r); v && !v->slotref) {
+            v->slotref = true;
+            NoteFact(v);
+        }
     }
     void CompoundAssign(Assign *a, TypeExpr *st, bool writable);
     void NoLetAssign(Node *at, const LVal &lv);

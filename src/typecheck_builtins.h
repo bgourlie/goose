@@ -1785,7 +1785,7 @@ inline void TypeCheck::GrowOnlyShrinkAt(Node *c, const string &op, VarDef *vd,
     // of its type. A parameter class's storage is not known here.
     auto arrtype = ShrunkType(vd, bound);
     CheckLinkShrink({ c, cat("cannot ", op, " ", what), vd, bound, arr ? arr : arrtype,
-                      effect.replaced, viaclass });
+                      effect, viaclass });
     CheckHeldShrinks(c, op, vd, what, true, bound);
     ShrinkScanVars([&](VarDef *v) {
         // The array's own holder is scanned as any other where the fields
@@ -1877,7 +1877,6 @@ inline void TypeCheck::GrowOnlyShrinkAt(Node *c, const string &op, VarDef *vd,
     // the argument says what that storage holds.
     if (viaclass) return;
     NoteLiveViews(c, cat("cannot ", op, " ", what), vd, what, true, bound);
-    NoteShrink(vd, bound, effect);
 }
 
 // A deferred shrink observes both the writes in its own body up to this
@@ -1888,11 +1887,12 @@ inline void TypeCheck::CheckLinkShrink(const LinkShrink &s) {
         cur.deferring->shrinks.emplace_back(s, CurrentLinkEffects());
         return;
     }
-    if (LiveElementLinks(s.owner, s.array, s.replaced, !s.viaclass).MayPointForward())
+    if (LiveElementLinks(s.owner, s.array, s.effect.replaced, !s.viaclass).MayPointForward())
         Error(s.at, cat(s.operation, ": retained storage may have a self-relative link "
                         "to a removed element (§5.1)"));
     if (s.viaclass) return;
-    if (s.owner->isglobal) NoteGlobalShrink(s.at, s.operation, s.owner, s.bound, s.replaced);
+    if (s.owner->isglobal) NoteGlobalShrink(s.at, s.operation, s.owner, s.bound, s.effect.replaced);
+    NoteShrink(s.owner, s.bound, s.effect);
     NoteShrinkOrder(s.owner, s.bound);
 }
 
