@@ -630,22 +630,34 @@ struct TypeCheck {
     Node *multidestnode = nullptr;
     vector<Dest> multidests;
     bool recordingrelative = false;
+    bool FixedPlacedResult(TypeExpr *t) {
+        return FixedResultNeedsLocation(t, ClassOf(t), [&](TypeExpr *ft) { return FieldRuns(ft); });
+    }
     Dest ResultDest(FnSpec *spec, int index = 0) {
         Dest d;
         d.result = spec;
         d.resultindex = index;
-        // A fixed placed result is built by its return expression. Collect
-        // its actual stores, including those before a return that aborts.
-        if (hasdefers && spec && spec == CurRealFrame().spec && spec->sf->has_rets &&
-            (size_t)index < spec->rets.size()) {
-            auto t = spec->rets[index];
-            if (ClassOf(t) == SC_FIXED && BuiltInPlace(t)) {
-                auto &writing = cur.fixedresults[index];
-                writing.literal = true;
-                d.construction = &writing;
-            }
+        // The expression may start writing before its result type is inferred.
+        // Keep that evidence if the resolved result needs its caller's location.
+        if (hasdefers && spec && spec == CurRealFrame().spec &&
+            ((size_t)index >= spec->rets.size() || FixedPlacedResult(spec->rets[index]))) {
+            auto &writing = cur.fixedresults[index];
+            writing.literal = true;
+            d.construction = &writing;
         }
         return d;
+    }
+    const Dest *CallResultDest(size_t i) {
+        if (i >= callresultdsts.size()) {
+            // A forwarded call can reveal the arity of an inferred return.
+            if (!callforwarding || callresultdsts.empty() || !callresultdsts.front().result)
+                return nullptr;
+            auto spec = callresultdsts.front().result;
+            auto first = callresultdsts.front().resultindex;
+            for (auto j = callresultdsts.size(); j <= i; j++)
+                callresultdsts.push_back(ResultDest(spec, first + (int)j));
+        }
+        return &callresultdsts[i];
     }
     bool RelativeDestination(const Roots &source, Dest dest, TypeExpr *pointee, Node *at,
                              bool record, bool forwarding = false);
@@ -1714,7 +1726,7 @@ struct TypeCheck {
     // callee records such an exit (FnRecord::outerexits), which a call reusing
     // it takes again.
     void NoteExit(int tf, Node *at, const vector<RetRoot> &results = {},
-                  const FnRecord::OuterExit *added = nullptr, vector<FnRecord::InterruptedAssign> interrupted = {});
+                  vector<FnRecord::InterruptedAssign> interrupted = {});
     void ReplayOuterExit(int tf, FnSpec *spec, const FnRecord::OuterExit &exit, const FlowState &entry,
                          Node *at, vector<Val> &args);
 

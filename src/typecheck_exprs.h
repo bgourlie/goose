@@ -1934,31 +1934,17 @@ inline Val TypeCheck::CheckLogical(Binary *b) {
     NarrowCond(b->left, b->op == T_ANDAND);
     auto mid = SaveFlow();
     CheckCond(b->right);
-    // The right operand may not run, and runs after the left test: what
-    // it un-narrows is un-narrowed after the condition, and the left test
-    // cannot narrow it for the region the condition guards; what it
-    // assigns may be assigned after the condition.
+    // NarrowCond may replay the left test in the region this condition
+    // guards. Don't reintroduce a narrowing the right operand invalidated.
     b->rightkills.clear();
-    vector<VarDef *> mayassign;
     for (auto &e : mid.locals) {
         if (!InScope(e.var, e.index)) continue;
         auto v = e.var;
         if (e.state.narrowed && !v->narrowed) b->rightkills.push_back(v);
-        if (v->maybeassigned) mayassign.push_back(v);
     }
     for (auto [gv, gn] : mid.globals)
         if (gn && !gv->narrowed) b->rightkills.push_back(gv);
-    // What it leaves emptied may not be, but what it ended stays ended.
-    auto rightkills = cur.kills;
-    auto rightlinks = std::move(cur.links);
-    auto rightreturns = reachable;
-    RestoreFlow(snap);
-    if (rightreturns) {
-        cur.links.Join(rightlinks);
-        cur.kills = IntersectKills(cur.kills, rightkills);
-    }
-    for (auto kv : b->rightkills) kv->narrowed = nullptr;
-    for (auto v : mayassign) v->maybeassigned = true;
+    MergeFlow(snap, SaveFlow());
     Val v;
     v.type = ast.booltype;
     return v;

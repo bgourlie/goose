@@ -1995,31 +1995,16 @@ inline void TypeCheck::ReplayEnvExits(FnSpec *spec) {
 
 // An exit of the body that frame tf checks, reached here: its caller finds a
 // variable outside it assigned where every exit does, and maybe assigned
-// where any may be (§4.4). `added`: those a reused callee's activation had
-// assigned when it took the exit, where they were unassigned when it began,
-// and those it may have assigned, where none could be (FnRecord::outerexits).
+// where any may be (§4.4). Record the bindings after this frame's defers.
 // The exit leaves the bodies checked in the frames above tf too, each of
 // which records what it had assigned by then for a call reusing it.
 inline void TypeCheck::NoteExit(int tf, Node *at, const vector<RetRoot> &results,
-                                const FnRecord::OuterExit *added, vector<FnRecord::InterruptedAssign> interrupted) {
+                                vector<FnRecord::InterruptedAssign> interrupted) {
     auto current = RealFrameIndex();
     interrupted = CheckExitScopes(std::max(frames[tf].scopebase, frames[current].scopebase), at,
                                   current != tf, std::move(interrupted));
     auto e = frames[tf].exits;
     if (!reachable || !e) return;
-    auto isassigned = [&](VarDef *v) {
-        return v->assigned || (added && added->assigned.count(v));
-    };
-    auto assignedplace = [&](VarDef *v) {
-        if (added) {
-            auto it = added->assigned.find(v);
-            if (it != added->assigned.end()) return it->second;
-        }
-        return v->refplace;
-    };
-    auto maybe = [&](VarDef *v) {
-        return v->maybeassigned || (added && added->maybeassigned.count(v));
-    };
     auto merge = [&](vector<RetRoot> &to) {
         if (to.size() < results.size()) to.resize(results.size());
         for (size_t i = 0; i < results.size(); i++) to[i].Include(results[i]);
@@ -2041,8 +2026,8 @@ inline void TypeCheck::NoteExit(int tf, Node *at, const vector<RetRoot> &results
                 if (link.resultowner != target) link.AddTo(x.partialresults);
         for (size_t i = 0; i < mine->vars.size(); i++) {
             auto v = mine->vars[i];
-            if (isassigned(v)) x.assigned.emplace(v, assignedplace(v));
-            if (maybe(v) && !mine->maybeonentry[i]) x.maybeassigned.insert(v);
+            if (v->assigned) x.assigned.emplace(v, v->refplace);
+            if (v->maybeassigned && !mine->maybeonentry[i]) x.maybeassigned.insert(v);
         }
         auto &outer = frames[current].spec->record.outerexits;
         for (auto &o : outer) {
@@ -2069,10 +2054,10 @@ inline void TypeCheck::NoteExit(int tf, Node *at, const vector<RetRoot> &results
         return;
     }
     for (size_t i = 0; i < e->vars.size(); i++) {
-        auto place = assignedplace(e->vars[i]);
-        e->places[i] = e->reached ? e->places[i].Common(place) : place;
-        e->assigned[i] = (!e->reached || e->assigned[i]) && isassigned(e->vars[i]);
-        e->maybeassigned[i] = (e->reached && e->maybeassigned[i]) || maybe(e->vars[i]);
+        auto v = e->vars[i];
+        e->places[i] = e->reached ? e->places[i].Common(v->refplace) : v->refplace;
+        e->assigned[i] = (!e->reached || e->assigned[i]) && v->assigned;
+        e->maybeassigned[i] = (e->reached && e->maybeassigned[i]) || v->maybeassigned;
     }
     if (target) {
         merge(target->record.retroots);
@@ -2113,7 +2098,7 @@ inline void TypeCheck::ReplayOuterExit(int tf, FnSpec *spec, const FnRecord::Out
             mapped.Add(RetAltVal(spec, owner, args, a.type, at).AsRoots());
         a.owners = std::move(mapped);
     }
-    NoteExit(tf, at, x.results, &x, std::move(interrupted));
+    NoteExit(tf, at, x.results, std::move(interrupted));
 }
 
 // A cycle's members read each other's records at their back edges, so each
@@ -3572,7 +3557,8 @@ inline void TypeCheck::CheckSpecBodyOnce(FnSpec *spec, vector<Val> *argvals, Lin
         }
     }
     for (auto &[index, writing] : cur.fixedresults)
-        if (writing.started) spec->record.writtenfixedresults.insert(index);
+        if (writing.started && (size_t)index < spec->rets.size() && FixedPlacedResult(spec->rets[index]))
+            spec->record.writtenfixedresults.insert(index);
     spec->record.mayreturn = exits.reached;
     reachable = savereach;
     RecordEnvExits(spec);
@@ -4275,15 +4261,16 @@ inline bool TypeCheck::ResultLayoutFits(TypeExpr *from, TypeExpr *to) {
 // after its operands complete, even if the callee subsequently exits
 // without returning. A reference result is loaded after the call.
 inline void TypeCheck::NoteCallConstruction(const vector<TypeExpr *> &results, const FnSpec *callee) {
-    for (size_t i = 0; i < results.size() && i < callresultdsts.size(); i++) {
-        auto &dest = callresultdsts[i];
+    if (!reachable) return;
+    for (size_t i = 0; i < results.size(); i++) {
+        auto dest = CallResultDest(i);
         auto t = results[i];
-        if (!dest.construction || !reachable || !IsAggregate(t) || !BuiltInPlace(t)) continue;
-        if (ClassOf(t) == SC_FIXED && callee && callee->sf->has_rets) {
+        if (!dest || !dest->construction || !IsAggregate(t) || !BuiltInPlace(t)) continue;
+        if (ClassOf(t) == SC_FIXED && callee) {
             auto rec = RecordOf(callee);
             if (rec && !rec->mayreturn && !rec->writtenfixedresults.count((int)i)) continue;
         }
-        dest.construction->started = true;
+        dest->construction->started = true;
     }
 }
 
@@ -4376,11 +4363,7 @@ inline void TypeCheck::ApplyRelativeStore(Node *call, FnSpec *spec, vector<Val> 
     if (s.result < 0) dest = Dest(mapped(s.destination));
     else {
         auto i = (size_t)s.result;
-        if (i < callresultdsts.size()) dest = callresultdsts[i];
-        else if (callforwarding && !callresultdsts.empty() && callresultdsts[0].result) {
-            dest = callresultdsts[0];
-            dest.resultindex += s.result;
-        }
+        if (auto receiver = CallResultDest(i)) dest = *receiver;
         if (dest.fill)
             Error(call, "a result containing relative links to its destination cannot be a "
                         "resize fill value, which is constructed once and copied");

@@ -47,6 +47,32 @@ fn moved_during_unwind() -> i64[] {
     return out;
 }
 
+fn skipped_rebind(skip: bool) -> i64[] {
+    var out: i64[] = [42];
+    var spare = 0;
+    var target .= spare;
+    let first .= out[0];
+    fn stop_after_rebind() -> bool { target .= first; abort("stop"); }
+    let skipped = skip || stop_after_rebind();
+    defer { target++; }
+    return out;
+}
+
+fn moved_on_nonlocal_exit() -> i64[] {
+    var out: i64[] = [42];
+    var spare = 0;
+    var target .= spare;
+    let first .= out[0];
+    fn phase() {
+        fn leave() { target .= first; return from phase; }
+        defer { target .= spare; }
+        leave();
+    }
+    phase();
+    defer { target++; }
+    return out;
+}
+
 fn stop() -> i64 { abort("stop"); }
 fn numbers(n: i64 = stop()) -> i64[] { [n] }
 fn fixed_numbers(n: i64) -> i64[2] { [n, stop()] }
@@ -138,11 +164,13 @@ struct Small { value: i64 }
 fn make(n: i64) -> Small { Small { value: n } }
 fn stopped_small() -> Small { abort("stop"); }
 fn stopped_linked() -> Linked { Linked { n: stop() } }
+fn inferred_stopped_linked() { return Linked { n: stop() }; }
 
 fn stopped_placed_call(flag: bool) -> Linked[] {
     var result: Linked[] = [Linked { n: 42 }];
     let first .= result[0];
     defer { if flag { first = stopped_linked(); } }
+    defer { if flag { first = inferred_stopped_linked(); } }
     return result;
 }
 
@@ -169,6 +197,8 @@ fn main() {
     assert(moved_before_exit(false)[0] == 42);
     assert(moved_before_exit(true)[0] == 42);
     assert(moved_during_unwind()[0] == 42);
+    assert(skipped_rebind(true)[0] == 42);
+    assert(moved_on_nonlocal_exit()[0] == 42);
     assert(stopped_placed_call(false)[0].n == 42);
     let unchanged = stopped_store(false);
     assert(unchanged[0] == 41);
