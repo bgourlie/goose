@@ -30,9 +30,10 @@ struct Bag { tag: i64, xs: i64[>..<] }
 struct Box { tag: i64, items: i64[>..<]& }
 fn siblings(stop: bool) {
     var bag = Bag { tag: 7, xs: [1] };
+    let alias .= bag;
     let tag .= bag.tag;
     let box = Box { tag: 8, items: bag.xs };
-    defer { assert(tag == 7 && box.tag == 8); }
+    defer { assert(tag == 7 && alias.tag == 7 && box.tag == 8); }
     bag.xs = [2, if stop { return; } else { 3 }];
 }
 

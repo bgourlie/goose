@@ -583,6 +583,22 @@ template<typename F> void TypeCheck::HoldForSequence(ForLoop *fl, const Val &v, 
 // middle of rendering.
 template<typename F> void TypeCheck::HeldOperands(F f) {
     for (auto &e : cur.nodepath) {
+        // A fill captures even the nested relative fields before emitting
+        // its first element. Their targets stay live across later operands.
+        if (auto fill = Is<ArrayLit>(e.node); fill && fill->fillval) {
+            auto pending = cur.links.fills.find(fill);
+            if (pending != cur.links.fills.end()) {
+                auto hold = [&](TypeExpr *pointee, const Roots &roots) {
+                    if (roots.None()) return; // Internal links move with the captured value.
+                    Val v;
+                    v.TakeAlts(roots);
+                    v.type = ast.RefTo(pointee, fill->line);
+                    f(Held { nullptr, std::move(v) });
+                };
+                for (auto &[slot, roots] : pending->second.slots) hold(slot.second.pointee, roots);
+                for (auto &link : pending->second.results) hold(link.pointee, link.source);
+            }
+        }
         auto own = e.discovering || (&e == &cur.nodepath.back() && Is<Call>(e.node));
         auto i = 0;
         ForOperands(e.node, [&](Node *ch, HoldKind kind) {
@@ -1462,10 +1478,8 @@ inline bool TypeCheck::FitsAt(Val &v, TypeExpr *dt, bool delivered) {
                                   : cat("this reference is rooted at ", vroot));
                     return false;
                 }
-                if (recordingrelative && !dt->ref->pool && !curdst.result && !curdst.discarded)
-                    RecordLinkStore(curdst.roots, curdst.reached ? curdst.reached : dt,
-                                    { pointee, curdst.appended ? EL_BACKWARD : EL_ANY },
-                                    fitnode, curdst.place, curdst.field);
+                if (recordingrelative && !dt->ref->pool && !curdst.result)
+                    StoreElementLink(curdst, dt, { pointee, curdst.appended ? EL_BACKWARD : EL_ANY }, fitnode, links);
                 v.type = dt;
                 return true;
             }

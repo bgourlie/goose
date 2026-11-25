@@ -4327,7 +4327,8 @@ inline bool TypeCheck::RelativeDestination(const Roots &source, Dest dest, TypeE
         rs.field = dest.field.path;
     } else rs.destination.Set(want, true);
     rs.AddTo(spec->record.relativestores);
-    if (dest.result && !dest.discarded) rs.AddTo(cur.links.resultlinks);
+    if (dest.result && !dest.discarded && reachable)
+        rs.AddTo(dest.repeated ? cur.links.fills[dest.repeated].results : cur.links.resultlinks);
     return true;
 }
 
@@ -4389,8 +4390,7 @@ inline void TypeCheck::ApplyRelativeStore(Node *call, FnSpec *spec, vector<Val> 
                         target, " to receiving storage ", receiver));
     }
     if (s.result >= 0 && dest.reached && !dest.result && !dest.discarded && !source.None())
-        RecordLinkStore(dest.roots, dest.reached,
-                        { s.pointee, dest.appended ? EL_BACKWARD : EL_ANY }, call, dest.place, dest.field);
+        StoreElementLink(dest, dest.reached, { s.pointee, dest.appended ? EL_BACKWARD : EL_ANY }, call, source);
 }
 
 inline TypeExpr *TypeCheck::SubstEnv(TypeExpr *t, FnSpec *env) {

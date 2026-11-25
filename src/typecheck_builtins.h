@@ -1503,6 +1503,7 @@ inline void TypeCheck::CheckHeldShrinks(Node *at, const string &op, VarDef *root
         auto sec = growonly ? " (§5.1)" : " (§5.2)";
         // A §5.1 scan's op names no array.
         auto shrink = cat("cannot ", op, growonly ? cat(" ", what) : string(), ": ");
+        if (!node) Error(at, cat(shrink, "a link target captured by the array fill may still refer into ", what, sec));
         auto expr = ExprStr(node);
         if (render) {
             if (expr.find('\n') != string::npos) expr = "its argument";
@@ -2061,7 +2062,7 @@ inline void TypeCheck::NoteRefPlace(VarDef *vd, const Val &v) {
     RefPlace place;
     if (vd->type->kind == TY_SLICE && !vd->isglobal) place = v.sliceplace;
     else if (IsAddressRef(vd->type) && (HasRelRefT(vd->type->ref->sub) ||
-                                        (hasdefers && !v.refplace.path.empty())))
+                                        (hasdefers && v.refplace.base)))
         place = StoragePlace(v, vd->type->ref->sub, v.refplace);
     else return;
     // A captured let can be initialized in a shorter-lived scope. Keep
@@ -2091,13 +2092,36 @@ inline RefPlace TypeCheck::ArgumentPlace(FnSpec *spec, VarDef *param, const vect
 // Internal links move with the complete element run. The destination alone
 // owns both ends, including when a call maps the store through a parameter.
 inline void TypeCheck::RecordElementLinks(const Dest &dest, TypeExpr *type, const ValueLinks &links, Node *at) {
-    auto place = dest.place;
-    place.intail |= IsArrayKind(type, A_GROW);
-    for (auto &[link, path] : links.slots) {
-        auto field = dest.field;
-        if (field.base && dest.fieldsteps) field.path += path;
-        RecordLinkStore(dest.roots, dest.reached ? dest.reached : type, link, at, place, field);
+    for (auto [link, path] : links.slots) {
+        link.intail |= IsArrayKind(type, A_GROW);
+        StoreElementLink(dest, type, link, at, {}, path);
     }
+}
+
+inline void TypeCheck::StoreElementLink(const Dest &dest, TypeExpr *type, ElementLink link, Node *at,
+                                       const Roots &borrowed, string_view path) {
+    if (!reachable || dest.discarded || dest.roots.None()) return;
+    auto reached = dest.reached ? dest.reached : type;
+    if (dest.repeated) {
+        // Element slots share the field containing the array. Nested
+        // arrays may also place a slot within a growable tail.
+        assert(!dest.fieldsteps);
+        link.intail |= dest.place.intail;
+        cur.links.fills[dest.repeated].slots[{ reached, link }].Add(borrowed);
+        return;
+    }
+    auto field = dest.field;
+    if (field.base && dest.fieldsteps) field.path += path;
+    RecordLinkStore(dest.roots, reached, link, at, dest.place, field);
+}
+
+inline void TypeCheck::FinishFill(ArrayLit *fill, const Dest &dest) {
+    auto pending = cur.links.fills.extract(fill);
+    if (!pending || !reachable) return;
+    for (auto &[slot, roots] : pending.mapped().slots)
+        StoreElementLink(dest, slot.first, slot.second, fill, roots);
+    for (auto &link : pending.mapped().results)
+        link.AddTo(dest.repeated ? cur.links.fills[dest.repeated].results : cur.links.resultlinks);
 }
 
 inline void TypeCheck::RecordLinkStore(const Roots &owners, TypeExpr *reached,
@@ -3659,7 +3683,7 @@ inline void TypeCheck::NoteLiveViews(Node *at, const string &prefix, VarDef *roo
     HeldOperands([&](const Held &h) {
         auto vs = views(h.v, h.v.type, h.location || h.reread, false, h.inplace, nullptr);
         if (!judged(vs)) return;
-        auto name = ExprStr(h.node);
+        auto name = h.node ? ExprStr(h.node) : "a link target captured by the array fill";
         if (name.find('\n') != string::npos)
             name = h.loop ? "a for loop's sequence" : "an earlier expression value";
         for (auto &w : vs) note(w, name);
@@ -4620,7 +4644,8 @@ inline TypeCheck::Alias TypeCheck::ReachesBuilt(VarDef *v, VarDef *built, bool e
 
 // Storage a deferred use can observe while unwinding. Follow stored views
 // when the use can read them, including when a whole holder is passed on.
-inline vector<TypeCheck::LiveView> TypeCheck::DeferredUseViews(VarDef *v, Dot *field, bool apart) {
+inline vector<TypeCheck::LiveView> TypeCheck::DeferredUseViews(VarDef *v, Dot *field,
+                                                              const RefPlace &target, bool &apart) {
     vector<LiveView> views;
     if (!v->type) return views;
     auto ref = IsRefOrSlice(v->type);
@@ -4628,16 +4653,28 @@ inline vector<TypeCheck::LiveView> TypeCheck::DeferredUseViews(VarDef *v, Dot *f
     Prov storage;
     storage.TakeAlts(ref ? RefRootsOf(v) : RootsOf(v));
     if (ref) storage.byteview = v->ref.byteview;
-    // Reading a scalar field of a holder does not follow the references in
-    // its siblings. Intermediate reference fields on the path do get read.
-    auto follows = !field || !field->exprtype || HoldsPlainRef(field->exprtype);
-    auto first = field;
-    while (first && Is<Dot>(first->obj)) {
-        first = Is<Dot>(first->obj);
-        follows |= first->exprtype && IsRefOrSlice(first->exprtype);
+    // Project the inline part of the read from the binding it has on this
+    // exit. A stored reference ends that path: its slot and its pointee
+    // are separate reads, and only the slot can be proved apart this way.
+    vector<Dot *> fields;
+    for (auto d = field; d; d = Is<Dot>(d->obj)) fields.push_back(d);
+    auto place = ref ? (v->type->kind == TY_SLICE ? v->SlicePlace() : v->PointeePlace())
+                     : RefPlace { {}, v };
+    auto projected = storage;
+    auto selected = t;
+    for (auto it = fields.rbegin(); it != fields.rend(); ++it) {
+        auto runs = FieldRuns(selected);
+        if (runs.size() != 1) break;
+        auto i = (*it)->fieldidx;
+        ProjectField(projected, place, selected, runs[0], i);
+        selected = (*runs[0].ftypes)[i];
+        if (IsRefOrSlice(selected)) break;
     }
+    apart = place.base && place.base == target.base && !FieldPathWithin(place.path, target.path) &&
+            !FieldPathWithin(target.path, place.path);
+    auto follows = IsRefOrSlice(selected) || HoldsPlainRef(selected);
     auto add = [&](const Prov &where, TypeExpr *type, bool direct) {
-        if (direct) views.push_back({ where, type });
+        if (direct && !apart) views.push_back({ where, type });
         if (!follows || !HoldsPlainRef(type)) return;
         HeldViews(where, type, false, views);
         if (v->isglobal) {
@@ -4653,12 +4690,13 @@ inline vector<TypeCheck::LiveView> TypeCheck::DeferredUseViews(VarDef *v, Dot *f
         // group can expose any component; selecting a field exposes one.
         auto inst = GetStructInst(t);
         for (size_t i = 0; i < inst->ftypes.size(); i++) {
-            if (inst->st->fields[i].ispad || (first && first->fieldidx != (int)i)) continue;
+            if (inst->st->fields[i].ispad || (!fields.empty() && fields.back()->fieldidx != (int)i))
+                continue;
             Prov where;
             where.TakeAlts(ProjectRoots(storage, t, (int)i));
             add(where, inst->ftypes[i], true);
         }
-    } else add(storage, t, ref && !apart);
+    } else add(storage, t, ref);
     return views;
 }
 
@@ -4694,12 +4732,7 @@ inline void TypeCheck::CheckBuiltUses(Node *rhs, Node *lval, TypeExpr *target,
     auto check = [&](Node *at, VarDef *v, const string &how, const string &via, Dot *field = nullptr) {
         vector<LiveView> views;
         auto apart = false;
-        if (onexit && v->type) {
-            if (IsRefOrSlice(v->type) && onexit->base && onexit->base == v->refplace.base)
-                apart = !FieldPathWithin(onexit->path, v->refplace.path) &&
-                        !FieldPathWithin(v->refplace.path, onexit->path);
-            views = DeferredUseViews(v, field, apart);
-        }
+        if (onexit && v->type) views = DeferredUseViews(v, field, *onexit, apart);
         for (auto &b : built.alts) {
             if (!b.root || IsTemp(b.root)) continue;
             for (const auto &view : views) {
@@ -4730,14 +4763,7 @@ inline void TypeCheck::CheckBuiltUses(Node *rhs, Node *lval, TypeExpr *target,
     // holder's record, else anywhere the variable's storage bounds.
     auto checkread = [&](Ident *id, Node *path) {
         auto v = id->vdef;
-        // The field's own type: a reference loads as what it refers to.
-        TypeExpr *vt = nullptr;
-        if (auto d = Is<Dot>(path); d && d->fieldidx >= 0) {
-            auto ot = d->obj->exprtype;
-            if (ot && ot->kind == TY_REF) ot = ot->ref->sub;
-            auto runs = ot ? FieldRuns(ot) : span<const FieldRun>();
-            if (runs.size() == 1) vt = (*runs[0].ftypes)[d->fieldidx];
-        }
+        auto vt = ReadFieldType(Is<Dot>(path), id);
         if (!v || !v->type || !vt) return;
         vector<TypeExpr *> reached;
         ReachedThroughRefs(vt, reached);
@@ -4761,7 +4787,7 @@ inline void TypeCheck::CheckBuiltUses(Node *rhs, Node *lval, TypeExpr *target,
     };
     EachUse(rhs,
             [&](Ident *id, Node *path) {
-                if (FieldsApart(path, lval, target)) return;
+                if (FieldsApart(path, lval, target, onexit != nullptr)) return;
                 check(id, id->vdef, cat("use ", ExprStr(path)), string(), Is<Dot>(path));
                 if (path != id) checkread(id, path);
             },
@@ -4803,13 +4829,29 @@ template<typename F, typename G> void TypeCheck::EachUse(Node *n, F named, G cal
     walk(n);
 }
 
+// The value read out of base's inline storage: the selected field, or
+// the first reference followed to reach it. Use the declaration because
+// a reference may have decayed by the time its use is checked.
+inline TypeExpr *TypeCheck::ReadFieldType(Dot *field, Node *base) {
+    TypeExpr *read = nullptr;
+    for (auto d = field; d && d != base; d = Is<Dot>(d->obj)) {
+        auto owner = d->obj->exprtype;
+        if (owner && owner->kind == TY_REF) owner = owner->ref->sub;
+        auto runs = owner ? FieldRuns(owner) : span<const FieldRun>();
+        if (runs.size() != 1 || d->fieldidx < 0) return nullptr;
+        auto ft = (*runs[0].ftypes)[d->fieldidx];
+        if (d == field || IsRefOrSlice(ft)) read = ft;
+    }
+    return read;
+}
+
 // Whether field paths `use` and `lval` start at one variable and part at
 // some field, what `use` reads holding no reference that could lead back
 // to what `lval` names: none to storage that can be or hold that location
 // (MayHoldBuilt), at any remove, and, where `lval` ends in a reference whose
 // pointee is assigned, not that location itself. A view of the old
 // elements it leads to is the shrink rule's to judge (§5.1).
-inline bool TypeCheck::FieldsApart(Node *use, Node *lval, TypeExpr *target) {
+inline bool TypeCheck::FieldsApart(Node *use, Node *lval, TypeExpr *target, bool onexit) {
     auto path = [](Node *n, vector<Dot *> &fields) -> VarDef * {
         for (auto d = Is<Dot>(n); d; d = Is<Dot>(n)) {
             if (d->fieldidx < 0) return nullptr;
@@ -4824,20 +4866,18 @@ inline bool TypeCheck::FieldsApart(Node *use, Node *lval, TypeExpr *target) {
     if (!var || var != path(lval, lf)) return false;
     for (size_t i = 1; i <= uf.size() && i <= lf.size(); i++) {
         if (uf[uf.size() - i]->fieldidx == lf[lf.size() - i]->fieldidx) continue;
-        auto ot = uf[0]->obj->exprtype;
-        if (ot && ot->kind == TY_REF) ot = ot->ref->sub;
-        auto runs = ot ? FieldRuns(ot) : span<const FieldRun>();
-        if (runs.size() != 1) return false;
-        auto ft = (*runs[0].ftypes)[uf[0]->fieldidx];
-        // Through a reference field the location is its pointee, which may
-        // be this field itself or lie in it (`d.r .= d.own`).
-        if (lval->exprtype && lval->exprtype->kind == TY_REF && CanContain(ft, target))
+        // Distinct inline fields occupy distinct slots. Crossing a stored
+        // reference after the paths split can bring them back together.
+        auto ft = ReadFieldType(uf.front(), uf[uf.size() - i]->obj);
+        auto written = ReadFieldType(lf.front(), lf[lf.size() - i]->obj);
+        if (!ft || !written) return false;
+        if (IsRefOrSlice(written) && (CanContain(ft, target) || (onexit && CanContain(target, ft))))
             return false;
         if (IsFlat(ft)) return true;
         vector<TypeExpr *> reached;
         ReachedThroughRefs(ft, reached);
         for (auto y : reached)
-            if (MayHoldBuilt(y, lval, target)) return false;
+            if (MayHoldBuilt(y, lval, target) || (onexit && CanContain(target, y))) return false;
         return true;
     }
     return false;

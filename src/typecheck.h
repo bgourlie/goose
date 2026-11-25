@@ -293,11 +293,27 @@ struct TypeCheck {
         };
         map<Part, size_t, std::less<>> live;
         vector<RelativeStore> resultlinks; // Writes into the result under construction on this path.
+        // A repeated literal captures its operand before installing any
+        // links. Only paths that finish the operand reach those stores.
+        struct FillLinks {
+            // Link targets stay borrowed until the repeated elements are written.
+            map<pair<TypeExpr *, ElementLink>, Roots> slots;
+            vector<RelativeStore> results;
+            void Join(const FillLinks &other) {
+                for (auto &[slot, roots] : other.slots) slots[slot].Add(roots);
+                for (auto &link : other.results) link.AddTo(results);
+            }
+            bool operator==(const FillLinks &other) const {
+                return slots == other.slots && RelativeStore::SameSet(results, other.results);
+            }
+        };
+        map<ArrayLit *, FillLinks> fills;
         void Add(const StoreEvent &e, size_t index) {
             live[{e.container, e.elementlink, e.linkfield, e.linkclass}] = index;
         }
         void Join(const LinkFlow &other) {
             for (auto &link : other.resultlinks) link.AddTo(resultlinks);
+            for (auto &[fill, links] : other.fills) fills[fill].Join(links);
             for (auto &[part, at] : other.live) {
                 auto &last = live[part];
                 last = std::max(last, at);
@@ -310,7 +326,8 @@ struct TypeCheck {
         }
         // Loop convergence depends on the possible writes, not event numbers.
         bool operator==(const LinkFlow &o) const {
-            return RelativeStore::SameSet(resultlinks, o.resultlinks) && live.size() == o.live.size() &&
+            return fills == o.fills && RelativeStore::SameSet(resultlinks, o.resultlinks) &&
+                   live.size() == o.live.size() &&
                    equal(live.begin(), live.end(), o.live.begin(),
                          [](const auto &a, const auto &b) { return a.first == b.first; });
         }
@@ -354,6 +371,7 @@ struct TypeCheck {
         FnSpec *result = nullptr;
         int resultindex = 0;
         bool discarded = false; // Construction is checked, but no live slot receives the value.
+        ArrayLit *repeated = nullptr; // Implicit writes wait for this fill's operand to finish.
         // Set while a block's tail is checked: a link needed this location,
         // so adapting the result must preserve where its bytes are built.
         bool *used = nullptr;
@@ -544,7 +562,7 @@ struct TypeCheck {
     // assignment's location, which is only the slot the value lands in (what
     // the slot holds now is overwritten, so a shrink does not reach it).
     struct Held {
-        Node *node;
+        Node *node; // Null for a link target captured by a repeated fill.
         Val v;
         bool location = false;
         // The builtin (print, str, format) rendering `node`, which runs the
@@ -2804,6 +2822,9 @@ struct TypeCheck {
     void NoteRefPlace(VarDef *vd, const Val &v);
     RefPlace ArgumentPlace(FnSpec *spec, VarDef *param, const vector<Val> &args);
     void RecordElementLinks(const Dest &dest, TypeExpr *type, const ValueLinks &links, Node *at);
+    void StoreElementLink(const Dest &dest, TypeExpr *type, ElementLink link, Node *at,
+                          const Roots &borrowed, string_view path = {});
+    void FinishFill(ArrayLit *fill, const Dest &dest);
     void RecordLinkStore(const Roots &owners, TypeExpr *reached, ElementLink link, Node *at,
                          LinkLocation place = {}, const LinkField &field = {});
     void NoteSlotStore(const StoreEvent &e);
@@ -3157,12 +3178,13 @@ struct TypeCheck {
     // assignment: onexit identifies the receiver's field when known.
     void CheckBuiltUses(Node *rhs, Node *lval, TypeExpr *target, const Roots &built,
                         TypeExpr *arr, const RefPlace *onexit = nullptr);
-    vector<LiveView> DeferredUseViews(VarDef *v, Dot *field, bool apart);
+    vector<LiveView> DeferredUseViews(VarDef *v, Dot *field, const RefPlace &target, bool &apart);
     Alias ReachesBuilt(VarDef *v, VarDef *built, bool exact, Node *lval, TypeExpr *target,
                        TypeExpr *arr, VarDef *&root);
     bool MayHoldBuilt(TypeExpr *y, Node *lval, TypeExpr *target);
     template<typename F, typename G> void EachUse(Node *n, F named, G called);
-    bool FieldsApart(Node *use, Node *lval, TypeExpr *target);
+    TypeExpr *ReadFieldType(Dot *field, Node *base);
+    bool FieldsApart(Node *use, Node *lval, TypeExpr *target, bool onexit);
     bool NamedOutside(FnSpec *spec, vector<VarDef *> &out);
     // Its results for callees whose bodies were all checked, which no
     // later check changes.

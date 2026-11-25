@@ -255,7 +255,10 @@ inline Val ArrayLit::Check(TypeCheck &tc, TypeExpr *expected) {
         // FreezeFill evaluates the operand once, including every field of
         // a relative literal, before writing the first repeated element.
         dest.construction = nullptr;
+        dest.repeated = this;
+        tc.cur.links.fills.erase(this); // A prior iteration may have left the operand by a break.
         auto ev = tc.CheckValueAt(fillval, elem, dest);
+        tc.FinishFill(this, tc.curdst);
         if (cnt && tc.reachable && tc.curdst.construction)
             tc.curdst.construction->started = true;
         if (!elem) {
