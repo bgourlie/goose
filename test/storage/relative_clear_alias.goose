@@ -2,6 +2,12 @@ struct Node { next: Node&<u32>? }
 
 fn clear(nodes: Node[>..]&) { nodes.clear(); }
 
+fn clear_alias(nodes: Node[>..]&, direct: bool) {
+    let alias .= nodes;
+    let another .= alias;
+    if direct { nodes.clear(); } else { another.clear(); }
+}
+
 fn main() {
     var nodes: Node[>..] = [Node {}, Node {}];
     var other: Node[>..] = [Node {}, Node {}];
@@ -19,5 +25,14 @@ fn main() {
     other.push(Node {});
     other.pop_n(1);
     assert(other.len == 0);
+    for direct in [false, true] {
+        nodes.push(Node {});
+        nodes.push(Node {});
+        nodes[0].next .= nodes[1];
+        clear_alias(nodes, direct);
+        nodes.push(Node {});
+        nodes.pop_n(1);
+        assert(nodes.len == 0);
+    }
     print("ok");
 }

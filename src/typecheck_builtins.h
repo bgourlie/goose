@@ -1464,8 +1464,8 @@ inline bool TypeCheck::KillPath(Node *n, VarDef *&base, string &path) {
         auto vd = id->vdef;
         if (!vd || vd->istemp) return false;
         if (IsRefOrSlice(vd->type) && (vd->type->kind != TY_REF || vd->isvar)) return false;
-        auto binding = cur.blockargpaths.find(vd);
-        if (binding == cur.blockargpaths.end()) {
+        auto binding = cur.aliaspaths.find(vd);
+        if (binding == cur.aliaspaths.end()) {
             base = vd;
             path.clear();
         } else {
@@ -1927,6 +1927,13 @@ inline void TypeCheck::AddStoreEvent(const StoreEvent &e) {
     }
     evs.push_back(e);
     origin(evs.size() - 1);
+}
+
+// An immutable binding names the same part of its owner's storage at each use.
+inline void TypeCheck::NoteRefPlace(VarDef *vd, Node *arg, const Val &v) {
+    if (vd->isvar || vd->isglobal || !IsPlainRef(vd->type) || !HasRelRefT(vd->type->ref->sub)) return;
+    if (auto k = ArgumentKill(arg, v, vd->type->ref->sub, true, 0))
+        cur.aliaspaths.emplace(vd, std::move(*k));
 }
 
 // Internal links move with the complete element run. The destination alone

@@ -2635,6 +2635,7 @@ struct TypeCheck {
     // whole assignment's of a value holding no references, and whether those
     // in force empty every slot of a `t` at `base` in container c that can
     // hold a view into an `arr`'s elements, since which event.
+    void NoteRefPlace(VarDef *vd, Node *arg, const Val &v);
     bool KillPath(Node *n, VarDef *&base, string &path);
     std::optional<Kill> OverwrittenPart(Node *n, const Roots &loc, TypeExpr *target, bool relative,
                                         size_t at);
@@ -2950,9 +2951,8 @@ struct TypeCheck {
         // The parts of holders emptied on every path here (Kill), part of
         // the flow state, which a branch joins and a loop's head takes.
         vector<Kill> kills;
-        // Immutable reference parameters of an inlined block that name a
-        // known part of an argument in this activation.
-        map<VarDef *, Kill> blockargpaths;
+        // Immutable reference bindings to a known part of storage in this activation.
+        map<VarDef *, Kill> aliaspaths;
     };
     BodyState cur;
     // The states of the bodies being checked around this one, outermost

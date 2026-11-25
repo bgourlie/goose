@@ -569,6 +569,7 @@ inline Prov TypeCheck::RefProvOf(VarDef *vd) {
 
 inline VarDef *TypeCheck::ResetLocal(VarDef *previous) {
     if (!previous) return ast.NewVarDef();
+    cur.aliaspaths.erase(previous);
     erase_if(cur.links.live, [&](const auto &entry) { return entry.first.owner == previous; });
     // Cached nested specializations capture this identity. Recompute its
     // checking state, but retain the capture discovered on an earlier pass,
@@ -2738,6 +2739,7 @@ inline void TypeCheck::CheckVarDecl(VarDecl *vd, bool global) {
         if (global) CheckVarExtent(d, vd);
         if (v && IsRefOrSlice(t)) {
             BindRefProvenance(d, *v);
+            NoteRefPlace(d, init, *v);
             if (t->cq) d->ref.writable = false;
             // An annotated one's binding FitsAt has noted.
             if (global && !ann && !v->isnull)

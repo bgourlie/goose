@@ -4124,10 +4124,7 @@ inline Val TypeCheck::CheckFunValCall(Call *c, const FnValBind &fb, TypeExpr *ex
         if (IsRefOrSlice(ptypes[i])) {
             BindRefProvenance(vd, argvals[i]);
             if (ptypes[i]->cq) vd->ref.writable = false;
-            if (!vd->isvar && IsPlainRef(ptypes[i]) && HasRelRefT(ptypes[i]->ref->sub)) {
-                if (auto k = ArgumentKill(c->args[i], argvals[i], ptypes[i]->ref->sub, true, 0))
-                    cur.blockargpaths.emplace(vd, std::move(*k));
-            }
+            NoteRefPlace(vd, c->args[i], argvals[i]);
         } else {
             if (argvals[i].elementlinks)
                 RecordElementLinks(RootsOf(vd), ptypes[i], argvals[i].elementlinks, c->args[i]);
@@ -4174,7 +4171,7 @@ inline Val TypeCheck::CheckFunValCall(Call *c, const FnValBind &fb, TypeExpr *ex
     if (needslocation && resultdest.used) *resultdest.used = true;
     PopScope();
     frames.pop_back();
-    for (auto vd : c->fvparams) cur.blockargpaths.erase(vd);
+    for (auto vd : c->fvparams) cur.aliaspaths.erase(vd);
     erase_if(cur.kills, [](const Kill &k) { return !k.relative; });
     // The result has the calling statement's lifetime (§9.2), with no
     // storage to bind by reference even where the tail names a variable.
