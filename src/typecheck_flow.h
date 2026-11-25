@@ -2355,6 +2355,14 @@ inline TypeCheck::LinkEffects TypeCheck::CurrentLinkEffects() {
     return effects;
 }
 
+// An overload probe can evaluate an expression more than once. Restore
+// its relative-link state independently of the ordinary store analysis.
+inline void TypeCheck::RestoreLinks(const LinkEffects &state) {
+    cur.links = state.writes;
+    erase_if(cur.kills, [](const Kill &k) { return k.relative; });
+    cur.kills.insert(cur.kills.end(), state.overwrites.begin(), state.overwrites.end());
+}
+
 inline void TypeCheck::ApplyLinkEffects(const LinkEffects &effects) {
     auto base = storeevents.size();
     for (auto k : effects.overwrites) {

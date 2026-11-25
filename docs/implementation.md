@@ -2147,10 +2147,10 @@ specialization clone's statement list and removes its dead tail. Later
 passes therefore see only checked nodes, without dead-node annotations.
 The source body remains available to other specializations. Pruning uses
 proven exits, never a provisional assumption that recursion cannot return.
-Argument rechecks start from the call's entry reachability, including its
-receiver; an exit found in a later argument during discovery must not erase
-an earlier argument's effects. The continuation still requires the arguments
-to complete, including the dispatch argument that phase 2 does not recheck.
+Argument rechecks start from the call's entry reachability and relative-link
+state, including its receiver. Each argument sees the writes and overwrites
+of the preceding arguments. The continuation requires all arguments to
+complete, including the operand that supplies a dispatch tag.
 
 A `let` declared without an initializer is assigned, or bound with `.=`,
 only where it is not maybe assigned (`NoLetReassign`, §4.4). This is
@@ -3258,8 +3258,8 @@ reports the redundant `&`s as the copy's (`RefCopyWarnings`). At a
 reference parameter, phase 2 warns about the `&`s because the branch binds
 by reference without them. Tag dispatch also binds such a construct at the
 dispatch position by reference. For a construct it dispatches by value,
-which phase 2 does not check again, tag dispatch reports the copy and the
-redundant `&`s noted on it. A member builtin reports those noted on its
+tag dispatch reports the copy and any redundant `&`s. Phase 2 checks that
+operand as the whole enum in its original argument position. A member builtin reports those noted on its
 receiver, which it takes as checked. A function value's declared reference
 parameter takes its provenance from the argument's check against it.
 
@@ -3285,8 +3285,8 @@ and a phase 2 at every level would double the checks per level of nesting:
 depth. The waiting call still does the parts of phase 2 that check nothing:
 it undoes the reference rewrite, marks the copies its parameters take as
 temporaries, and warns about a redundant `&`. Where the outer call takes
-the argument as checked instead (the argument it dispatches on, a member
-builtin's receiver, an argument beside an exemplar's opaque value), it
+the argument as checked instead (a member builtin's receiver or an
+argument beside an exemplar's opaque value), it
 checks the argument again in full first (`CheckWaitingArg`). An error that
 only the waiting phase 2 finds is reported when the outer call checks the
 argument again. So another error in that call, in a later argument, its
