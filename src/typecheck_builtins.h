@@ -400,7 +400,7 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
             Error(c, cat(".move_from takes a slice of ", TypeStr(elem), ", got ", TypeStr(sv.type)));
         if (HasRelRefT(elem))
             Error(c, ".move_from cannot copy elements containing self-relative references");
-        NoteStorageWrite(rv, elem);
+        NoteStorageWrite(rv, elem, rv.refplace);
         AppendedCopies(args[1], sv, elem, rv);
         return VoidVal();
     }
@@ -680,7 +680,7 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
         }
     }
     // Ordinary builtin stores follow evaluation of all their operands.
-    if (d.flags & BF_WRITE) NoteStorageWrite(rv, recvarr, reachable || writesduringargs);
+    if (d.flags & BF_WRITE) NoteStorageWrite(rv, recvarr, rv.refplace, reachable || writesduringargs);
     // A grow-only array shrinks only where nothing can still be rooted in
     // it (§5.1); pop, pop_n and resize also need an element the shrink can
     // find, which a sequential array has not got.
@@ -851,7 +851,7 @@ inline void TypeCheck::CheckByteOut(Call *c, Node *out, const string &form) {
         Error(c, "cannot append through a non-writable value (let, or "
                  "non-writable provenance, §9.5)");
     NoteGrow(c, ov, cat(BuiltinByKind(c->builtin).grows, " ", ExprStr(out)), ot);
-    NoteStorageWrite(ov, ot);
+    NoteStorageWrite(ov, ot, ov.refplace);
 }
 
 // An argument of print/str/format (§3.7): every value type has a text
@@ -941,7 +941,7 @@ inline void TypeCheck::CheckPrintable(Call *c, const char *what, vector<Node *> 
     auto context = ast.New<Call>(c->line, c->callee);
     CheckRenderable(context, what, av.type, a, seen, av, builder);
     // A limited receiver copies this argument's completed text from the temporary.
-    if (receiver && !seen.direct) NoteStorageWrite(*out, receiver);
+    if (receiver && !seen.direct) NoteStorageWrite(*out, receiver, out->refplace);
     // A type that reaches itself through references is rendered below its
     // first level by a function of its own, which runs no format overload
     // (RenderFn): an overload for a part of it needs one for the type.
@@ -1009,7 +1009,7 @@ inline void TypeCheck::CheckRenderable(Call *c, const char *what, TypeExpr *t, N
     // Direct rendering writes a scalar or an aggregate prefix here. A
     // non-null reference forwards to its pointee, and a hook records its own writes.
     if (seen.direct && seen.executes && (t->kind != TY_REF || t->ref->optional))
-        NoteStorageWrite(out, seen.direct);
+        NoteStorageWrite(out, seen.direct, out.refplace);
     // The argument itself, unless an overload takes it whole, is read where
     // it lies, around the overloads its parts run, so that storage stays in
     // use meanwhile (HeldOperands, the argument being rendered).
@@ -1420,8 +1420,8 @@ inline ValueLinks TypeCheck::LiveElementLinks(VarDef *owner, TypeExpr *target, T
             auto &e = storeevents[i];
             if (e.container == owner && e.elementlink &&
                 none_of(cur.kills.begin(), cur.kills.end(), [&](const Kill &k) {
-                    return k.relative && k.container == owner && i < k.at && e.linkfield.Within(k.base, k.path);
-                })) retain(e.elementlink, e.linkfield);
+                    return k.relative && k.container == owner && i < k.at && e.storefield.Within(k.base, k.path);
+                })) retain(e.elementlink, e.storefield);
         }
     }
     return links;
@@ -1992,6 +1992,7 @@ inline void TypeCheck::HolderFromLit(Val &v, const LitDeep &deep) {
     v.elementlinks.Include(deep.elementlinks, IsArrayKind(v.type, A_GROW));
     if (!v.type || !HoldsPlainRef(v.type)) return;
     v.holderset = true;
+    if (v.type->kind == TY_STRUCT && curdst.roots.Exact()) v.recordedholder = curdst.roots.Root();
     v.contents = deep.roots;
     v.byteview = deep.byteview;
 }
@@ -2014,7 +2015,7 @@ inline void TypeCheck::AddStoreEvent(const StoreEvent &e) {
     } else {
         madestores.push_back(e);
         e.container->storedinto = true;
-        NoteSlotStore(e);
+        if (!e.ReadsOwnContents()) NoteSlotStore(e); // A transfer within a holder adds no root.
     }
     if (!e.elementlink && (e.container->type || e.container->isglobal)) return;
     auto spec = CurRealFrame().spec;
@@ -2040,7 +2041,7 @@ inline void TypeCheck::AddStoreEvent(const StoreEvent &e) {
     for (size_t m = 0; m < evs.size(); m++) {
         auto &o = evs[m];
         if (o.container == e.container && o.elementlink == e.elementlink && o.linkparam == e.linkparam &&
-            o.linkfield == e.linkfield &&
+            o.storefield == e.storefield && o.wholecopy == e.wholecopy &&
             o.root == e.root && o.src == e.src &&
             o.exact == e.exact && o.byteview == e.byteview && o.bound == e.bound &&
             o.slot == e.slot && o.sliceref == e.sliceref && !o.pointee == !e.pointee &&
@@ -2055,17 +2056,24 @@ inline void TypeCheck::AddStoreEvent(const StoreEvent &e) {
     origin(evs.size() - 1);
 }
 
-// An immutable binding can retain the field containing its pointee even
-// when writing through the binding only overwrites part of that field.
+// Keep the field containing the pointee even when a write through the
+// binding only overwrites part of that field.
 inline void TypeCheck::NoteRefPlace(VarDef *vd, const Val &v) {
-    if (vd->isvar) return;
+    // A mutable reference's current binding is flow state. Its lifetime
+    // commitment still includes every binding at the committed depth.
+    if (vd->isvar && (!hasdefers || vd->isglobal || !IsAddressRef(vd->type))) return;
     RefPlace place;
     if (vd->type->kind == TY_SLICE && !vd->isglobal) place = v.sliceplace;
-    else if (IsAddressRef(vd->type) && (HasRelRefT(vd->type->ref->sub) ||
-                                        (hasdefers && v.refplace.base)))
-        place = StoragePlace(v, vd->type->ref->sub, v.refplace);
-    else return;
-    // A captured let can be initialized in a shorter-lived scope. Keep
+    else if (IsAddressRef(vd->type) && (hasdefers || HasRelRefT(vd->type->ref->sub))) {
+        auto owners = OwnersAtPlace(v, v.refplace);
+        place = StoragePlace(owners, vd->type->ref->sub, v.refplace);
+        if (hasdefers && !place.base && owners.Exact()) {
+            auto owner = owners.Root();
+            if (owner && owner->type && !IsRefOrSlice(owner->type) && !IsTemp(owner))
+                place = RefPlace { place.location, owner }.Inside();
+        }
+    } else return;
+    // A captured binding can be initialized in a shorter-lived scope. Keep
     // facts expressed in bindings that will still exist wherever it is read.
     if (place.location.param && Depth(place.location.param) > Depth(vd)) place.location.param = nullptr;
     if (place.base && (vd->isglobal || Depth(place.base) > Depth(vd)))
@@ -2124,6 +2132,14 @@ inline void TypeCheck::FinishFill(ArrayLit *fill, const Dest &dest) {
         link.AddTo(dest.repeated ? cur.links.fills[dest.repeated].results : cur.links.resultlinks);
 }
 
+inline LinkField TypeCheck::StoredField(const LinkField &field, const Roots &owners,
+                                        VarDef *root, bool bound) {
+    if (!field.base || bound || !owners.Exact() || owners.Root() != root) return {};
+    if (field.base == root || (field.base->isparam && !field.base->isvar &&
+        field.base->ref.Exact() && field.base->ref.Root() == root)) return field;
+    return {};
+}
+
 inline void TypeCheck::RecordLinkStore(const Roots &owners, TypeExpr *reached,
                                       ElementLink link, Node *at, LinkLocation place, const LinkField &field) {
     if (!reachable || owners.None()) return;
@@ -2133,12 +2149,7 @@ inline void TypeCheck::RecordLinkStore(const Roots &owners, TypeExpr *reached,
         StoreEvent e;
         e.container = d.root;
         e.elementlink = link;
-        // A local alias can bind another subobject on the next iteration.
-        // Keep paths anchored in the owner or a stable parameter of a call.
-        if (field.base && owners.Exact() && !d.bound && owners.Root() == d.root &&
-            (field.base == d.root || (field.base->isparam && !field.base->isvar &&
-             field.base->ref.Exact() && field.base->ref.Root() == d.root)))
-            e.linkfield = field;
+        e.storefield = StoredField(field, owners, d.root, d.bound);
         if (place.param && !link.intail && !d.bound && owners.Exact() &&
             d.root == owners.Root() && d.root == place.param->ref.Root())
             e.linkparam = place.param;
@@ -2208,15 +2219,27 @@ inline void TypeCheck::NoteSlotStore(const StoreEvent &e) {
 // slice has none -- what it points at is its binding -- and neither has a
 // parameter's class root, which stands for storage of the caller's, whose
 // contents are the caller's to know.
+// A write copying a holder's own contents can move a reference between
+// sibling fields without adding an owner. A selected read must follow the
+// unfiltered source, even when this transfer was made through a parameter.
+inline void TypeCheck::RecordHolderTransfer(VarDef *container, TypeExpr *reached) {
+    if (!hasdefers) return;
+    StoreEvent e;
+    e.container = e.src = container;
+    e.reached = reached;
+    AddStoreEvent(e);
+}
+
 inline void TypeCheck::RecordStore(VarDef *container, const Roots &roots, bool byteview,
-                                    TypeExpr *pointee, VarDef *src, TypeExpr *reached,
-                                    bool bound, bool slot, bool sliceref) {
+                                   VarDef *src, TypeExpr *value, const Dest *dest, TypeExpr *reached,
+                                   bool bound) {
     if (!container) return;
     // Putting a container's own read-back contents back into it adds no
     // incoming lifetime. Keep this distinction before discarding src. It
     // may put them into a part a kill emptied, though, as may a store of a
     // value that points nowhere yet, neither on record.
     if (src == container) {
+        RecordHolderTransfer(container, reached);
         DropKills(container);
         return;
     }
@@ -2233,6 +2256,7 @@ inline void TypeCheck::RecordStore(VarDef *container, const Roots &roots, bool b
         // store like any other.
         auto from = a.classread ? a.root : a.from;
         if (!a.exact && from == container && !bound) {
+            RecordHolderTransfer(container, reached);
             DropKills(container);
             continue;
         }
@@ -2244,6 +2268,12 @@ inline void TypeCheck::RecordStore(VarDef *container, const Roots &roots, bool b
         // what it holds (StoreSource).
         auto copied = StoreSource(src);
         e.src = copied;
+        if (dest) {
+            e.storefield = StoredField(dest->field, dest->roots, container, bound);
+            e.wholecopy = e.storefield.base && dest->fieldsteps && copied && copied->type &&
+                          value && TopConstEq(copied->type, value);
+            e.slot = dest->slot;
+        }
         // A reference read back out of a container inexactly (§9.5) points
         // at whatever was stored into that container: its stores are the
         // precise answer, where a bound would implicate every sibling.
@@ -2254,12 +2284,11 @@ inline void TypeCheck::RecordStore(VarDef *container, const Roots &roots, bool b
         // held.
         e.classread = IsClassRoot(e.src) && (copied || a.classread);
         e.exact = a.exact;
-        e.pointee = byteview ? nullptr : pointee;
+        e.pointee = value && IsRefOrSlice(value) && !byteview ? PointeeOf(value) : nullptr;
+        e.sliceref = value && value->kind == TY_REF && PointeeOf(value)->kind == TY_SLICE;
         e.byteview = byteview;
         e.reached = reached;
         e.bound = bound;
-        e.slot = slot;
-        e.sliceref = sliceref;
         if (fitnode) e.at = fitnode->line;
         AddStoreEvent(e);
         if (holds) AddContents(container, a, e.classread, e.src);
@@ -2314,7 +2343,7 @@ inline void TypeCheck::ApplyCalleeStores(FnSpec *spec, vector<Val> &argvals, Nod
     };
     auto push = [&](VarDef *container, const RootAlt &a, TypeExpr *pointee, VarDef *src,
                     bool classread, bool byteview, TypeExpr *reached, bool bound, bool slot,
-                    bool sliceref) {
+                    bool sliceref, const LinkField &field) {
         // A view the storage of one of the caller's classes held, passed as
         // the argument: it holds what that storage holds, as the same value
         // stored here would (RecordStore).
@@ -2322,8 +2351,13 @@ inline void TypeCheck::ApplyCalleeStores(FnSpec *spec, vector<Val> &argvals, Nod
             src = a.root;
             classread = true;
         }
-        if (!container || (src == container && !bound)) return;
+        if (!container) return;
+        if (src == container && !bound) {
+            RecordHolderTransfer(container, reached);
+            return;
+        }
         StoreEvent e;
+        e.storefield = field;
         e.container = container;
         e.root = a.root;
         e.src = src;
@@ -2350,6 +2384,20 @@ inline void TypeCheck::ApplyCalleeStores(FnSpec *spec, vector<Val> &argvals, Nod
             return r;
         }
         return exact ? r : Bounds(r);
+    };
+    auto mapfield = [&](const StoreEvent &e, const Roots &owners) {
+        auto field = e.storefield;
+        if (field.base == e.container && e.container->componentbase) {
+            field.base = ExactComponent(owners);
+            if (!field.base) field = {};
+        } else if (field.base && field.base->ownerspec == spec) {
+            auto part = ArgumentPlace(spec, field.base, argvals);
+            // An indexed argument names the whole array field only as a
+            // containing field. The callee's suffix is inside its element.
+            if (!part.base) field = {};
+            else field = { part.base, part.enclosing ? string(part.path) : cat(part.path, field.path) };
+        }
+        return field;
     };
     // A container the caller can name: its own variables and its lexical
     // parents', a class root, a global. Anything else is the callee's own.
@@ -2545,7 +2593,7 @@ inline void TypeCheck::ApplyCalleeStores(FnSpec *spec, vector<Val> &argvals, Nod
             for (auto &a : r.alts)
                 if (once(e.container, a.root))
                     push(e.container, a, e.pointee, src, classread, e.byteview, e.reached,
-                         e.bound, e.slot, e.sliceref);
+                         e.bound, e.slot, e.sliceref, e.storefield);
             return;
         }
         // Where the argument's root only bounds the storage, or the store
@@ -2580,7 +2628,7 @@ inline void TypeCheck::ApplyCalleeStores(FnSpec *spec, vector<Val> &argvals, Nod
                 }
                 if (once(t.root, a.root))
                     push(t.root, a, e.pointee, src, classread, e.byteview, e.reached, t.bound,
-                         e.slot, e.sliceref);
+                         e.slot, e.sliceref, StoredField(mapfield(e, cr), cr, t.root, t.bound));
             }
             if (e.slot && first)
                 slotstores.push_back({ t.root, t.bound, e,
@@ -2695,7 +2743,14 @@ inline void TypeCheck::ApplyCalleeStores(FnSpec *spec, vector<Val> &argvals, Nod
     // until what they store no longer grows.
     vector<pair<const StoreEvent *, Roots>> held;
     for (auto &e : rec->classevents) {
-        if (e.src == e.container && !e.bound) continue;
+        if (e.ReadsOwnContents()) {
+            auto from = storeevents.size();
+            auto owners = mapped(e.container, true);
+            for (auto &target : ShrinkTargets(owners, e.reached, false))
+                if (target.root) RecordHolderTransfer(target.root, e.reached);
+            tag(from, (int)(&e - rec->classevents.data()));
+            continue;
+        }
         Roots unused;
         if (e.classread && e.src == e.root && !e.exact && classat(e.root, unused) >= 0) {
             held.push_back({ &e, Roots {} });
@@ -2710,18 +2765,8 @@ inline void TypeCheck::ApplyCalleeStores(FnSpec *spec, vector<Val> &argvals, Nod
                 // parameter used to reach the slot supplies its location.
                 place = ArgumentPlace(spec, e.linkparam, argvals).location;
             }
-            auto field = e.linkfield;
             auto owners = mapped(e.container, !e.bound);
-            if (field.base == e.container && e.container->componentbase) {
-                field.base = ExactComponent(owners);
-                if (!field.base) field = {};
-            } else if (field.base && field.base->ownerspec == spec) {
-                auto part = ArgumentPlace(spec, field.base, argvals);
-                // An indexed argument names the whole array field only as a
-                // containing field. The callee's suffix is inside its element.
-                if (!part.base) field = {};
-                else field = { part.base, part.enclosing ? string(part.path) : cat(part.path, field.path) };
-            }
+            auto field = mapfield(e, owners);
             RecordLinkStore(owners, e.reached, e.elementlink, at, place, field);
         } else {
             applystore(e, mapped(e.root, e.exact), true);
@@ -2851,7 +2896,7 @@ inline void TypeCheck::CheckGlobalShrinks() {
     map<VarDef *, vector<size_t>> bycontainer;
     map<VarDef *, set<pair<ElementLink, LinkField>>> globallinks;
     for (auto &e : storeevents)
-        if (e.elementlink && e.container->isglobal) globallinks[e.container].emplace(e.elementlink, e.linkfield);
+        if (e.elementlink && e.container->isglobal) globallinks[e.container].emplace(e.elementlink, e.storefield);
     for (size_t i = 0; i < madestores.size(); i++)
         bycontainer[madestores[i].container].push_back(i);
     for (auto &gs : globalshrinks) CheckItem([&] {
@@ -3639,7 +3684,7 @@ inline void TypeCheck::NoteLiveViews(Node *at, const string &prefix, VarDef *roo
             out.push_back({ sv, sub->sub, true });
             if (growonly && HoldsPlainRef(sub->sub)) HeldViews(sv, sub->sub, isvar, out);
         } else if (growonly && HoldsPlainRef(sub)) {
-            HeldViews(p, sub, isvar, out, nullptr, nullptr, base, arrtype);
+            HeldViews(p, sub, isvar, out, nullptr, {}, nullptr, base, arrtype);
         }
         return out;
     };
@@ -3721,11 +3766,11 @@ inline void TypeCheck::NoteLiveViews(Node *at, const string &prefix, VarDef *roo
 // the holders followed so far.
 inline void TypeCheck::RecordedViews(VarDef *h, size_t from, TypeExpr *ht,
                                      vector<LiveView> &out, set<VarDef *> &seen,
-                                     span<const pair<TypeExpr *, bool>> slots) {
+                                     span<const pair<TypeExpr *, bool>> slots, const RefPlace &selected) {
     // Following a selected field can lead back to this holder. That read
     // may see slots outside the initial selection.
     if (slots.empty() && !seen.insert(h).second) return;
-    EachHolderRoot(h, from, [&](const StoreEvent &e) {
+    EachHolderRoot(h, from, selected, [&](const StoreEvent &e) {
         if (e.pointee && !slots.empty() && none_of(slots.begin(), slots.end(),
                 [&](const auto &slot) { return MaySameType(e.pointee, slot.first); })) return;
         if (e.classread) {
@@ -3803,8 +3848,8 @@ inline void TypeCheck::StoredViews(VarDef *r, bool exact, TypeExpr *pointee, boo
 // not show yet may have moved to another holder at that depth
 // (HeldRefsMayPointInto). A global holder is judged with the globals.
 inline void TypeCheck::HeldViews(const Prov &p, TypeExpr *held, bool isvar,
-                                 vector<LiveView> &out, TypeExpr *field, const TempHolds *temps,
-                                 VarDef *base, TypeExpr *arrtype) {
+                                 vector<LiveView> &out, TypeExpr *field, const RefPlace &selected,
+                                 const TempHolds *temps, VarDef *base, TypeExpr *arrtype) {
     vector<TypeExpr *> pointees;
     ReachedThroughRefs(field ? field : held, pointees);
     vector<pair<TypeExpr *, bool>> slots;
@@ -3821,11 +3866,11 @@ inline void TypeCheck::HeldViews(const Prov &p, TypeExpr *held, bool isvar,
                        KilledFor(r, base, held, arrtype, since);
         auto from = emptied ? std::max(LiveEventBase(r), since) : LiveEventBase(r);
         if (a.exact && r->type && !IsRefOrSlice(r->type) && !isvar) {
-            RecordedViews(r, from, r->type, out, seen, slots);
+            RecordedViews(r, from, r->type, out, seen, slots, selected);
             continue;
         }
         if ((a.exact || a.classread) && IsClassRoot(r) && !isvar) {
-            RecordedViews(r, from, held, out, seen, slots);
+            RecordedViews(r, from, held, out, seen, slots, selected);
             if (emptied) continue;
             Prov cv;
             cv.Set(r, true);
@@ -3857,21 +3902,37 @@ inline void TypeCheck::HeldViews(const Prov &p, TypeExpr *held, bool isvar,
 // What came out of the storage of a parameter's class alone (StoreEvent::
 // classread) holds what the activation stored there, followed as a copy's
 // source is, and what the callers did, which f takes the event for.
-template<typename F> void TypeCheck::EachHolderRoot(VarDef *holder, size_t from, F f) {
-    set<VarDef *> seen;
-    function<void(VarDef *, size_t)> walk = [&](VarDef *h, size_t start) {
-        if (!seen.insert(h).second) return;
+template<typename F> void TypeCheck::EachHolderRoot(VarDef *holder, size_t from,
+                                                    const RefPlace &selected, F f) {
+    set<tuple<VarDef *, VarDef *, string_view>> seen;
+    auto walk = [&](auto &&self, VarDef *h, size_t start, const RefPlace &read) -> void {
+        if (!seen.emplace(h, read.base, read.path).second) return;
         if (h->type && ClassOf(h->type) == SC_ROOT)
-            for (auto c : h->components) if (c) walk(c, start);
+            for (auto c : h->components) if (c) self(self, c, start, read);
         for (auto i = start; i < storeevents.size(); i++) {
             auto e = storeevents[i];
             if (e.container != h || StoredLater(i)) continue;
+            auto &field = e.storefield;
+            if (read.base && read.base == field.base &&
+                !FieldPathWithin(read.path, field.path) && !FieldPathWithin(field.path, read.path)) continue;
+            if (e.ReadsOwnContents()) {
+                self(self, h, 0, {});
+                continue;
+            }
             if (e.src && !e.src->isglobal && e.src->type) {
-                walk(e.src, 0);
+                // Reading a copied struct field reads the same field of its
+                // source. An indirect source may have supplied any slot.
+                RefPlace source;
+                if (e.wholecopy && read.base && read.base == field.base &&
+                    FieldPathWithin(read.path, field.path)) {
+                    source.base = e.src;
+                    source.path = read.path.substr(field.path.size());
+                }
+                self(self, e.src, 0, source);
                 continue;
             }
             if (e.classread) {
-                walk(e.src, 0);
+                self(self, e.src, 0, {});
                 f(e);
                 continue;
             }
@@ -3886,7 +3947,7 @@ template<typename F> void TypeCheck::EachHolderRoot(VarDef *holder, size_t from,
             if (e.root) f(e);
         }
     };
-    walk(holder, from);
+    walk(walk, holder, from, selected);
 }
 
 // A shrink of ls.shrunk while what ls.live roots is still used, both as the
@@ -4078,7 +4139,7 @@ inline void TypeCheck::ApplyCalleeLiveShrinks(Node *at, FnSpec *spec, vector<Val
                     lp.alts = { la };
                     lp.byteview = orig.byteview;
                     vector<LiveView> vs;
-                    HeldViews(lp, held, false, vs, nullptr, &temps);
+                    HeldViews(lp, held, false, vs, nullptr, {}, &temps);
                     for (auto &w : vs) {
                         for (auto &b : w.p.alts) {
                             auto x = ls;
@@ -4435,7 +4496,9 @@ inline void TypeCheck::ApplyCalleeShrinks(Node *at, FnSpec *spec, vector<Val> &a
 }
 
 inline bool TypeCheck::BuiltInPlace(TypeExpr *elem) {
-    return ClassOf(elem) != SC_FIXED || (elem->kind != TY_REF && HasRelRefT(elem, true));
+    auto cls = ClassOf(elem);
+    return cls != SC_FIXED ||
+           FixedResultNeedsLocation(elem, cls, [&](TypeExpr *t) { return FieldRuns(t); });
 }
 
 // A T[k] of the receiver's elements, or a T[] where they are not
@@ -4673,6 +4736,9 @@ inline vector<TypeCheck::LiveView> TypeCheck::DeferredUseViews(VarDef *v, Dot *f
     for (auto d = field; d; d = Is<Dot>(d->obj)) fields.push_back(d);
     auto place = ref ? (v->type->kind == TY_SLICE ? v->SlicePlace() : v->PointeePlace())
                      : RefPlace { {}, v };
+    // This walk visits the whole defer, which can itself rebind a var
+    // between two reads. Only its stable bindings identify field paths.
+    if (ref && v->isvar) place = {};
     auto projected = storage;
     auto selected = t;
     for (auto it = fields.rbegin(); it != fields.rend(); ++it) {
@@ -4691,7 +4757,7 @@ inline vector<TypeCheck::LiveView> TypeCheck::DeferredUseViews(VarDef *v, Dot *f
         if (direct && !apart) views.push_back({ where, type });
         auto read = readfield ? readfield : type;
         if (!HoldsPlainRef(read)) return;
-        HeldViews(where, type, false, views, readfield);
+        HeldViews(where, type, false, views, readfield, readfield ? place : RefPlace {});
         if (v->isglobal) {
             Prov global;
             global.Set(v, false);
@@ -4802,7 +4868,7 @@ inline void TypeCheck::CheckBuiltUses(Node *rhs, Node *lval, TypeExpr *target,
     auto use = [&](Node *at, VarDef *v, Dot *field, const string &how, const string &via) {
         if (field && FieldsApart(field, lval, target, onexit != nullptr)) return;
         check(at, v, how, via, field);
-        if (field) checkread(at, v, field, how, via);
+        if (field && !onexit) checkread(at, v, field, how, via);
         // Root fields have independent owners. DeferredUseViews already
         // checks the selected components on an exit.
         if (!onexit && !v->components.empty()) {

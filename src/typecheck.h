@@ -173,11 +173,8 @@ struct TypeCheck {
         vector<OuterFn> fns;
     };
 
-    // A function body's exits as its caller's flow sees them (§4.4): the
-    // variables outside it that it can name and were unassigned when its
-    // check began -- the ones it may assign -- whether each is assigned at
-    // every exit reached so far and may be at any of them (NoteExit), and
-    // whether it may have been when the check began.
+    // Across the body's exits, join definite assignment of its captures
+    // and the current places of rebindable references (NoteExit).
     struct BodyExits {
         vector<VarDef *> vars;
         vector<bool> assigned, maybeassigned, maybeonentry;
@@ -309,7 +306,7 @@ struct TypeCheck {
         };
         map<ArrayLit *, FillLinks> fills;
         void Add(const StoreEvent &e, size_t index) {
-            live[{e.container, e.elementlink, e.linkfield, e.linkclass}] = index;
+            live[{e.container, e.elementlink, e.storefield, e.linkclass}] = index;
         }
         void Join(const LinkFlow &other) {
             for (auto &link : other.resultlinks) link.AddTo(resultlinks);
@@ -419,15 +416,17 @@ struct TypeCheck {
         bool viaclass;
     };
     struct DeferEnv;
-    struct DeferredLinks {
-        Block *body = nullptr;
+    struct DeferEffects {
+        Defer *statement = nullptr;
+        vector<FnRecord::StorageWrite> writes;
+        vector<pair<VarDef *, RefPlace>> bindings; // Captures rebound on normal completion.
         vector<pair<LinkShrink, LinkEffects>> shrinks;
         LinkEffects exit;
         bool completes = true;
         shared_ptr<DeferEnv> env;
     };
     struct Scope {
-        vector<DeferredLinks> defers;
+        vector<DeferEffects> defers;
         int kind = SK_PLAIN;
         int serial = 0;              // Unique per scope opened: tells a later one at its index apart.
         int varbase = 0;
@@ -635,6 +634,17 @@ struct TypeCheck {
         Dest d;
         d.result = spec;
         d.resultindex = index;
+        // A fixed placed result is built by its return expression. Collect
+        // its actual stores, including those before a return that aborts.
+        if (hasdefers && spec && spec == CurRealFrame().spec && spec->sf->has_rets &&
+            (size_t)index < spec->rets.size()) {
+            auto t = spec->rets[index];
+            if (ClassOf(t) == SC_FIXED && BuiltInPlace(t)) {
+                auto &writing = cur.fixedresults[index];
+                writing.literal = true;
+                d.construction = &writing;
+            }
+        }
         return d;
     }
     bool RelativeDestination(const Roots &source, Dest dest, TypeExpr *pointee, Node *at,
@@ -2636,19 +2646,21 @@ struct TypeCheck {
     unordered_map<Defer *, set<const VarDef *>> deferwrites;
     vector<EnvRead> DeferBindings(Defer *d);
     static void CalledSpecs(Node *n, vector<FnSpec *> &to);
-    void NoteStorageWrite(const Roots &storage, TypeExpr *type, bool canwrite);
-    void NoteStorageWrite(const Roots &storage, TypeExpr *type) {
-        NoteStorageWrite(storage, type, reachable);
+    static Roots OwnersAtPlace(const Roots &storage, const RefPlace &place);
+    void RecordStorageWrite(FnRecord::StorageWrite write, Defer *executing = nullptr);
+    void NoteStorageWrite(const Roots &storage, TypeExpr *type, const RefPlace &place, bool canwrite);
+    void NoteStorageWrite(const Roots &storage, TypeExpr *type, const RefPlace &place = {}) {
+        NoteStorageWrite(storage, type, place, reachable);
     }
-    void NoteCallConstruction(const vector<TypeExpr *> &results);
+    void NoteCallConstruction(const vector<TypeExpr *> &results, const FnSpec *callee = nullptr);
     void ApplyCalleeWrites(FnSpec *spec, const vector<Val> &args);
     void CheckDefer(Defer *d);
-    DeferredLinks CheckDeferredBody(Defer *d);
-    void RefreshDeferredBody(DeferredLinks &effects);
+    DeferEffects CheckDeferredBody(Defer *d);
+    void RefreshDeferredBody(DeferEffects &effects);
     LinkEffects CurrentLinkEffects();
     void ApplyLinkEffects(const LinkEffects &effects);
     void CheckLinkShrink(const LinkShrink &shrink);
-    void ExitLinkDefers(int first, span<const FnRecord::InterruptedAssign> interrupted = {});
+    void RunExitDefers(int first, span<const FnRecord::InterruptedAssign> interrupted = {});
     vector<FnRecord::InterruptedAssign> CheckExitScopes(int first, Node *at, bool outer = false,
             vector<FnRecord::InterruptedAssign> interrupted = {});
     bool InDeferBody();
@@ -2837,9 +2849,11 @@ struct TypeCheck {
     // A store of what points at `roots` (a reference's, or a holder's
     // contents) into container: one event per root, the container's
     // contents updated (§9.2).
-    void RecordStore(VarDef *container, const Roots &roots, bool byteview, TypeExpr *pointee,
-                     VarDef *src = nullptr, TypeExpr *reached = nullptr, bool bound = false,
-                     bool slot = false, bool sliceref = false);
+    LinkField StoredField(const LinkField &field, const Roots &owners, VarDef *root, bool bound);
+    void RecordHolderTransfer(VarDef *container, TypeExpr *reached);
+    void RecordStore(VarDef *container, const Roots &roots, bool byteview, VarDef *src = nullptr,
+                     TypeExpr *value = nullptr, const Dest *dest = nullptr, TypeExpr *reached = nullptr,
+                     bool bound = false);
     // Whether a holder may hold a reference into arr: `hit` takes the index
     // of the event that says so, `via` the type of the slot a reference
     // stored there refers to where it leads into arr only through what that
@@ -3005,7 +3019,8 @@ struct TypeCheck {
     // (TempContents).
     using TempHolds = vector<pair<VarDef *, Roots>>;
     void RecordedViews(VarDef *h, size_t from, TypeExpr *ht, vector<LiveView> &out,
-                       set<VarDef *> &seen, span<const pair<TypeExpr *, bool>> slots = {});
+                       set<VarDef *> &seen, span<const pair<TypeExpr *, bool>> slots = {},
+                       const RefPlace &selected = {});
     void StoredViews(VarDef *r, bool exact, TypeExpr *pointee, bool sliceref, bool byteview,
                      TypeExpr *ht, vector<LiveView> &out, set<VarDef *> &seen);
     // `base`: the `let` reference or parameter p is the binding of, whose
@@ -3013,9 +3028,9 @@ struct TypeCheck {
     // `arrtype` to the stores since. A selected field limits which of the
     // holder's reference slots the read can follow.
     void HeldViews(const Prov &p, TypeExpr *held, bool isvar, vector<LiveView> &out,
-                   TypeExpr *field = nullptr, const TempHolds *temps = nullptr,
+                   TypeExpr *field = nullptr, const RefPlace &selected = {}, const TempHolds *temps = nullptr,
                    VarDef *base = nullptr, TypeExpr *arrtype = nullptr);
-    template<typename F> void EachHolderRoot(VarDef *holder, size_t from, F f);
+    template<typename F> void EachHolderRoot(VarDef *holder, size_t from, const RefPlace &selected, F f);
     bool NoteLiveShrink(LiveShrink ls, FnSpec *current);
     void ApplyCalleeLiveShrinks(Node *at, FnSpec *spec, vector<Val> &argvals, string_view name);
     // A growth of the array rooted at root -- a push, an append, a pool
@@ -3051,6 +3066,7 @@ struct TypeCheck {
     // from the summary. A function value's body is checked in its call's
     // statement and keeps it (CheckFunValCall).
     struct BodyState {
+        map<int, Construction> fixedresults;
         Rebuild *rebuild = nullptr;
         // The node being checked and every node it is nested in (PathEntry).
         vector<PathEntry> nodepath;
@@ -3088,7 +3104,7 @@ struct TypeCheck {
         vector<RelativeStore> interruptedresults;
         // (program event, summary index) for ordinary class writes in this body.
         vector<pair<size_t, int>> classwrites;
-        DeferredLinks *deferring = nullptr; // Relative effects of the defer body being checked.
+        DeferEffects *deferring = nullptr; // Storage effects of the defer body being checked.
         // The parts of holders emptied on every path here (Kill), part of
         // the flow state, which a branch joins and a loop's head takes.
         vector<Kill> kills;

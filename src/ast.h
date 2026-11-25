@@ -925,6 +925,7 @@ struct Val : Prov {
     // store events describe its contents exactly; none where it may lie in
     // any of several, or anywhere a root only bounds (TypeCheck::HolderSource).
     VarDef *holderfrom = nullptr;
+    VarDef *recordedholder = nullptr; // A struct literal already recorded its field stores here.
     FnValBind fnv;               // When type is TY_FN.
 
     bool HasResultType() const { return type && type->kind != TY_VOID; }
@@ -1912,7 +1913,7 @@ struct VarDef {
     // A global's position in ast.globals' definitions (TypeCheck::NoteNarrowed).
     int globalindex = 0;
     bool isparam = false;
-    RefPlace refplace;       // Pointee or viewed elements of a stable binding.
+    RefPlace refplace;       // Pointee or viewed elements known on this control-flow path.
     RefPlace SlicePlace() const { return slotref ? RefPlace {} : refplace; }
     RefPlace PointeePlace() {
         auto place = refplace;
@@ -2162,6 +2163,13 @@ template<typename R> bool HasRelRefOf(TypeExpr *t, bool inpool, R runs) {
     }
 }
 
+// A fixed result can write existing caller storage during evaluation only
+// when its embedded offsets require that location. Other fixed results are
+// delivered as completed values (including pointer-ABI copies to fresh slots).
+template<typename R> bool FixedResultNeedsLocation(TypeExpr *t, SizeClass cls, R runs) {
+    return cls == SC_FIXED && t->kind != TY_REF && HasRelRefOf(t, true, runs);
+}
+
 // Named storage used implicitly by a checked type: relative-reference bases
 // and index/bound lengths. The callback's flag distinguishes mutable lengths
 // from stable bases. The caller retains seen across a body if desired.
@@ -2359,7 +2367,8 @@ struct StoreEvent {
     // Links within this owner's storage, from either a relative store or a
     // verified element run. Mapping this event requires only the destination.
     ElementLink elementlink;
-    LinkField linkfield;  // The part containing the written slot, when known.
+    LinkField storefield;  // The part containing the written slot, when known.
+    bool wholecopy = false; // An entire holder copied to this exact field.
     VarDef *linkparam = nullptr; // Direct destination parameter, even when parameters share a class.
     int linkclass = -1;          // Its index in the current body's class-store summary.
     // What was stored: a reference to something rooted at `root`, or (a
@@ -2405,6 +2414,7 @@ struct StoreEvent {
     // one array exactly (RootArg::heldexact): its class only bounds them, and
     // no store in the body put them there.
     bool incoming = false;
+    bool ReadsOwnContents() const { return src && src == container && !bound; }
 };
 
 // A shrink, and a reference, slice or holder still used after it that only
@@ -2554,6 +2564,7 @@ struct FnRecord {
         bool exact, indirect;
     };
     vector<StorageWrite> storagewrites;
+    set<int> writtenfixedresults; // Placed fixed results a return expression may have started.
     // Whether this specialization can resume its immediate Goose caller.
     // A return-from to an outer body does not, although its C function returns
     // normally to propagate that exit. Unknown recursive calls may return.

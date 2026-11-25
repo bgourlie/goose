@@ -21,7 +21,7 @@ inline void TypeCheck::PushScope(int kind, Node *node) {
 }
 
 inline void TypeCheck::PopScope() {
-    if (reachable) ExitLinkDefers((int)scopes.size() - 1);
+    if (reachable) RunExitDefers((int)scopes.size() - 1);
     auto &s = scopes.back();
     // A `var x = []` that nothing ever pushed into has no type to give
     // codegen; the scope ending is the last chance to say so.
@@ -1071,9 +1071,19 @@ inline void TypeCheck::NarrowCond(Node *cond, bool sense) {
 // value's, and the binding is a store like any other for the shrink rules,
 // made where the initializer is.
 inline void TypeCheck::NoteHolderBinding(VarDef *d, const Val &v, Node *at) {
+    if (Is<StructLit>(at) && v.recordedholder == d) {
+        // Its fields have already recorded their stores at d. An inferred
+        // binding only now has a type, so finish its aggregate provenance.
+        auto roots = ContentsOf(v);
+        d->contents.unknown |= roots.unknown;
+        d->contentbyteview |= v.byteview;
+        for (auto &a : roots.alts) AddContents(d, a, a.classread, a.from);
+        return;
+    }
     auto saved = fitnode;
     fitnode = at;
-    RecordStore(d, ContentsOf(v), v.byteview, nullptr, v.holderfrom);
+    Dest dest(d);
+    RecordStore(d, ContentsOf(v), v.byteview, v.holderfrom, IsRefOrSlice(v.type) ? nullptr : v.type, &dest);
     fitnode = saved;
 }
 
@@ -1690,7 +1700,7 @@ inline Val TypeCheck::CheckMatch(MatchExpr *m, TypeExpr *expected, bool wantvalu
                             for (auto &a : held.alts) a.slotread = true;
                         auto saved = fitnode;
                         fitnode = m;
-                        RecordStore(binder, held, sv.byteview, nullptr,
+                        RecordStore(binder, held, sv.byteview,
                                     intemp ? contents.from : HolderSource(sv));
                         fitnode = saved;
                     }
@@ -1907,7 +1917,7 @@ inline TypeCheck::Scope TypeCheck::CheckLoopPasses(Node *x, FlowState &head,
         cur.looppasses.push_back({ (int)scopes.size(), firstbase, storeevents.size(), settled });
         PushScope(SK_LOOP, x);
         pass();
-        if (reachable) ExitLinkDefers((int)scopes.size() - 1);
+        if (reachable) RunExitDefers((int)scopes.size() - 1);
         scopes.back().defers.clear();
         auto &s = scopes.back();
         if (reachable) {
@@ -2162,7 +2172,7 @@ inline void TypeCheck::CheckFor(ForLoop *x) {
                 for (auto &a : held.alts) a.slotread = true;
             auto saved = fitnode;
             fitnode = x;
-            RecordStore(vd, held, iterprov.byteview, nullptr,
+            RecordStore(vd, held, iterprov.byteview,
                         intemp ? contents.from : HolderSource(iterprov));
             fitnode = saved;
         }
@@ -2376,7 +2386,7 @@ inline vector<EnvRead> TypeCheck::DeferBindings(Defer *d) {
     return bindings;
 }
 
-inline TypeCheck::DeferredLinks TypeCheck::CheckDeferredBody(Defer *d) {
+inline TypeCheck::DeferEffects TypeCheck::CheckDeferredBody(Defer *d) {
     auto saved = SaveFlow();
     for (auto &e : saved.locals)
         if (e.var->isvar) e.var->narrowed = nullptr;
@@ -2384,8 +2394,8 @@ inline TypeCheck::DeferredLinks TypeCheck::CheckDeferredBody(Defer *d) {
         for (auto v : g->defs)
             if (v->isvar) v->narrowed = nullptr;
     PushScope(SK_DEFER, d);
-    DeferredLinks effects;
-    effects.body = d->body;
+    DeferEffects effects;
+    effects.statement = d;
     {
         Saved collecting(cur.deferring, &effects);
         Saved<Rebuild *> active(cur.rebuild, nullptr); // Checked now, executed on scope exit.
@@ -2396,16 +2406,19 @@ inline TypeCheck::DeferredLinks TypeCheck::CheckDeferredBody(Defer *d) {
         deferbodies--;
         effects.exit = CurrentLinkEffects();
         effects.completes = reachable;
+        if (reachable) for (auto &e : saved.locals)
+            if (e.state.refplace != e.var->refplace)
+                effects.bindings.emplace_back(e.var, e.var->refplace);
     }
     PopScope();
     RestoreFlow(saved);
     return effects;
 }
 
-// Ref/holder provenance grows as later bindings are checked. Usually the
-// declaration-time summary still applies. If an owner changed, resolve the
-// body with the enlarged roots and its original lexical environment.
-inline void TypeCheck::RefreshDeferredBody(DeferredLinks &effects) {
+// Reuse the summary while its inputs match. A different binding on this
+// exit can change the owner read or written, even when the set of possible
+// lifetime roots has stayed the same.
+inline void TypeCheck::RefreshDeferredBody(DeferEffects &effects) {
     auto env = effects.env;
     if (!env || none_of(env->bindings.begin(), env->bindings.end(), [](const EnvRead &r) {
             return r.ref != r.var->ref || r.contents != r.var->contents ||
@@ -2424,10 +2437,11 @@ inline void TypeCheck::RefreshDeferredBody(DeferredLinks &effects) {
         Saved ps(cur.nodepath, env->path);
         scopes.back().defers.resize(env->ndefers);
         RestoreFlow(env->entry);
-        auto updated = CheckDeferredBody(env->body);
-        effects.shrinks = std::move(updated.shrinks);
-        effects.exit = std::move(updated.exit);
-        effects.completes = updated.completes;
+        // The declarations and narrowing are those at registration. The
+        // references those declarations hold are the ones on this exit.
+        for (auto &e : exit.locals)
+            if (InScope(e.var, e.index)) e.var->refplace = e.state.refplace;
+        effects = CheckDeferredBody(env->body);
         // The new binding may itself lead to a holder whose contents can change.
         effects.env = make_shared<DeferEnv>(*env);
         effects.env->bindings = DeferBindings(env->body);
@@ -2458,13 +2472,14 @@ inline void TypeCheck::ApplyLinkEffects(const LinkEffects &effects) {
     }
 }
 
-inline void TypeCheck::ExitLinkDefers(int first, span<const FnRecord::InterruptedAssign> interrupted) {
+inline void TypeCheck::RunExitDefers(int first, span<const FnRecord::InterruptedAssign> interrupted) {
     if (!reachable) return;
     for (auto i = (int)scopes.size(); i-- > first;) {
         for (auto it = scopes[i].defers.rbegin(); it != scopes[i].defers.rend(); ++it) {
             RefreshDeferredBody(*it);
+            for (auto &write : it->writes) RecordStorageWrite(write, it->statement);
             for (auto &a : interrupted)
-                CheckBuiltUses(it->body, a.lval, a.type, a.owners, ResizableArrayIn(a.type), &a.place);
+                CheckBuiltUses(it->statement->body, a.lval, a.type, a.owners, ResizableArrayIn(a.type), &a.place);
             for (auto &[shrink, before] : it->shrinks) {
                 Saved links(cur.links, cur.links);
                 Saved kills(cur.kills, cur.kills);
@@ -2475,6 +2490,7 @@ inline void TypeCheck::ExitLinkDefers(int first, span<const FnRecord::Interrupte
                 reachable = false;
                 return;
             }
+            for (auto &[v, place] : it->bindings) v->refplace = place;
             ApplyLinkEffects(it->exit);
         }
     }
@@ -2490,7 +2506,7 @@ inline vector<FnRecord::InterruptedAssign> TypeCheck::CheckExitScopes(
         auto place = StoragePlace(r->receiver, r->type, r->receiver.place);
         FnRecord::InterruptedAssign { r->lval, r->type, r->receiver, place }.AddTo(interrupted);
     }
-    ExitLinkDefers(first, interrupted);
+    RunExitDefers(first, interrupted);
     if (!reachable) return {};
     for (auto &a : interrupted) {
         erase_if(a.owners.alts, [&](const RootAlt &owner) {
@@ -2538,35 +2554,46 @@ inline void TypeCheck::NoteDeferMention(VarDef *v) {
     }
 }
 
-// The destination of an actual write. A read or the creation of a writable
-// reference alone does not change the named result. Writes in a named callee
-// are recorded on its external roots and mapped when a defer calls it.
-inline void TypeCheck::NoteStorageWrite(const Roots &storage, TypeExpr *type, bool canwrite) {
+// A binding can have several lifetime roots at this depth, while its
+// current field or element belongs to a single known owner on this path.
+inline Roots TypeCheck::OwnersAtPlace(const Roots &storage, const RefPlace &place) {
+    if (place.base && !storage.Exact())
+        for (auto &a : storage.alts)
+            if (a.root == place.base && a.exact) {
+                Roots owner;
+                owner.Add(a);
+                return owner;
+            }
+    return storage;
+}
+
+// Collect a deferred write while checking the body. Publish it when that
+// defer runs, either to an enclosing defer or to the executing function.
+inline void TypeCheck::RecordStorageWrite(FnRecord::StorageWrite write, Defer *executing) {
+    auto spec = CurRealFrame().spec;
+    if (!spec || !write.root || write.root->isglobal || IsTemp(write.root)) return;
+    if (!cur.deferring && write.root->ownerspec == spec) {
+        if (executing) deferwrites[executing].insert(write.root);
+        return;
+    }
+    auto &writes = cur.deferring ? cur.deferring->writes : spec->record.storagewrites;
+    for (auto &w : writes)
+        if (w.root == write.root && w.exact == write.exact && w.indirect == write.indirect &&
+            TypeEq(w.type, write.type)) return;
+    writes.push_back(write);
+}
+
+inline void TypeCheck::NoteStorageWrite(const Roots &storage, TypeExpr *type, const RefPlace &place,
+                                        bool canwrite) {
     if (!hasdefers || !canwrite) return;
-    auto &frame = CurRealFrame();
-    auto spec = frame.spec;
-    if (!spec) return;
-    auto note = [&](VarDef *root, bool exact, bool indirect) {
-        if (!root || root->isglobal || IsTemp(root)) return;
-        if (deferbodies && root->ownerspec == spec) {
-            for (auto i = frame.scopebase; i < (int)scopes.size(); i++)
-                if (scopes[i].kind == SK_DEFER)
-                    deferwrites[(Defer *)scopes[i].node].insert(root);
-        }
-        if (root->ownerspec == spec) return;
-        auto &writes = spec->record.storagewrites;
-        for (auto &w : writes)
-            if (w.root == root && w.exact == exact && w.indirect == indirect && TypeEq(w.type, type)) return;
-        writes.push_back({ root, type, exact, indirect });
-    };
-    for (auto &a : storage.alts) {
+    for (auto &a : OwnersAtPlace(storage, place).alts) {
         if (!a.root || a.root->isglobal) continue; // No global can point into the local result.
         if (a.exact || IsClassRoot(a.root)) {
-            note(a.root, a.exact, !a.exact && a.from == a.root);
+            RecordStorageWrite({ a.root, type, a.exact, !a.exact && a.from == a.root });
         } else {
             // A lifetime bound can cover more than one storage owner.
             auto candidates = RootCandidates(type, Depth(a.root), false, true, true);
-            for (auto &c : candidates.alts) note(c.root, c.exact, false);
+            for (auto &c : candidates.alts) RecordStorageWrite({ c.root, type, c.exact, false });
         }
     }
 }
@@ -2576,7 +2603,7 @@ inline void TypeCheck::ApplyCalleeWrites(FnSpec *spec, const vector<Val> &args) 
     if (spec->sf->isextern) {
         for (size_t p = 0; p < args.size() && p < spec->argtypes.size(); p++) {
             auto t = spec->argtypes[p];
-            if (IsRefOrSlice(t) && !t->cq) NoteStorageWrite(args[p], PointeeOf(t));
+            if (IsRefOrSlice(t) && !t->cq) NoteStorageWrite(args[p], PointeeOf(t), args[p].refplace);
         }
         return;
     }
@@ -2584,6 +2611,15 @@ inline void TypeCheck::ApplyCalleeWrites(FnSpec *spec, const vector<Val> &args) 
     if (!rec) return;
     for (auto &w : rec->storagewrites) {
         auto roots = MapClass(spec, w.root, args);
+        // Several formals can share a lifetime class. Only narrow the
+        // write to an argument where that formal alone names the class.
+        bool view = false;
+        auto p = ClassParam(spec, w.root, view);
+        if (!roots.Exact() && !view && p >= 0 && (size_t)p < args.size() && IsAddressRef(spec->argtypes[p]) &&
+            spec->params[p]->ref.Root() == w.root &&
+            count_if(spec->params.begin(), spec->params.end(),
+                     [&](VarDef *v) { return v->ref.Root() == w.root; }) == 1)
+            roots = OwnersAtPlace(roots, args[p].refplace);
         if (!w.exact) {
             auto owner = HolderSource(roots);
             Roots contents;
@@ -3026,9 +3062,9 @@ inline Val TypeCheck::CheckAssignedValue(Assign *a, TypeExpr *target, TypeExpr *
     Construction construction {};
     if (hasdefers && IsAggregate(target)) {
         auto cls = ClassOf(target);
-        if (cls == SC_RESIZABLE) NoteStorageWrite(built, target);
+        if (cls == SC_RESIZABLE) NoteStorageWrite(built, target, built.place);
         if (cls == SC_FIXED) {
-            construction.literal = HasRelRefT(target, true);
+            construction.literal = BuiltInPlace(target);
             dest.construction = &construction;
         }
     }
@@ -3055,7 +3091,7 @@ inline Val TypeCheck::CheckAssignedValue(Assign *a, TypeExpr *target, TypeExpr *
         Saved active(cur.rebuild, arr ? &r : cur.rebuild);
         v = CheckValueAt(a->rhs, target, dest);
     }
-    NoteStorageWrite(built, target, reachable || construction.started);
+    NoteStorageWrite(built, target, built.place, reachable || construction.started);
     if (arr && !built.None()) {
         CheckGrowsSince(base, built, cat("the value assigned to ", ExprStr(a->lval)), target);
         CheckBuiltUses(a->rhs, a->lval, target, built, arr);
@@ -3123,7 +3159,7 @@ inline void TypeCheck::CheckAssign(Assign *a) {
     }
     if (a->op == T_DOTASSIGN) {
         CheckRebind(a, lv);
-        NoteStorageWrite(held, held.type);
+        NoteStorageWrite(held, held.type, held.place);
         return;
     }
     if (lv.isvarint)
@@ -3137,7 +3173,7 @@ inline void TypeCheck::CheckAssign(Assign *a) {
         if (a->op == T_ASSIGN) PointeeAssign(a, lv, held);
         else {
             CompoundAssign(a, lv.type->ref->sub, PointeeWritable(lv, a));
-            NoteStorageWrite(held, held.type);
+            NoteStorageWrite(held, held.type, held.place);
         }
         a->pointee = true;
         return;
@@ -3149,7 +3185,7 @@ inline void TypeCheck::CheckAssign(Assign *a) {
         NoCopyWrite(a, lv);
         NoLetAssign(a, lv);
         CompoundAssign(a, lv.type, WholeWritable(lv));
-        NoteStorageWrite(held, held.type);
+        NoteStorageWrite(held, held.type, held.place);
         if (lv.var) RequireAssigned(lv.var, a);
         return;
     }
@@ -3513,7 +3549,7 @@ inline void TypeCheck::CheckIncDec(IncDec *x) {
     if (!IsIntT(st))
         Error(x, cat(TName(x->op), " requires an integer lvalue, got ", TypeStr(st)));
     if (st->ix) NoIndexUpdate(x, TName(x->op), st);
-    NoteStorageWrite(lv, st);
+    NoteStorageWrite(lv, st, lv.place);
 }
 
 // An update computes a plain integer, which an index or bound type does not

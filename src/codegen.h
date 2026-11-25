@@ -1175,7 +1175,9 @@ struct CodeGen {
     void EmitRelSelfStore(const string &stk, TypeExpr *rt, int64_t fieldoff, Line ln);
     bool HasRelRef(TypeExpr *t);
     bool IsFlatFixed(TypeExpr *t);
-    bool NeedsResultLocation(TypeExpr *t) { return IsFix(t) && t->kind != TY_REF && HasRelRef(t); }
+    bool NeedsResultLocation(TypeExpr *t) {
+        return FixedResultNeedsLocation(t, Cls(t), [&](TypeExpr *ft) { return FieldRuns(ft); });
+    }
     bool HasSelfRelRef(TypeExpr *t);
     void NoSelfRelCopy(Node *val);
     bool HasUninitSlots(TypeExpr *t);

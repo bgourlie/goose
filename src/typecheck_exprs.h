@@ -698,8 +698,7 @@ inline void TypeCheck::ProjectField(Prov &storage, RefPlace &place, TypeExpr *ow
     } else if (place.base && !place.enclosing) {
         // A defer can hold a reference to a sibling of the field being
         // rebuilt. Retain those paths even when the fields have no links.
-        if (HasRelRefT((*fields.ftypes)[i]) ||
-            (hasdefers && (ClassOf(owner) == SC_RESIZABLE || !place.path.empty())))
+        if (hasdefers || HasRelRefT((*fields.ftypes)[i]))
             place.path = ast.Intern(cat(place.path, ".", (*fields.fields)[i].name));
         else place = { place.location };
     }
@@ -1268,13 +1267,10 @@ inline bool TypeCheck::FitsAt(Val &v, TypeExpr *dt, bool delivered) {
                     // A literal's fields were each recorded as they were
                     // stored; a whole-value event for it would only be a
                     // looser copy.
-                    if (!Is<StructLit>(fitnode) && !Is<ArrayLit>(fitnode))
-                        RecordStore(d.root, roots, v.byteview, nullptr, v.holderfrom, reached,
-                                    d.bound);
+                    if (!(Is<StructLit>(fitnode) && v.recordedholder == d.root) && !Is<ArrayLit>(fitnode))
+                        RecordStore(d.root, roots, v.byteview, v.holderfrom, t, &curdst, reached, d.bound);
                 } else {
-                    RecordStore(d.root, roots, v.byteview, PointeeOf(t), nullptr, reached,
-                                d.bound, curdst.slot,
-                                t->kind == TY_REF && PointeeOf(t)->kind == TY_SLICE);
+                    RecordStore(d.root, roots, v.byteview, nullptr, t, &curdst, reached, d.bound);
                     if (curdst.slot)
                         StoreIntoSlot(fitnode, d.root, d.bound, dt, v,
                                       curdst.roots.Exact()
@@ -3243,7 +3239,8 @@ inline TypeCheck::LitDeep TypeCheck::CheckInits(StructLit *sl, vector<Field> &fi
                              ? RootComponent(rootowner, selft, sl->fieldindices[k]) : nullptr;
         DestScope ds(*this, component ? Dest(component) : curdst);
         curdst.fieldsteps &= selft->kind == TY_STRUCT;
-        if (!component && curdst.fieldsteps && (curdst.field.base || curdst.result) && HasRelRefT(ft))
+        if (!component && curdst.fieldsteps && (curdst.field.base || curdst.result) &&
+            (HasRelRefT(ft) || (hasdefers && HoldsPlainRef(ft))))
             Append(curdst.field.path, ".", fields[sl->fieldindices[k]].name);
         curdst.place.intail |= IsArrayKind(ft, A_GROW);
         if (Is<SelfRef>(fi.val)) {

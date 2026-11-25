@@ -45,6 +45,22 @@ fn siblings(stop: bool) {
     bag.xs = [2, if stop { return; } else { 3 }];
 }
 
+struct Pair { first: i64[>..<]&, second: i64[>..<]& }
+
+fn bind_first(p: Pair&, xs: i64[>..<]&) { p.first .= xs; }
+
+fn same_typed_fields(stop: bool) {
+    var xs: i64[>..<] = [1];
+    var ys: i64[>..<] = [2];
+    var p = Pair { first: xs, second: ys };
+    bind_first(p, xs);
+    let saved = p;
+    fn observe() { assert(saved.second.len == 1); }
+    defer observe();
+    defer { assert(p.second.len == 1); }
+    xs = [3, if stop { return; } else { 4 }];
+}
+
 fn named_result(stop: bool) -> i64[>..<] {
     var xs: i64[>..<] = [1, 2];
     xs = [5, if stop { return [7, 8]; } else { 6 }];
@@ -79,5 +95,7 @@ fn main() {
     let other = named_result(true);
     assert(other.len == 2 && other[0] == 7 && other[1] == 8);
     components(true);
+    same_typed_fields(true);
+    same_typed_fields(false);
     print("ok");
 }

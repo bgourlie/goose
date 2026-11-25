@@ -504,7 +504,7 @@ inline Val TypeCheck::ResolveCall(Call *c, vector<SFunction *> &cands, FnSpec *e
     // Replay restored the caller's bindings. A completed callee now leaves
     // its captures as its recorded exits did, just as at a reused call.
     if (!spec->inprogress) ReplayEnvExits(spec);
-    NoteCallConstruction(spec->rets);
+    NoteCallConstruction(spec->rets, spec);
     // An argument can overwrite the same storage that the callee links.
     // Apply the body effects after both passes over the arguments.
     ApplyCalleeStorage(c, spec, argvals, name, argnodes, true);
@@ -1360,7 +1360,7 @@ inline Val TypeCheck::TryDispatch(Call *c, vector<SFunction *> &cands, FnSpec *e
             first = spec;
         }
         c->dispatch.push_back(spec);
-        NoteCallConstruction(spec->rets);
+        NoteCallConstruction(spec->rets, spec);
         ApplyCalleeStorage(c, spec, armvals, name, argnodes, true);
         CheckCalleeRelative(c, spec, argvals);
         auto rec = RecordOf(spec);
@@ -3054,6 +3054,7 @@ inline bool TypeCheck::SameRecord(const FnRecord &a, const FnRecord &b, const Fn
     if (!RelativeStore::SameSet(a.relativestores, b.relativestores, Roots::Compare::Cycle))
         return why("relative destinations");
     if (a.mayreturn != b.mayreturn) return why("normal completion");
+    if (a.writtenfixedresults != b.writtenfixedresults) return why("placed result writes");
     if (a.exitlinks != b.exitlinks) return why("link effects on return");
     auto sameresults = [](const vector<RetRoot> &x, const vector<RetRoot> &y) {
         return equal(x.begin(), x.end(), y.begin(), y.end(),
@@ -3116,7 +3117,7 @@ inline bool TypeCheck::SameRecord(const FnRecord &a, const FnRecord &b, const Fn
     }
     auto sameevents = [&](const StoreEvent &p, const StoreEvent &q) {
         return p.container == q.container && p.elementlink == q.elementlink && p.linkparam == q.linkparam &&
-               p.linkfield == q.linkfield &&
+               p.storefield == q.storefield && p.wholecopy == q.wholecopy &&
                p.root == q.root && p.src == q.src &&
                p.exact == q.exact && p.byteview == q.byteview && p.bound == q.bound &&
                p.slot == q.slot && p.sliceref == q.sliceref && p.classread == q.classread &&
@@ -3162,7 +3163,8 @@ inline void TypeCheck::CheckSpecBodyOnce(FnSpec *spec, vector<Val> *argvals, Lin
     auto lexframe = LexFrame(spec->lexparent, sf);
     EachNamedVar(lexframe, spec, [&](int i) {
         outernarrowed.push_back({ vars[i], vars[i]->narrowed });
-        if (vars[i]->assigned) {
+        if (vars[i]->assigned &&
+            !(hasdefers && vars[i]->isvar && vars[i]->type && IsAddressRef(vars[i]->type))) {
             outerassigned.push_back({ vars[i], vars[i]->maybeassigned });
             return;
         }
@@ -3327,7 +3329,7 @@ inline void TypeCheck::CheckSpecBodyOnce(FnSpec *spec, vector<Val> *argvals, Lin
             held.Set(cr, ra.heldexact, nullptr, ra.slotread);
             auto stored = vd->storedinto;
             auto first = storeevents.size();
-            RecordStore(vd, held, ra.byteview, nullptr);
+            RecordStore(vd, held, ra.byteview);
             vd->storedinto = stored;
             if (!ra.heldexact)
                 for (auto k = first; k < storeevents.size(); k++) storeevents[k].incoming = true;
@@ -3569,9 +3571,18 @@ inline void TypeCheck::CheckSpecBodyOnce(FnSpec *spec, vector<Val> *argvals, Lin
             exits.vars[i]->maybeassigned = exits.maybeassigned[i];
         }
     }
+    for (auto &[index, writing] : cur.fixedresults)
+        if (writing.started) spec->record.writtenfixedresults.insert(index);
     spec->record.mayreturn = exits.reached;
     reachable = savereach;
     RecordEnvExits(spec);
+    // A cached nonlocal exit can be replayed with unrelated caller locals
+    // rebound. Only the captures the body actually accessed belong to it.
+    for (auto &exit : spec->record.outerexits)
+        erase_if(exit.assigned, [&](const auto &entry) {
+            return none_of(spec->envreads.begin(), spec->envreads.end(),
+                           [&](const EnvRead &r) { return r.var == entry.first; });
+        });
     spec->inprogress = false;
     spec->record.eventend = storeevents.size();
     spec->record.bodyevents.clear();
@@ -4263,11 +4274,16 @@ inline bool TypeCheck::ResultLayoutFits(TypeExpr *from, TypeExpr *to) {
 // A call can start constructing a value in its destination
 // after its operands complete, even if the callee subsequently exits
 // without returning. A reference result is loaded after the call.
-inline void TypeCheck::NoteCallConstruction(const vector<TypeExpr *> &results) {
+inline void TypeCheck::NoteCallConstruction(const vector<TypeExpr *> &results, const FnSpec *callee) {
     for (size_t i = 0; i < results.size() && i < callresultdsts.size(); i++) {
         auto &dest = callresultdsts[i];
-        if (dest.construction && IsAggregate(results[i]) && reachable)
-            dest.construction->started = true;
+        auto t = results[i];
+        if (!dest.construction || !reachable || !IsAggregate(t) || !BuiltInPlace(t)) continue;
+        if (ClassOf(t) == SC_FIXED && callee && callee->sf->has_rets) {
+            auto rec = RecordOf(callee);
+            if (rec && !rec->mayreturn && !rec->writtenfixedresults.count((int)i)) continue;
+        }
+        dest.construction->started = true;
     }
 }
 

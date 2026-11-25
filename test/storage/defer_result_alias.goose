@@ -25,6 +25,28 @@ fn read_rebound_alias() -> i64[] {
     return result;
 }
 
+fn moved_before_exit(later_defer: bool) -> i64[] {
+    var out: i64[] = [42];
+    var spare = 0;
+    var written .= out[0];
+    defer increment(written);
+    if later_defer {
+        defer { written .= spare; }
+    } else {
+        written .= spare;
+    }
+    return out;
+}
+
+fn moved_during_unwind() -> i64[] {
+    var out: i64[] = [42];
+    var spare = 0;
+    var written .= out[0];
+    defer { written++; }
+    defer { written .= spare; }
+    return out;
+}
+
 fn stop() -> i64 { abort("stop"); }
 fn numbers(n: i64 = stop()) -> i64[] { [n] }
 fn fixed_numbers(n: i64) -> i64[2] { [n, stop()] }
@@ -114,10 +136,21 @@ inline fn copied_growable() -> i64[>..<] {
 
 struct Small { value: i64 }
 fn make(n: i64) -> Small { Small { value: n } }
+fn stopped_small() -> Small { abort("stop"); }
+fn stopped_linked() -> Linked { Linked { n: stop() } }
+
+fn stopped_placed_call(flag: bool) -> Linked[] {
+    var result: Linked[] = [Linked { n: 42 }];
+    let first .= result[0];
+    defer { if flag { first = stopped_linked(); } }
+    return result;
+}
+
 fn stopped_aggregate(flag: bool) -> Small[] {
     var result: Small[] = [Small { value: 42 }];
     let first .= result[0];
     defer { if flag { first = make(stop()); } }
+    defer { if flag { first = stopped_small(); } }
     return result;
 }
 
@@ -133,6 +166,10 @@ fn main() {
     assert(items[0].counter == 42 && counter == 42);
     let numbers: i64[] = read_rebound_alias();
     assert(numbers[0] == 42);
+    assert(moved_before_exit(false)[0] == 42);
+    assert(moved_before_exit(true)[0] == 42);
+    assert(moved_during_unwind()[0] == 42);
+    assert(stopped_placed_call(false)[0].n == 42);
     let unchanged = stopped_store(false);
     assert(unchanged[0] == 41);
     assert(stopped_builtin(false)[0] == 41);
