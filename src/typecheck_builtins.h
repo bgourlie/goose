@@ -4301,13 +4301,7 @@ inline void TypeCheck::ApplyCalleeShrinks(Node *at, FnSpec *spec, vector<Val> &a
     ApplyCalleeLiveShrinks(at, spec, argvals, name);
     // On a long-distance return this activation also unwinds. The callee
     // may have written any of the replayed stores before taking that exit.
-    for (auto &exit : spec->outerexits) {
-        auto floor = frames[RealFrameIndex()].scopebase;
-        for (auto &f : frames) if (f.spec == exit.target) floor = std::max(floor, f.scopebase);
-        auto flow = SaveFlow();
-        ExitLinkDefers(floor);
-        RestoreFlow(flow);
-    }
+    ReplayOuterExits(spec, rec->outerexits);
     if (applyexits && ordered && !rec->unknownexitlinks) {
         cur.links = std::move(entrylinks);
         for (auto &k : rec->exitoverwrites) argkill(k, true);

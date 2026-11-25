@@ -26,7 +26,44 @@ fn stopped(stop: bool) {
     }
 }
 
+fn explicit_result(stop: bool) -> Node[] {
+    var nodes: Node[] = [Node {}, Node {}];
+    if stop {
+        nodes[0].next .= nodes[1];
+        defer { abort("stop"); }
+        return nodes;
+    }
+    return nodes;
+}
+
+fn tail_result(stop: bool) -> Node[] {
+    var nodes: Node[] = [Node {}, Node {}];
+    if !stop { return nodes; }
+    nodes[0].next .= nodes[1];
+    defer { abort("stop"); }
+    nodes
+}
+
+fn invoke<F>() { F(); }
+fn linked() -> Node[] {
+    var nodes: Node[] = [Node {}, Node {}];
+    nodes[0].next .= nodes[1];
+    return nodes;
+}
+fn distant_result(stop: bool) -> Node[] {
+    var nodes: Node[] = [Node {}, Node {}];
+    if stop {
+        defer { abort("stop"); }
+        invoke() { return linked() from distant_result; };
+    }
+    return nodes;
+}
+
 fn main() {
+    var explicit: Node[>..<] = explicit_result(false);
+    var tail: Node[>..<] = tail_result(false);
+    var distant: Node[>..<] = distant_result(false);
+    assert(explicit.len == 2 && tail.len == 2 && distant.len == 2);
     stopped(false);
     var nodes: Node[>..] = [Node {}, Node {}];
     { defer { nodes[0].next .= nodes[1]; } }

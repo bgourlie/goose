@@ -245,7 +245,9 @@ inline Val ArrayLit::Check(TypeCheck &tc, TypeExpr *expected) {
         fillcount = tc.ast.New<IntLit>(fillcount->line, cnt);
         fillcount->exprtype = tc.ast.inttypes[IS_I64];
         TypeCheck::SlotScope ss(tc, true);
-        auto ev = tc.CheckValue(fillval, elem);
+        auto dest = tc.curdst;
+        dest.discarded |= cnt == 0;
+        auto ev = tc.CheckValueAt(fillval, elem, dest);
         if (!elem) {
             tc.NoUntypedEmptyArray(ev, fillval, "the array literal around it");
             elem = ev.type;

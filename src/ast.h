@@ -2355,6 +2355,34 @@ struct LiveShrink {
     bool inplace = false;
 };
 
+// Relative links need their location and target in the same root.
+// A result location is supplied by the caller; other destinations
+// name parameter classes or lexical storage, mapped as return roots are.
+struct RelativeStore {
+    Roots source, destination;
+    string field;  // Enclosing struct field path in the result, if any.
+    bool intail = false;
+    TypeExpr *pointee = nullptr;
+    int result = -1;
+    bool Same(const RelativeStore &other, Roots::Compare how = Roots::Compare::All) const {
+        return result == other.result && intail == other.intail && pointee == other.pointee &&
+               field == other.field && source.Same(other.source, how) && destination.Same(other.destination, how);
+    }
+
+    bool RecordedIn(const vector<RelativeStore> &stores,
+                    Roots::Compare how = Roots::Compare::All) const {
+        return any_of(stores.begin(), stores.end(), [&](const auto &s) { return Same(s, how); });
+    }
+    static bool SameSet(const vector<RelativeStore> &a, const vector<RelativeStore> &b,
+                        Roots::Compare how = Roots::Compare::All) {
+        return a.size() == b.size() && all_of(a.begin(), a.end(),
+            [&](const RelativeStore &s) { return s.RecordedIn(b, how); });
+    }
+    void AddTo(vector<RelativeStore> &stores) const {
+        if (!RecordedIn(stores)) stores.push_back(*this);
+    }
+};
+
 // One return value's reference roots, or for a holder the roots of what it
 // holds: every root a return gives, which each call maps and merges as it
 // would the branches of an `if` (§9.2), and the cycle fixpoint's prediction
@@ -2366,12 +2394,34 @@ struct RetRoot {
     bool byteview = false;
     bool freshview = false;    // Prov::freshview.
     ValueLinks elementlinks; // Any return may give an array with Val::elementlinks.
+    vector<RelativeStore> resultlinks; // Links written into a result that reaches its caller.
     bool set = false;          // A non-null return has recorded its root.
     // The by-value holder parameter every return gives as it was passed,
     // nothing stored into it since its binding: the result holds what the
     // argument held (TypeCheck::CallResult). -1 where any return gives
     // something else.
     int heldparam = -1;
+
+    bool Same(const RetRoot &other, Roots::Compare how) const {
+        return alts.Same(other.alts, how) && place == other.place && set == other.set &&
+               writable == other.writable && byteview == other.byteview &&
+               freshview == other.freshview &&
+               heldparam == other.heldparam && elementlinks == other.elementlinks &&
+               RelativeStore::SameSet(resultlinks, other.resultlinks, how);
+    }
+
+    void Include(const RetRoot &other) {
+        elementlinks.Include(other.elementlinks);
+        for (auto &link : other.resultlinks) link.AddTo(resultlinks);
+        if (!other.set) return;
+        alts.Add(other.alts);
+        place = set ? place.Common(other.place) : other.place;
+        heldparam = !set || heldparam == other.heldparam ? other.heldparam : -1;
+        writable &= other.writable;
+        byteview |= other.byteview;
+        freshview |= other.freshview;
+        set = true;
+    }
 };
 
 // A literal parameter's contact with a type (§7.7): what the literal at
@@ -2405,11 +2455,12 @@ struct EnvRead {
 };
 
 // An exit of a body outside a specialization's activation that its check
-// took (FnSpec::outerexits).
+// took (FnRecord::outerexits).
 struct OuterExit {
     FnSpec *target = nullptr;
     map<VarDef *, RefPlace> assigned;
     set<VarDef *> maybeassigned;
+    vector<RetRoot> results; // As evaluated before unwinding, in the target's coordinates.
 };
 
 // The analysis a checked body exposes to its callers. A recursive round
@@ -2418,20 +2469,6 @@ struct OuterExit {
 // The event range locates this round's stores in TypeCheck::storeevents; it
 // is replay metadata, not a fact compared for convergence.
 struct FnRecord {
-    // Relative links need their location and target in the same root.
-    // A result location is supplied by the caller; other destinations
-    // name parameter classes or lexical storage, mapped as return roots are.
-    struct RelativeStore {
-        Roots source, destination;
-        string field;  // Enclosing struct field path in the result, if any.
-        bool intail = false;
-        TypeExpr *pointee = nullptr;
-        int result = -1;
-        bool Same(const RelativeStore &other, Roots::Compare how = Roots::Compare::All) const {
-            return result == other.result && intail == other.intail && pointee == other.pointee &&
-                   field == other.field && source.Same(other.source, how) && destination.Same(other.destination, how);
-        }
-    };
     vector<RelativeStore> relativestores;
     // Storage a write through a parameter or capture may change (§6.6).
     // An indirect write follows a stored reference out of the argument.
@@ -2445,6 +2482,7 @@ struct FnRecord {
     // A return-from to an outer body does not, although its C function returns
     // normally to propagate that exit. Unknown recursive calls may return.
     bool mayreturn = true;
+    vector<OuterExit> outerexits; // Nonlocal returns that completed this activation's defers.
     vector<RetRoot> retroots;      // Per ret: the checked returns' roots and the prediction.
     // External optional bindings this body (or a callee) may rebind.
     set<VarDef *> reboundoptionals;
@@ -2568,13 +2606,6 @@ struct FnSpec {
     // The same variables as the check left them, which a call reusing it
     // leaves them as too (TypeCheck::ReplayEnvExits).
     vector<EnvRead> envexits;
-    // Exits of the bodies outside this one's activation that its check took
-    // -- a function value's `return`, a `return from` -- each target with
-    // the variables outside it that the activation had assigned at all of
-    // them, where they were unassigned when it began, and those it may have
-    // assigned at any of them, where none could be when it began: a call
-    // reusing it takes them again (TypeCheck::ReplayOuterExits).
-    vector<OuterExit> outerexits;
     vector<int> litparams;         // Parameters that are literals (§7.7): part of the key.
     vector<LitAdapt> litadapts;    // The types those parameters adapted to in the body.
     vector<LitFlow> litflows;      // Where they were passed on as literals.

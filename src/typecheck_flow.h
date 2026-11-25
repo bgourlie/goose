@@ -2395,7 +2395,7 @@ inline TypeCheck::DeferredLinks TypeCheck::CheckDeferredBody(Defer *d) {
     DeferredLinks effects;
     {
         Saved collecting(cur.deferring, &effects);
-        cur.links.live.clear();
+        cur.links = {};
         erase_if(cur.kills, [](const Kill &k) { return k.relative; });
         deferbodies++;
         CheckBlockVal(d->body, nullptr, false);

@@ -1850,7 +1850,6 @@ inline FnSpec *TypeCheck::GetOrCreateSpec(MatchInfo &mi, vector<Val> &argvals, N
             spec->stale = false;
             CheckSpecBodyOnce(spec, &argvals, callnode->line, Is<Call>(callnode));
         } else if (!spec->inprogress) {
-            ReplayOuterExits(spec);
             ReplayEnvExits(spec);
         }
         NoteCalleeEnvReads(spec);
@@ -2006,10 +2005,10 @@ inline void TypeCheck::ReplayEnvExits(FnSpec *spec) {
 // variable outside it assigned where every exit does, and maybe assigned
 // where any may be (§4.4). `added`: those a reused callee's activation had
 // assigned when it took the exit, where they were unassigned when it began,
-// and those it may have assigned, where none could be (FnSpec::outerexits).
+// and those it may have assigned, where none could be (FnRecord::outerexits).
 // The exit leaves the bodies checked in the frames above tf too, each of
 // which records what it had assigned by then for a call reusing it.
-inline void TypeCheck::NoteExit(int tf, const OuterExit *added) {
+inline void TypeCheck::NoteExit(int tf, const vector<RetRoot> &results, const OuterExit *added) {
     auto e = frames[tf].exits;
     if (!reachable || !e) return;
     auto isassigned = [&](VarDef *v) {
@@ -2025,40 +2024,24 @@ inline void TypeCheck::NoteExit(int tf, const OuterExit *added) {
     auto maybe = [&](VarDef *v) {
         return v->maybeassigned || (added && added->maybeassigned.count(v));
     };
-    for (size_t i = 0; i < e->vars.size(); i++) {
-        auto place = assignedplace(e->vars[i]);
-        e->places[i] = e->reached ? e->places[i].Common(place) : place;
-        e->assigned[i] = (!e->reached || e->assigned[i]) && isassigned(e->vars[i]);
-        e->maybeassigned[i] = (e->reached && e->maybeassigned[i]) || maybe(e->vars[i]);
-    }
+    auto merge = [&](vector<RetRoot> &to) {
+        if (to.size() < results.size()) to.resize(results.size());
+        for (size_t i = 0; i < results.size(); i++) to[i].Include(results[i]);
+    };
     auto target = frames[tf].spec;
-    if (target) {
-        // A nonlocal exit or a callback need not have this activation's
-        // current paths. Only export overwrites that every exit proves.
-        vector<FnRecord::CallerKill> out;
-        if (!added && tf == RealFrameIndex() && !frames.back().isfunval) {
-            auto stores = cur.links.ClassStores();
-            target->record.exitlinkstores.insert(stores.begin(), stores.end());
-            out = CallerKills(target, true);
-        } else target->record.unknownexitlinks = true;
-        auto &all = target->record.exitoverwrites;
-        if (!e->reached) all = std::move(out);
-        else FnRecord::IntersectKills(all, out);
-    }
-    e->reached = true;
-    for (auto k = tf + 1; k < (int)frames.size(); k++) {
-        auto mine = frames[k].exits;
-        if (!mine) continue;
+    auto current = RealFrameIndex();
+    // The caller replays this exit after applying the callee's stores. Each
+    // activation unwinds its own defers before passing the result on.
+    if (current != tf) {
+        auto mine = frames[current].exits;
+        if (!mine) return;
         OuterExit x { target };
-        for (auto v : e->vars) {
-            auto at = find(mine->vars.begin(), mine->vars.end(), v);
-            if (at == mine->vars.end()) continue;
+        for (size_t i = 0; i < mine->vars.size(); i++) {
+            auto v = mine->vars[i];
             if (isassigned(v)) x.assigned.emplace(v, assignedplace(v));
-            if (maybe(v) && !mine->maybeonentry[at - mine->vars.begin()])
-                x.maybeassigned.insert(v);
+            if (maybe(v) && !mine->maybeonentry[i]) x.maybeassigned.insert(v);
         }
-        auto &outer = frames[k].spec->outerexits;
-        auto known = false;
+        auto &outer = frames[current].spec->record.outerexits;
         for (auto &o : outer) {
             if (o.target != target) continue;
             // What every exit of the target it takes has assigned, and what
@@ -2072,24 +2055,63 @@ inline void TypeCheck::NoteExit(int tf, const OuterExit *added) {
                 }
             }
             o.maybeassigned.insert(x.maybeassigned.begin(), x.maybeassigned.end());
-            known = true;
+            merge(o.results);
+            return;
         }
-        if (!known) outer.push_back(std::move(x));
+        x.results = results;
+        outer.push_back(std::move(x));
+        return;
     }
+    for (size_t i = 0; i < e->vars.size(); i++) {
+        auto place = assignedplace(e->vars[i]);
+        e->places[i] = e->reached ? e->places[i].Common(place) : place;
+        e->assigned[i] = (!e->reached || e->assigned[i]) && isassigned(e->vars[i]);
+        e->maybeassigned[i] = (e->reached && e->maybeassigned[i]) || maybe(e->vars[i]);
+    }
+    if (target) {
+        merge(target->record.retroots);
+        // A nonlocal exit or a callback need not have this activation's
+        // current paths. Only export overwrites that every exit proves.
+        vector<FnRecord::CallerKill> out;
+        if (!added && !frames.back().isfunval) {
+            auto stores = cur.links.ClassStores();
+            target->record.exitlinkstores.insert(stores.begin(), stores.end());
+            out = CallerKills(target, true);
+        } else target->record.unknownexitlinks = true;
+        auto &all = target->record.exitoverwrites;
+        if (!e->reached) all = std::move(out);
+        else FnRecord::IntersectKills(all, out);
+    }
+    e->reached = true;
 }
 
-// A call reusing a body takes the exits of the bodies outside it that its
-// check took, having assigned what the check had by each, and maybe what it
-// may have by any. Their targets are on the call path, the body being reused
-// only under the specializations its long-distance returns were checked
-// against (FnSpec::needs).
-inline void TypeCheck::ReplayOuterExits(FnSpec *spec) {
-    for (auto &x : spec->outerexits) {
-        for (auto i = (int)frames.size() - 1; i >= 0; i--) {
-            if (frames[i].isfunval || frames[i].spec != x.target) continue;
-            NoteExit(i, &x);
-            break;
+// A nonlocal return leaves this activation through its caller's defer chain.
+// The ordinary continuation of the call keeps its own flow state.
+inline void TypeCheck::ReplayOuterExits(const FnSpec *spec, const vector<OuterExit> &exits) {
+    for (auto &x : exits) {
+        auto tf = FrameOfSpec(x.target);
+        if (tf < 0) continue;
+        auto flow = SaveFlow();
+        // Specialization has already applied the callee's ordinary exits
+        // to captured variables. Start this exit with their entry bindings
+        // and apply only the assignments made along the nonlocal return.
+        for (auto &e : flow.locals) {
+            auto v = e.var;
+            for (auto &r : spec->envreads) if (r.var == v) {
+                v->assigned = r.assigned;
+                v->maybeassigned = r.maybeassigned;
+                v->refplace = r.refplace;
+                break;
+            }
+            if (auto it = x.assigned.find(v); it != x.assigned.end()) {
+                v->assigned = true;
+                v->refplace = it->second;
+            }
+            v->maybeassigned |= x.maybeassigned.count(v) != 0;
         }
+        ExitLinkDefers(std::max(frames[tf].scopebase, CurRealFrame().scopebase));
+        NoteExit(tf, x.results, &x);
+        RestoreFlow(flow);
     }
 }
 
@@ -3013,11 +3035,6 @@ inline void TypeCheck::CheckSpecBody(FnSpec *spec, vector<Val> *argvals, Line ca
 }
 
 inline bool TypeCheck::SameRecord(const FnRecord &a, const FnRecord &b, const FnSpec *spec) {
-    // A root's `from` names a container of the round's own body, which
-    // the next round makes anew.
-    auto sameroots = [&](const Roots &x, const Roots &y) {
-        return x.Same(y, Roots::Compare::Cycle);
-    };
     // GOOSE_ROUNDS in the environment traces what keeps a cycle's rounds
     // going.
     auto why = [&](const char *what) {
@@ -3033,23 +3050,21 @@ inline bool TypeCheck::SameRecord(const FnRecord &a, const FnRecord &b, const Fn
                 return p.root == q.root && p.exact == q.exact && p.indirect == q.indirect &&
                        sametype(p.type, q.type);
             })) return why("storage writes");
-    if (a.relativestores.size() != b.relativestores.size()) return why("relative destinations");
-    for (auto &p : a.relativestores)
-        if (none_of(b.relativestores.begin(), b.relativestores.end(), [&](const auto &q) {
-                return p.Same(q, Roots::Compare::Cycle);
-            }))
-            return why("relative destinations");
+    if (!RelativeStore::SameSet(a.relativestores, b.relativestores, Roots::Compare::Cycle))
+        return why("relative destinations");
     if (a.mayreturn != b.mayreturn) return why("normal completion");
     if (a.exitoverwrites != b.exitoverwrites || a.exitlinkstores != b.exitlinkstores ||
         a.unknownexitlinks != b.unknownexitlinks) return why("link effects on return");
-    if (a.retroots.size() != b.retroots.size()) return why("returns");
-    for (size_t i = 0; i < a.retroots.size(); i++) {
-        auto &p = a.retroots[i], &q = b.retroots[i];
-        if (!sameroots(p.alts, q.alts) || p.writable != q.writable || p.byteview != q.byteview ||
-            p.freshview != q.freshview || p.elementlinks != q.elementlinks ||
-            p.set != q.set || p.heldparam != q.heldparam || p.place != q.place)
-            return why("return roots");
-    }
+    auto sameresults = [](const vector<RetRoot> &x, const vector<RetRoot> &y) {
+        return equal(x.begin(), x.end(), y.begin(), y.end(),
+                     [](const auto &p, const auto &q) { return p.Same(q, Roots::Compare::Cycle); });
+    };
+    if (!sameresults(a.retroots, b.retroots)) return why("return roots");
+    if (!is_permutation(a.outerexits.begin(), a.outerexits.end(), b.outerexits.begin(), b.outerexits.end(),
+            [&](const auto &p, const auto &q) {
+                return p.target == q.target && p.assigned == q.assigned &&
+                       p.maybeassigned == q.maybeassigned && sameresults(p.results, q.results);
+            })) return why("nonlocal exits");
     auto sameeffect = [&](const ShrinkEffect &p, const ShrinkEffect &q) {
         return p.balance == q.balance && sametype(p.replaced, q.replaced);
     };
@@ -3473,6 +3488,7 @@ inline void TypeCheck::CheckSpecBodyOnce(FnSpec *spec, vector<Val> *argvals, Lin
                     auto expected = spec->retsknown && spec->rets.size() == 1 ? spec->rets[0]
                                                                               : nullptr;
                     Val tv;
+                    Saved links(cur.links.resultlinks, vector<RelativeStore> {});
                     {
                         FlagScope ret(inreturn, true);
                         RetValScope rv(*this, spec->body->tail);
@@ -3491,10 +3507,7 @@ inline void TypeCheck::CheckSpecBodyOnce(FnSpec *spec, vector<Val> *argvals, Lin
                             if (spec->retsknown && !spec->rets.empty())
                                 Error(tail, cat("function ", sf->name, " must return value(s)"));
                         } else {
-                            vector<Val> vals = { tv };
-                            RecordReturn(spec, vals, tail);
-                            ExitLinkDefers(frames[fi].scopebase);
-                            NoteExit(fi);
+                            FinishReturn(fi, { tv }, tail);
                             reachable = false;
                         }
                     }
@@ -3589,16 +3602,12 @@ inline int TypeCheck::HeldParam(FnSpec *spec, const Val &v) {
     return p < (ptrdiff_t)spec->params.size() ? (int)p : -1;
 }
 
-// Shared by `return` statements and body tails: agree the values with
-// the target's return types (setting them on first sight), and record
-// reference roots for the caller to map (§9.2).
-inline void TypeCheck::RecordReturn(FnSpec *tspec, vector<Val> &vals, Node *at) {
-    // A single call forwards all its return values.
-    vector<TypeExpr *> types;
-    for (auto &v : vals) {
+// Check and snapshot a statement's or body tail's result before its defers
+// run (§6.6). Only a completing exit contributes it to the caller (§9.2).
+inline void TypeCheck::FinishReturn(int tf, const vector<Val> &vals, Node *at) {
+    auto tspec = frames[tf].spec;
+    for (auto &v : vals)
         if (v.type == fntype) Error(at, "function values cannot be returned (§7.6)");
-        types.push_back(v.type);
-    }
     // The result type this return meets may be a reference another one
     // inferred, where none is written.
     auto inferredearlier = tspec->retsknown && tspec->sf && !tspec->sf->has_rets;
@@ -3616,12 +3625,13 @@ inline void TypeCheck::RecordReturn(FnSpec *tspec, vector<Val> &vals, Node *at) 
                           tspec->sf ? tspec->sf->name : string_view("?"), " has ",
                           (int64_t)tspec->rets.size()));
     }
-    if (tspec->record.retroots.size() < tspec->rets.size())
-        tspec->record.retroots.resize(tspec->rets.size());
+    vector<RetRoot> results(vals.size());
+    for (auto &link : cur.links.resultlinks)
+        if ((size_t)link.result < results.size()) results[link.result].resultlinks.push_back(link);
     for (size_t i = 0; i < vals.size(); i++) {
         auto rt = tspec->rets[i];
-        auto &rr = tspec->record.retroots[i];
-        rr.elementlinks.Include(vals[i].elementlinks);
+        auto &rr = results[i];
+        rr.elementlinks = vals[i].elementlinks;
         auto isrs = IsRefOrSlice(rt);
         auto holder = !isrs && HoldsPlainRef(rt);
         if (!isrs && !holder) continue;
@@ -3650,9 +3660,7 @@ inline void TypeCheck::RecordReturn(FnSpec *tspec, vector<Val> &vals, Node *at) 
             if (IsTemp(root))
                 Error(at, "returning a reference into a temporary");
         }
-        // A result may come from any return: every root one gives is kept,
-        // with the guarantees that hold on all paths to it.
-        auto held = holder ? HeldParam(tspec, vals[i]) : -1;
+
         if (isrs) {
             auto place = rt->kind == TY_SLICE ? vals[i].sliceplace : vals[i].refplace;
             // Only the callee's actual parameters and global storage name
@@ -3663,15 +3671,17 @@ inline void TypeCheck::RecordReturn(FnSpec *tspec, vector<Val> &vals, Node *at) 
             if (!parameter(place.location.param)) place.location.param = nullptr;
             if (place.base && !place.base->isglobal && !parameter(place.base))
                 place = { place.location, nullptr, {}, place.nullonly };
-            rr.place = rr.set ? rr.place.Common(place) : place;
+            rr.place = place;
         }
-        rr.heldparam = !rr.set || rr.heldparam == held ? held : -1;
-        rr.alts.Add(roots);
-        rr.writable = rr.writable && vals[i].writable;
-        rr.byteview = rr.byteview || vals[i].byteview;
-        rr.freshview = rr.freshview || (isrs && vals[i].freshview);
+        rr.heldparam = holder ? HeldParam(tspec, vals[i]) : -1;
+        rr.alts = std::move(roots);
+        rr.writable = vals[i].writable;
+        rr.byteview = vals[i].byteview;
+        rr.freshview = isrs && vals[i].freshview;
         rr.set = true;
     }
+    ExitLinkDefers(std::max(frames[tf].scopebase, CurRealFrame().scopebase));
+    NoteExit(tf, results);
 }
 
 // One root a result may have, as this call sees it: a parameter's class root
@@ -3772,7 +3782,7 @@ inline Val TypeCheck::CallResult(Call *c, FnSpec *spec, vector<Val> &argvals) {
                 // A root of this activation's own that outlives nothing it
                 // could be stored in and may point into a grow-shrink array:
                 // the result is passed down, and returning it is returning
-                // a reference rooted in the activation (RecordReturn).
+                // a reference rooted in the activation (FinishReturn).
                 auto t = ast.NewVarDef();
                 t->name = "<recursive result>";
                 t->depth = CurDepth();
@@ -3849,10 +3859,8 @@ inline Val TypeCheck::CallResult(Call *c, FnSpec *spec, vector<Val> &argvals) {
 // points where that call's arguments did, as the call's own result would
 // (RetAltVal), and a variable of the call, the body's own locals among them,
 // dies with it. What is left is rooted where the target names it, which the
-// target's calls map in turn (RecordReturn). What the target's record gets is
-// then this call's, as what ApplyCalleeStores maps in place is: another call
-// reusing the check -- a later pass of a loop, a later round of a cycle the
-// target is in, which records its returns anew -- would give it nothing.
+// target's calls map in turn. The intermediate summary uses these particular
+// arguments' roots, so a different call must check that mapping again.
 inline void TypeCheck::ReturnThroughCalls(Val &v, int tf, Return *r) {
     auto isrs = IsRefOrSlice(v.type);
     if (!isrs && !HoldsPlainRef(v.type)) return;
@@ -3954,6 +3962,7 @@ inline void TypeCheck::CheckReturn(Return *r) {
     for (auto i = tf + 1; i < (int)frames.size(); i++) AddNeed(frames[i].spec, tspec);
     // Values.
     vector<Val> vals;
+    Saved links(cur.links.resultlinks, vector<RelativeStore> {});
     auto expectone = [&](size_t i) -> TypeExpr * {
         return tspec->retsknown && i < tspec->rets.size() ? tspec->rets[i] : nullptr;
     };
@@ -4007,38 +4016,26 @@ inline void TypeCheck::CheckReturn(Return *r) {
     }
     if (vals.empty() && tspec->retsknown && !tspec->rets.empty())
         Error(r, cat("function ", frames[tf].sf->name, " must return value(s)"));
-    if (!vals.empty() || !tspec->retsknown) {
-        // For long-distance returns, references, including those a returned
-        // value holds, must not be rooted in frames that unwind. One out of a
-        // function value's body is mapped through the calls it leaves; one
-        // written in a named function must conservatively be rooted at
-        // globals/static.
-        if (tf != (int)frames.size() - 1) {
-            // These links are recorded in the target's summary. Recheck the
-            // intervening calls if a later round rebuilds that summary.
-            if (any_of(vals.begin(), vals.end(), [](const Val &v) { return v.elementlinks; })) {
-                for (auto k = tf + 1; k < (int)frames.size(); k++) {
-                    auto s = frames[k].spec;
-                    if (!frames[k].isfunval && s && s != tspec) s->storesout = true;
-                }
+    // For long-distance returns, references, including those a returned
+    // value holds, must not be rooted in frames that unwind. One out of a
+    // function value's body is mapped through the calls it leaves; one
+    // written in a named function must conservatively be rooted at
+    // globals/static.
+    if (tf != (int)frames.size() - 1) {
+        for (auto &v : vals) {
+            if (frames.back().isfunval) {
+                ReturnThroughCalls(v, tf, r);
+                continue;
             }
-            for (auto &v : vals) {
-                if (frames.back().isfunval) {
-                    ReturnThroughCalls(v, tf, r);
-                    continue;
-                }
-                auto isrs = IsRefOrSlice(v.type);
-                if (!isrs && !HoldsPlainRef(v.type)) continue;
-                const Roots &roots = isrs ? v.AsRoots() : ContentsOf(v);
-                if (roots.Any([](const RootAlt &a) { return a.root && !a.root->isglobal; }))
-                    Error(r, "a long-distance return may only carry references to "
-                             "globals or static data");
-            }
+            auto isrs = IsRefOrSlice(v.type);
+            if (!isrs && !HoldsPlainRef(v.type)) continue;
+            const Roots &roots = isrs ? v.AsRoots() : ContentsOf(v);
+            if (roots.Any([](const RootAlt &a) { return a.root && !a.root->isglobal; }))
+                Error(r, "a long-distance return may only carry references to "
+                         "globals or static data");
         }
-        RecordReturn(tspec, vals, r);
     }
-    ExitLinkDefers(std::max(frames[tf].scopebase, CurRealFrame().scopebase));
-    NoteExit(tf);
+    FinishReturn(tf, vals, r);
     reachable = false;
 }
 
@@ -4298,7 +4295,7 @@ inline bool TypeCheck::RelativeDestination(const Roots &source, Dest dest, TypeE
     if (!dest.result && !IsClassRoot(have) && !IsClassRoot(want)) return false;
     if (!record) return true;
     if (dest.used) *dest.used = true;
-    FnRecord::RelativeStore rs;
+    RelativeStore rs;
     rs.intail = dest.place.intail;
     rs.pointee = pointee;
     rs.source.Set(have, true);
@@ -4306,9 +4303,8 @@ inline bool TypeCheck::RelativeDestination(const Roots &source, Dest dest, TypeE
         rs.result = dest.resultindex;
         rs.field = dest.field.path;
     } else rs.destination.Set(want, true);
-    auto &stores = spec->record.relativestores;
-    if (none_of(stores.begin(), stores.end(), [&](const auto &s) { return s.Same(rs); }))
-        stores.push_back(std::move(rs));
+    rs.AddTo(spec->record.relativestores);
+    if (dest.result && !dest.discarded) rs.AddTo(cur.links.resultlinks);
     return true;
 }
 
@@ -4348,6 +4344,10 @@ inline void TypeCheck::CheckCalleeRelative(Call *call, FnSpec *spec, vector<Val>
                 if (!dest.reached) dest.reached = spec->rets[i];
             }
             if (dest.fieldsteps) dest.field.path += s.field;
+            // Every construction must fit the receiver. Only a store from
+            // a completing return leaves its link in that receiver.
+            dest.discarded |= i >= rec->retroots.size() ||
+                              !s.RecordedIn(rec->retroots[i].resultlinks);
         }
         dest.place.intail |= s.intail;
         if (!RelativeDestination(source, dest, s.pointee, call, true, true)) {
@@ -4358,7 +4358,7 @@ inline void TypeCheck::CheckCalleeRelative(Call *call, FnSpec *spec, vector<Val>
                             "(§3.9); call of ", spec->sf->name, " links a target rooted at ",
                             target, " to receiving storage ", receiver));
         }
-        if (s.result >= 0 && dest.reached && !dest.result && !source.None())
+        if (s.result >= 0 && dest.reached && !dest.result && !dest.discarded && !source.None())
             RecordLinkStore(dest.roots, dest.reached,
                             { s.pointee, dest.appended ? EL_BACKWARD : EL_ANY }, call, dest.place, dest.field);
     }

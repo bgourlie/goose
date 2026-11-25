@@ -291,10 +291,12 @@ struct TypeCheck {
             auto operator<=>(const Part &) const = default;
         };
         map<Part, size_t> live;
+        vector<RelativeStore> resultlinks; // Writes into the result under construction on this path.
         void Add(const StoreEvent &e, size_t index) {
             live[{e.container, e.elementlink, e.linkfield, e.linkclass}] = index;
         }
         void Join(const LinkFlow &other) {
+            for (auto &link : other.resultlinks) link.AddTo(resultlinks);
             for (auto &[part, at] : other.live) {
                 auto &last = live[part];
                 last = std::max(last, at);
@@ -307,8 +309,9 @@ struct TypeCheck {
         }
         // Loop convergence depends on the possible writes, not event numbers.
         bool operator==(const LinkFlow &o) const {
-            return live.size() == o.live.size() && equal(live.begin(), live.end(), o.live.begin(),
-                [](const auto &a, const auto &b) { return a.first == b.first; });
+            return RelativeStore::SameSet(resultlinks, o.resultlinks) && live.size() == o.live.size() &&
+                   equal(live.begin(), live.end(), o.live.begin(),
+                         [](const auto &a, const auto &b) { return a.first == b.first; });
         }
     };
     struct FlowState {
@@ -331,6 +334,7 @@ struct TypeCheck {
         Roots roots;
         FnSpec *result = nullptr;
         int resultindex = 0;
+        bool discarded = false; // Construction is checked, but no live slot receives the value.
         // Set while a block's tail is checked: a link needed this location,
         // so adapting the result must preserve where its bytes are built.
         bool *used = nullptr;
@@ -1656,10 +1660,10 @@ struct TypeCheck {
     // body's exits agree, and maybe assigned where any may be (BodyExits):
     // its returns, the tail, a reachable end, and an exit of it that a
     // callee takes -- a function value's `return`, a `return from`. A
-    // callee records such an exit (FnSpec::outerexits), which a call reusing
+    // callee records such an exit (FnRecord::outerexits), which a call reusing
     // it takes again.
-    void NoteExit(int tf, const OuterExit *added = nullptr);
-    void ReplayOuterExits(FnSpec *spec);
+    void NoteExit(int tf, const vector<RetRoot> &results = {}, const OuterExit *added = nullptr);
+    void ReplayOuterExits(const FnSpec *spec, const vector<OuterExit> &exits);
 
     // A loop body is checked as many times as it takes for what it feeds
     // back to its head to settle (CheckLoopPasses): the roots its rebinds
@@ -2537,7 +2541,7 @@ struct TypeCheck {
     vector<VarDef *> NarrowedOptionals(const MatchInfo &mi);
     int EnvReach(const MatchInfo &mi);
     void CheckSpecBody(FnSpec *spec, vector<Val> *argvals, Line callline, Call *call = nullptr);
-    void RecordReturn(FnSpec *tspec, vector<Val> &vals, Node *at);
+    void FinishReturn(int tf, const vector<Val> &vals, Node *at);
     void NamedResultCopyWarning(FnSpec *spec);
     Val RetAltVal(FnSpec *spec, const RootAlt &alt, vector<Val> &argvals, TypeExpr *t, Node *at);
     int HeldParam(FnSpec *spec, const Val &v);

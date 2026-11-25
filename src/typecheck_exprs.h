@@ -1076,7 +1076,7 @@ inline void TypeCheck::MustFit(Val &v, Node *n, TypeExpr *dt) {
     fitnode = n;
     auto from = LoadType(v.type);
     if (FitsAt(v, dt)) {
-        if (v.elementlinks && !IsRefOrSlice(dt) && !curdst.roots.None())
+        if (v.elementlinks && !curdst.discarded && !IsRefOrSlice(dt) && !curdst.roots.None())
             RecordElementLinks(curdst.roots, curdst.reached ? curdst.reached : dt, v.elementlinks,
                                n, { curdst.place.intail || IsArrayKind(dt, A_GROW), curdst.place.param },
                                curdst.field);
@@ -1230,7 +1230,7 @@ inline bool TypeCheck::FitsAt(Val &v, TypeExpr *dt) {
         // Each storage the slot may be in holds the value from here on; a
         // reference or slice variable itself holds it as its binding, which
         // for a global is a store all the same (CheckGlobalShrinks).
-        if (!curdst.varbind) {
+        if (!curdst.varbind && !curdst.discarded) {
             for (auto &d : dsts) {
                 if (holder) {
                     // A literal's fields were each recorded as they were
@@ -1250,7 +1250,7 @@ inline bool TypeCheck::FitsAt(Val &v, TypeExpr *dt) {
                                           : " through a reference that may name it");
                 }
             }
-        } else if (curdst.roots.Exact() && curdst.roots.Root()->isglobal) {
+        } else if (curdst.varbind && curdst.roots.Exact() && curdst.roots.Root()->isglobal) {
             NoteGlobalBinding(curdst.roots.Root(), roots, v.byteview, PointeeOf(t),
                               fitnode ? fitnode->line : Line {});
         }
@@ -1445,7 +1445,7 @@ inline bool TypeCheck::FitsAt(Val &v, TypeExpr *dt) {
                                   : cat("this reference is rooted at ", vroot));
                     return false;
                 }
-                if (recordingrelative && !dt->ref->pool && !curdst.result)
+                if (recordingrelative && !dt->ref->pool && !curdst.result && !curdst.discarded)
                     RecordLinkStore(curdst.roots, curdst.reached ? curdst.reached : dt,
                                     { pointee, curdst.appended ? EL_BACKWARD : EL_ANY },
                                     fitnode, curdst.place, curdst.field);
