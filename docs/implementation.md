@@ -3685,12 +3685,13 @@ whole-program check accounts for views held by other globals and for
 unknown incoming links at host entry points or through a bound.
 
 `Val::elementlinks` carries the owner's links through branches, by-value
-arguments, named results and each forwarded result slot. It keeps writes
-in the resizable tail separate from other writes and records whether a
-link can target an array itself. A layout conversion can move a complete
-element run while removing the length prefix a link would still name. The by-value
-argument's link state is part of the specialization key. `FitsAt` checks
-the links when the result changes array kind. A grow-shrink array cannot
+arguments, named results and each forwarded result slot. For each pointee
+type it tracks the possible link directions in the resizable tail and in
+the rest of the owner. A header link can survive a tail clear when its
+pointee cannot lie in the removed elements. A layout conversion can move
+a complete element run while removing the length prefix a link would still
+name. The by-value argument's link state is part of the specialization key.
+`FitsAt` checks the links when the result changes array kind. A grow-shrink array cannot
 hold a link into its elements (§5.2), and an adapter that copies a
 limited array's live prefix can discard a target (§5.3). An array initialized
 with null links and returned by name uses the ordinary named-result entry when adapting it.

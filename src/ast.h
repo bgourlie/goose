@@ -689,35 +689,51 @@ struct Prov : Roots {
 // storage. A decoded run or a rebind may also link into a later element.
 enum ElementLinks { EL_NONE, EL_BACKWARD, EL_ANY };
 
-struct SlotLinks {
+struct ElementLink {
+    TypeExpr *pointee = nullptr; // One representative per loaded type (LinkPointee).
     ElementLinks direction = EL_NONE;
-    bool arraytarget = false; // A target may be an array itself, including its length prefix.
+    bool intail = false; // The receiving slot lies in its owner's resizable tail.
     explicit operator bool() const { return direction != EL_NONE; }
-    auto operator<=>(const SlotLinks &) const = default;
-    void Include(SlotLinks other) {
-        direction = std::max(direction, other.direction);
-        arraytarget |= other.arraytarget;
+    auto operator<=>(const ElementLink &) const = default;
+    bool SameSlotKind(ElementLink other) const {
+        return pointee == other.pointee && intail == other.intail;
     }
 };
 
-// The resizable tail, when present, is unique in an owner's storage.
-// Other slots include writes whose position in that owner is unknown.
+// A value can contain links to several types. Join directions only for the
+// same pointee type and slot location, since clearing a tail keeps the header.
 struct ValueLinks {
-    SlotLinks other, tail;
-    explicit operator bool() const { return other || tail; }
-    bool operator==(const ValueLinks &) const = default;
-    SlotLinks All() const {
-        auto links = other;
-        links.Include(tail);
-        return links;
+    small_vector<ElementLink, 1> slots;
+    explicit operator bool() const { return !slots.empty(); }
+    bool Include(ElementLink link) {
+        for (auto &known : slots) {
+            if (!known.SameSlotKind(link)) continue;
+            if (known.direction >= link.direction) return false;
+            known.direction = link.direction;
+            return true;
+        }
+        slots.push_back(link);
+        return true;
     }
-    void Include(ValueLinks links, bool intail = false) {
-        (intail ? tail : other).Include(links.other);
-        tail.Include(links.tail);
+    void Include(const ValueLinks &other, bool intail = false) {
+        for (auto link : other.slots) {
+            link.intail |= intail;
+            Include(link);
+        }
     }
-    bool Covers(ValueLinks links) const {
-        links.Include(*this);
-        return links == *this;
+    template<typename F> bool Any(F f) const { return any_of(slots.begin(), slots.end(), f); }
+    bool MayPointForward() const {
+        return Any([](auto link) { return link.direction == EL_ANY; });
+    }
+    bool Covers(const ValueLinks &other) const {
+        return all_of(other.slots.begin(), other.slots.end(), [&](auto link) {
+            return Any([&](auto known) {
+                return known.SameSlotKind(link) && known.direction >= link.direction;
+            });
+        });
+    }
+    bool operator==(const ValueLinks &other) const {
+        return is_permutation(slots.begin(), slots.end(), other.slots.begin(), other.slots.end());
     }
 };
 
@@ -2166,8 +2182,7 @@ struct StoreEvent {
     VarDef *container = nullptr;
     // Links within this owner's storage, from either a relative store or a
     // verified element run. Mapping this event requires only the destination.
-    SlotLinks elementlinks;
-    bool intail = false;         // The receiving slot lies in the resizable element run.
+    ElementLink elementlink;
     int linkclass = -1;          // Its index in the current body's class-store summary.
     // What was stored: a reference to something rooted at `root`, or (a
     // copy of) the contents of container `src` -- a holder value read out
@@ -2311,7 +2326,7 @@ struct FnRecord {
     struct RelativeStore {
         Roots source, destination;
         bool intail = false;
-        bool arraytarget = false;
+        TypeExpr *pointee = nullptr;
         int result = -1;
     };
     vector<RelativeStore> relativestores;

@@ -475,19 +475,6 @@ inline bool TypeCheck::VerifiableElem(TypeExpr *t, TypeExpr *elem, string &why) 
     }
 }
 
-// Does a type hold a relative reference at any depth (§3.9)? Such a field
-// names an element of the array a verified image loaded, wherever the value
-// carrying it ends up.
-inline bool TypeCheck::HoldsRelRef(TypeExpr *t) {
-    switch (t->kind) {
-        case TY_REF: return t->ref->lenstorage >= 0;
-        case TY_STRUCT: case TY_ENUM: case TY_VARIANT:
-            return AnyField(t, [&](TypeExpr *ft) { return HoldsRelRef(ft); });
-        case TY_ARRAY: return HoldsRelRef(t->arr->sub);
-        default: return false;
-    }
-}
-
 // Does a type have a default value (§4.2)? Everything does except a
 // non-optional reference, which has nothing to point at, an enum without
 // variants, which has no value at all, and anything containing either
@@ -1001,6 +988,15 @@ inline void TypeCheck::SelfRelPointees(TypeExpr *t, vector<TypeExpr *> &out) {
         case TY_ARRAY: SelfRelPointees(t->arr->sub, out); return;
         default: EachField(t, [&](TypeExpr *ft) { SelfRelPointees(ft, out); });
     }
+}
+
+// Flow joins and specialization keys compare link facts across repeated
+// checks, which can construct distinct AST nodes for the same concrete type.
+inline TypeExpr *TypeCheck::LinkPointee(TypeExpr *t) {
+    t = LoadType(t);
+    for (auto known : linkpointees) if (TypeEq(t, known)) return known;
+    linkpointees.push_back(t);
+    return t;
 }
 
 // A resizable struct returned as a named result keeps its resizable tail at

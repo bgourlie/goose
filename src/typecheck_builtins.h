@@ -259,8 +259,9 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
             // array's own contents still hold it: the store rule that keeps
             // references into a T[>..<] out of storage (§5.2) never ran,
             // because the verified copy is not a store.
-            auto elementlinks = HoldsRelRef(el) ? EL_ANY : EL_NONE;
-            if (ak == A_GROWSHRINK && elementlinks)
+            vector<TypeExpr *> pointees;
+            SelfRelPointees(el, pointees);
+            if (ak == A_GROWSHRINK && !pointees.empty())
                 Error(c, cat("from_bytes<", TypeStr(t),
                              "> cannot hold relative references: a shrink would free "
                              "what they still name"));
@@ -269,7 +270,8 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
             c->rettypes.push_back(ast.booltype);
             Val first;
             first.type = t;
-            first.elementlinks.other.direction = elementlinks;
+            for (auto p : pointees)
+                first.elementlinks.Include({ LinkPointee(p), EL_ANY, ak == A_GROW });
             first.Set(TempRoot(), false);
             Val ok;
             ok.type = ast.booltype;
@@ -1249,15 +1251,18 @@ inline void TypeCheck::GrowOnlyAssignKnown(Assign *a, const Roots &built, bool w
                      "grow-only array", " through a reference whose array is not known (§5.1)"));
 }
 
+// A relative reference may reach a removed element, one of its fields,
+// or a byte of the element run exposed by bytes_of.
+inline bool TypeCheck::LinkMayReachElements(TypeExpr *array, TypeExpr *pointee) {
+    return !array || MayHoldValueOf(array->arr->sub, pointee) || (IsU8(pointee) && Viewable(array));
+}
+
 // Only a slot that survives the shrink can keep a link into the removed
 // elements. Emptying the tail preserves the fields before it.
 inline bool TypeCheck::RetainsRelativeSlot(TypeExpr *part, TypeExpr *array, TypeExpr *replaced) {
     if (replaced && TopConstEq(part, replaced)) return false;
     if (!array) return HasRelRefT(part);
-    if (IsSelfRelRef(part)) {
-        auto pt = LoadType(part->ref->sub);
-        return MayHoldValueOf(array->arr->sub, pt) || (IsU8(pt) && Viewable(array));
-    }
+    if (IsSelfRelRef(part)) return LinkMayReachElements(array, LoadType(part->ref->sub));
     if (part->kind == TY_ARRAY) return RetainsRelativeSlot(part->arr->sub, array, replaced);
     return AnyField(part, [&](TypeExpr *ft) { return RetainsRelativeSlot(ft, array, replaced); });
 }
@@ -1274,10 +1279,14 @@ inline ValueLinks TypeCheck::LiveElementLinks(VarDef *owner, TypeExpr *target, T
     bool cleared = t && KilledFor(owner, owner, t, arr, since, true, replaced);
     auto emptiestail = replaced && ResizableArrayIn(replaced);
     ValueLinks links;
+    auto retain = [&](ElementLink link) {
+        if (link && !(emptiestail && link.intail) && LinkMayReachElements(arr, link.pointee))
+            links.Include(link);
+    };
     for (auto &[part, at] : cur.links.live) {
-        if (part.owner != owner || (emptiestail && part.intail)) continue;
+        if (part.owner != owner) continue;
         if (owner->type && cleared && at < since) continue;
-        (part.intail ? links.tail : links.other).Include(part.kind);
+        retain(part.link);
     }
     auto spec = CurRealFrame().spec;
     // A named callee records shrinks of captured owners as external shrinks.
@@ -1286,8 +1295,7 @@ inline ValueLinks TypeCheck::LiveElementLinks(VarDef *owner, TypeExpr *target, T
     if (!cleared && spec && !callerchecks && (owner->isglobal || capture)) {
         for (size_t i = 0; i < spec->record.eventstart; i++) {
             auto &e = storeevents[i];
-            if (e.container == owner && !(emptiestail && e.intail))
-                (e.intail ? links.tail : links.other).Include(e.elementlinks);
+            if (e.container == owner) retain(e.elementlink);
         }
     }
     return links;
@@ -1512,7 +1520,7 @@ inline void TypeCheck::ApplyLinkKill(const Kill &k) {
     erase_if(cur.links.live, [&](const auto &entry) {
         auto &[place, at] = entry;
         if (place.owner != owner) return false;
-        if (tail && place.intail && at < k.at) return true;
+        if (tail && place.link.intail && at < k.at) return true;
         if (!all || at >= since) return false;
         auto reached = storeevents[at].reached;
         return owner->type || (reached && TopConstEq(t, LoadType(reached)));
@@ -1783,7 +1791,7 @@ inline void TypeCheck::CheckLinkShrink(const LinkShrink &s) {
         cur.deferring->shrinks.emplace_back(s, CurrentLinkEffects());
         return;
     }
-    if (LiveElementLinks(s.owner, s.array, s.replaced, !s.viaclass).All().direction == EL_ANY)
+    if (LiveElementLinks(s.owner, s.array, s.replaced, !s.viaclass).MayPointForward())
         Error(s.at, cat(s.operation, ": retained storage may have a self-relative link "
                         "to a removed element (§5.1)"));
     if (s.viaclass) return;
@@ -1823,14 +1831,11 @@ inline void TypeCheck::HolderFromLit(Val &v, const LitDeep &deep) {
 // stands for -- the call sites map those back (§3.5).
 inline void TypeCheck::AddStoreEvent(const StoreEvent &e) {
     storeevents.push_back(e);
-    if (e.elementlinks) {
-        auto &all = e.intail ? e.container->elementlinks.tail : e.container->elementlinks.other;
-        auto before = all;
-        all.Include(e.elementlinks);
-        if (all != before) {
+    if (e.elementlink) {
+        if (e.container->elementlinks.Include(e.elementlink)) {
             // A backward link on a parameter class cannot invalidate a
             // shrink in this body. Its caller records the link on the owner.
-            if (e.elementlinks.direction == EL_ANY || e.container->ownerspec || e.container->isglobal)
+            if (e.elementlink.direction == EL_ANY || e.container->ownerspec || e.container->isglobal)
                 NoteFact(e.container, ActivationFloor(e.container));
         }
         // A variable being initialized may still be waiting for its type.
@@ -1841,13 +1846,13 @@ inline void TypeCheck::AddStoreEvent(const StoreEvent &e) {
         e.container->storedinto = true;
         NoteSlotStore(e);
     }
-    if (!e.elementlinks && (e.container->type || e.container->isglobal)) return;
+    if (!e.elementlink && (e.container->type || e.container->isglobal)) return;
     auto spec = CurRealFrame().spec;
     if (!spec) return;
     // The callee's class event a replayed store came from, for the entry it
     // lands in: the earliest of those, where any is (Replay).
     auto origin = [&](size_t m) {
-        if (e.elementlinks) storeevents.back().linkclass = (int)m;
+        if (e.elementlink) storeevents.back().linkclass = (int)m;
         else cur.classwrites.emplace_back(storeevents.size() - 1, (int)m);
         if (!replay.classorigins || m < replay.classbase) return;
         auto &os = *replay.classorigins;
@@ -1864,7 +1869,7 @@ inline void TypeCheck::AddStoreEvent(const StoreEvent &e) {
     auto &evs = spec->record.classevents;
     for (size_t m = 0; m < evs.size(); m++) {
         auto &o = evs[m];
-        if (o.container == e.container && o.elementlinks == e.elementlinks && o.intail == e.intail &&
+        if (o.container == e.container && o.elementlink == e.elementlink &&
             o.root == e.root && o.src == e.src &&
             o.exact == e.exact && o.byteview == e.byteview && o.bound == e.bound &&
             o.slot == e.slot && o.sliceref == e.sliceref && !o.pointee == !e.pointee &&
@@ -1882,20 +1887,21 @@ inline void TypeCheck::AddStoreEvent(const StoreEvent &e) {
 // Internal links move with the complete element run. The destination alone
 // owns both ends, including when a call maps the store through a parameter.
 inline void TypeCheck::RecordElementLinks(const Roots &owners, TypeExpr *reached,
-                                          ValueLinks links, Node *at, bool intail) {
-    if (links.other) RecordLinkStore(owners, reached, links.other, at, intail);
-    if (links.tail) RecordLinkStore(owners, reached, links.tail, at, true);
+                                          const ValueLinks &links, Node *at, bool intail) {
+    for (auto link : links.slots) {
+        link.intail |= intail;
+        RecordLinkStore(owners, reached, link, at);
+    }
 }
 
 inline void TypeCheck::RecordLinkStore(const Roots &owners, TypeExpr *reached,
-                                      SlotLinks links, Node *at, bool intail) {
+                                      ElementLink link, Node *at) {
     if (!reachable || owners.None()) return;
     for (auto &d : ShrinkTargets(owners, reached, false)) {
         if (IsTemp(d.root)) continue;
         StoreEvent e;
         e.container = d.root;
-        e.elementlinks = links;
-        e.intail = intail;
+        e.elementlink = link;
         e.exact = true;  // No external root is stored.
         e.reached = reached;
         e.bound = d.bound;
@@ -2174,7 +2180,7 @@ inline void TypeCheck::ApplyCalleeStores(FnSpec *spec, vector<Val> &argvals, Nod
         // Mapped from the body's own record, which an earlier call to it
         // left mapped for that call's arguments.
         auto e = storeevents[i];
-        if (e.elementlinks) continue;  // Only class destinations need mapping, below.
+        if (e.elementlink) continue;  // Only class destinations need mapping, below.
         if (auto k = i - rec->eventstart; k < rec->bodyevents.size()) {
             auto &b = rec->bodyevents[k];
             e.container = b.container;
@@ -2393,7 +2399,7 @@ inline void TypeCheck::ApplyCalleeStores(FnSpec *spec, vector<Val> &argvals, Nod
         } else {
             if (bodystores.empty())
                 for (size_t k = 0; k < rec->bodyevents.size(); k++)
-                    if (!storeevents[rec->eventstart + k].elementlinks)
+                    if (!storeevents[rec->eventstart + k].elementlink)
                         bodystores[rec->bodyevents[k].container].push_back(k);
             onpath.insert(x);
             auto outer = cycled;
@@ -2457,8 +2463,8 @@ inline void TypeCheck::ApplyCalleeStores(FnSpec *spec, vector<Val> &argvals, Nod
         }
         auto from = storeevents.size();
         replay.origin = (int)(&e - rec->classevents.data());
-        if (e.elementlinks)
-            RecordLinkStore(mapped(e.container, !e.bound), e.reached, e.elementlinks, at, e.intail);
+        if (e.elementlink)
+            RecordLinkStore(mapped(e.container, !e.bound), e.reached, e.elementlink, at);
         else
             applystore(e, mapped(e.root, e.exact), true);
         replay.origin = -1;
@@ -2598,14 +2604,17 @@ inline void TypeCheck::CheckGlobalShrinks() {
         }
         for (auto arr : arrays) {
             auto arrtype = gs.bound ? gs.bound : LoadType(arr->type);
-            if (gs.incoming && arr->elementlinks.All().direction == EL_ANY &&
-                RetainsRelativeSlot(LoadType(arr->type), ResizableArrayIn(arrtype), gs.replaced) &&
-                any_of(storeevents.begin(), storeevents.end(), [&](const StoreEvent &e) {
-                    return e.container == arr && e.elementlinks.direction == EL_ANY &&
-                           !(e.intail && gs.replaced && ResizableArrayIn(gs.replaced));
-                }))
-                ErrorIn(LocOf(gs.at), cat(gs.prefix, ": retained storage may have a "
-                        "self-relative link to a removed element (§5.1)"), gs.chain);
+            if (gs.incoming && arr->elementlinks) {
+                auto tail = ResizableArrayIn(arrtype);
+                auto emptiestail = gs.replaced && ResizableArrayIn(gs.replaced);
+                if (RetainsRelativeSlot(LoadType(arr->type), tail, gs.replaced) &&
+                    arr->elementlinks.Any([&](auto link) {
+                        return link.direction == EL_ANY && !(emptiestail && link.intail) &&
+                               LinkMayReachElements(tail, link.pointee);
+                    }))
+                    ErrorIn(LocOf(gs.at), cat(gs.prefix, ": retained storage may have a "
+                            "self-relative link to a removed element (§5.1)"), gs.chain);
+            }
             for (auto g : ast.globals) {
                 for (auto gd : g->defs) {
                     if (gd == arr || !gd->type || !HoldsPlainRef(gd->type)) continue;
@@ -3883,7 +3892,7 @@ inline void TypeCheck::ApplyCalleeShrinks(Node *at, FnSpec *spec, vector<Val> &a
         if (!k.relative) {
             for (; kill.at < storeevents.size(); kill.at++) {
                 auto &e = storeevents[kill.at];
-                if (e.elementlinks || e.container != kill.container) continue;
+                if (e.elementlink || e.container != kill.container) continue;
                 auto i = kill.at - storesbase;
                 if (i >= origins.size() || origins[i] < 0 || k.writes.count(origins[i])) break;
             }
@@ -3905,7 +3914,7 @@ inline void TypeCheck::ApplyCalleeShrinks(Node *at, FnSpec *spec, vector<Val> &a
     auto projectlinks = [&](const set<int> *live) {
         for (size_t i = 0; i < origins.size(); i++) {
             auto &e = storeevents[storesbase + i];
-            if (e.elementlinks && (!live || origins[i] < 0 || live->count(origins[i])))
+            if (e.elementlink && (!live || origins[i] < 0 || live->count(origins[i])))
                 cur.links.Add(e, storesbase + i);
         }
     };

@@ -1327,16 +1327,12 @@ inline bool TypeCheck::FitsAt(Val &v, TypeExpr *dt) {
             // Changing the outer layout moves or removes its header. Offsets
             // within the element run survive, but an offset to the array
             // itself would no longer address an array of its declared type.
-            if (t->kind == TY_ARRAY && v.elementlinks.All().arraytarget) {
-                vector<TypeExpr *> pointees;
-                SelfRelPointees(selem, pointees);
-                if (any_of(pointees.begin(), pointees.end(),
-                           [&](TypeExpr *p) { return TopConstEq(p, t); })) {
-                    fitfail = cat("cannot construct ", TypeStr(dt), " from ", TypeStr(t),
-                                  ": a self-relative link may name the source array itself, "
-                                  "whose layout the conversion changes (§3.9)");
-                    return false;
-                }
+            if (t->kind == TY_ARRAY &&
+                v.elementlinks.Any([&](auto link) { return TopConstEq(link.pointee, t); })) {
+                fitfail = cat("cannot construct ", TypeStr(dt), " from ", TypeStr(t),
+                              ": a self-relative link may name the source array itself, "
+                              "whose layout the conversion changes (§3.9)");
+                return false;
             }
             if (dt->arr->akind == A_GROWSHRINK && v.elementlinks) {
                 fitfail = cat("cannot construct ", TypeStr(dt), " from ", TypeStr(t),
@@ -1344,16 +1340,19 @@ inline bool TypeCheck::FitsAt(Val &v, TypeExpr *dt) {
                               "reference still names (§5.2)");
                 return false;
             }
-            if (IsArrayKind(t, A_LIMITED) && v.elementlinks.All().direction == EL_ANY) {
+            if (IsArrayKind(t, A_LIMITED) && v.elementlinks.MayPointForward()) {
                 fitfail = cat("cannot construct ", TypeStr(dt), " from ", TypeStr(t),
                               ": a self-relative link may name a slot beyond the live length "
                               "that the conversion would discard (§5.3)");
                 return false;
             }
             // All slots in the converted array now belong to its element run.
-            auto links = v.elementlinks.All();
-            v.elementlinks = {};
-            (IsArrayKind(dt, A_GROW) ? v.elementlinks.tail : v.elementlinks.other) = links;
+            ValueLinks links;
+            for (auto link : v.elementlinks.slots) {
+                link.intail = IsArrayKind(dt, A_GROW);
+                links.Include(link);
+            }
+            v.elementlinks = std::move(links);
             v.type = dt;
             return true;
         }
@@ -1403,9 +1402,10 @@ inline bool TypeCheck::FitsAt(Val &v, TypeExpr *dt) {
                 // bounds the pointee's lifetime will not do (§9.5).
                 auto want = dt->ref->pool ? dt->ref->pool : curdst.roots.Root();
                 auto have = dt->ref->pool ? PoolOf(links.Root()) : links.Root();
-                auto arraytarget = dt->ref->sub->kind == TY_ARRAY;
+                auto pointee = dt->ref->sub;
+                if (recordingrelative && !dt->ref->pool) pointee = LinkPointee(pointee);
                 auto fits = dt->ref->pool ? want && links.Exact() && have == want
-                    : RelativeDestination(links, curdst, fitnode, recordingrelative, false, arraytarget);
+                    : RelativeDestination(links, curdst, pointee, fitnode, recordingrelative);
                 if (!fits) {
                     auto why = links.Exact() ? string() : ReadBackWhy(links);
                     auto vroot = links.Root() ? links.Root()->name : string_view("static data");
@@ -1423,7 +1423,7 @@ inline bool TypeCheck::FitsAt(Val &v, TypeExpr *dt) {
                 }
                 if (recordingrelative && !dt->ref->pool && !curdst.result)
                     RecordLinkStore(curdst.roots, curdst.reached ? curdst.reached : dt,
-                                    { curdst.appended ? EL_BACKWARD : EL_ANY, arraytarget }, fitnode, curdst.intail);
+                                    { pointee, curdst.appended ? EL_BACKWARD : EL_ANY, curdst.intail }, fitnode);
                 v.type = dt;
                 return true;
             }
@@ -3244,7 +3244,7 @@ inline void TypeCheck::CheckSelfInit(Node *n, TypeExpr *ft, TypeExpr *selft) {
     // built: inside that pool.
     Roots poolroot;
     if (ft->ref->pool) poolroot.Set(ft->ref->pool, true);
-    if (ft->ref->pool && !RelativeDestination(poolroot, curdst, n, true))
+    if (ft->ref->pool && !RelativeDestination(poolroot, curdst, LinkPointee(selft), n, true))
         Error(n, cat("self initializes ", TypeStr(ft), " only in a literal being built "
                      "inside ", ft->ref->pool->name, " (a push, an append, an alloc, or an "
                      "element store), since it stores the value's own offset in it (§3.9)"));

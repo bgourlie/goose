@@ -104,6 +104,7 @@ inline bool IsBranchConstruct(const Node *n) {
 struct TypeCheck {
     Ast &ast;
     StableTypeGraph stabletypes;
+    vector<TypeExpr *> linkpointees;
     unordered_map<const void *, vector<TypeExpr *>> arrayelements;
     // CanContain's and ReachesThroughRefs' answers for complete type graphs:
     // RootCandidates asks them of every variable in scope and every global,
@@ -275,14 +276,13 @@ struct TypeCheck {
     struct LinkFlow {
         struct Part {
             VarDef *owner;
-            SlotLinks kind;
-            bool intail;
+            ElementLink link;
             int summary;
             auto operator<=>(const Part &) const = default;
         };
         map<Part, size_t> live;
         void Add(const StoreEvent &e, size_t index) {
-            live[{e.container, e.elementlinks, e.intail, e.linkclass}] = index;
+            live[{e.container, e.elementlink, e.linkclass}] = index;
         }
         void Join(const LinkFlow &other) {
             for (auto &[part, at] : other.live) {
@@ -571,8 +571,8 @@ struct TypeCheck {
         d.resultindex = index;
         return d;
     }
-    bool RelativeDestination(const Roots &source, Dest dest, Node *at, bool record,
-                             bool forwarding = false, bool arraytarget = false);
+    bool RelativeDestination(const Roots &source, Dest dest, TypeExpr *pointee, Node *at,
+                             bool record, bool forwarding = false);
     void CheckCalleeRelative(Call *call, FnSpec *spec, vector<Val> &args);
     bool ResultLayoutFits(TypeExpr *from, TypeExpr *to);
     // A declaration's immediate initializer and its owner, for root construction
@@ -1328,7 +1328,6 @@ struct TypeCheck {
     // back to. Both walk the element type; `why` explains a refusal.
     bool ImageSafe(TypeExpr *t, string &why);
     bool VerifiableElem(TypeExpr *t, TypeExpr *elem, string &why);
-    bool HoldsRelRef(TypeExpr *t);
 
     // Is this a type an uninitialized `var x: T;` may have: fixed-size, so a
     // later whole-value assignment fully constructs it.
@@ -1764,6 +1763,7 @@ struct TypeCheck {
     void CheckNamedResultUses(FnSpec *spec);
     VarDef *NamedResultOf(FnSpec *spec);
     void SelfRelPointees(TypeExpr *t, vector<TypeExpr *> &out);
+    TypeExpr *LinkPointee(TypeExpr *t);
     bool NamedResultKeepsLinks(TypeExpr *t);
 
     // ------------------------------------------------------------------
@@ -2613,6 +2613,7 @@ struct TypeCheck {
                          bool empties);
     void GrowOnlyAssignKnown(Assign *a, const Roots &built, bool whole);
     bool RetainsRelativeSlot(TypeExpr *part, TypeExpr *array, TypeExpr *replaced);
+    bool LinkMayReachElements(TypeExpr *array, TypeExpr *pointee);
     ValueLinks LiveElementLinks(VarDef *owner, TypeExpr *target = nullptr,
                                TypeExpr *replaced = nullptr, bool callerchecks = false);
     // Whether a shrink whose receiver has these roots knows the arrays it
@@ -2693,9 +2694,9 @@ struct TypeCheck {
     void NoteLitElem(LitDeep &deep, Node *at, const Val &v, TypeExpr *t);
     void HolderFromLit(Val &v, const LitDeep &deep);
     void AddStoreEvent(const StoreEvent &e);
-    void RecordElementLinks(const Roots &owners, TypeExpr *reached, ValueLinks links, Node *at,
+    void RecordElementLinks(const Roots &owners, TypeExpr *reached, const ValueLinks &links, Node *at,
                             bool intail = false);
-    void RecordLinkStore(const Roots &owners, TypeExpr *reached, SlotLinks links, Node *at, bool intail);
+    void RecordLinkStore(const Roots &owners, TypeExpr *reached, ElementLink link, Node *at);
     void NoteSlotStore(const StoreEvent &e);
     // How NeverStoredError words a grow-shrink array `gs` a value pointing at
     // `roots` may point into: as the array itself where it is the value's one

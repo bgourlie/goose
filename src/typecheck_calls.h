@@ -3019,8 +3019,8 @@ inline bool TypeCheck::SameRecord(const FnRecord &a, const FnRecord &b, const Fn
     if (a.relativestores.size() != b.relativestores.size()) return why("relative destinations");
     for (auto &p : a.relativestores)
         if (none_of(b.relativestores.begin(), b.relativestores.end(), [&](const auto &q) {
-                return p.intail == q.intail && p.arraytarget == q.arraytarget && p.result == q.result && sameroots(p.source, q.source) &&
-                       sameroots(p.destination, q.destination);
+                return p.intail == q.intail && p.pointee == q.pointee && p.result == q.result &&
+                       sameroots(p.source, q.source) && sameroots(p.destination, q.destination);
             }))
             return why("relative destinations");
     if (a.mayreturn != b.mayreturn) return why("normal completion");
@@ -3078,7 +3078,7 @@ inline bool TypeCheck::SameRecord(const FnRecord &a, const FnRecord &b, const Fn
             return why("live shrinks");
     }
     auto sameevents = [&](const StoreEvent &p, const StoreEvent &q) {
-        return p.container == q.container && p.elementlinks == q.elementlinks && p.intail == q.intail &&
+        return p.container == q.container && p.elementlink == q.elementlink &&
                p.root == q.root && p.src == q.src &&
                p.exact == q.exact && p.byteview == q.byteview && p.bound == q.bound &&
                p.slot == q.slot && p.sliceref == q.sliceref && p.classread == q.classread &&
@@ -4195,8 +4195,8 @@ inline bool TypeCheck::ResultLayoutFits(TypeExpr *from, TypeExpr *to) {
 // relationship between parameter classes and captured storage is likewise
 // checked at every call, rather than assumed from the call that first
 // specialized the body. Concrete local roots must agree here.
-inline bool TypeCheck::RelativeDestination(const Roots &source, Dest dest, Node *at, bool record,
-                                          bool forwarding, bool arraytarget) {
+inline bool TypeCheck::RelativeDestination(const Roots &source, Dest dest, TypeExpr *pointee,
+                                          Node *at, bool record, bool forwarding) {
     if (source.None() || dest.unknown) return true;
     if (!source.Exact() || (!dest.result && !dest.roots.Exact())) return false;
     auto roots = source;
@@ -4238,13 +4238,13 @@ inline bool TypeCheck::RelativeDestination(const Roots &source, Dest dest, Node 
     if (dest.used) *dest.used = true;
     FnRecord::RelativeStore rs;
     rs.intail = dest.intail;
-    rs.arraytarget = arraytarget;
+    rs.pointee = pointee;
     rs.source.Set(have, true);
     if (dest.result) rs.result = dest.resultindex;
     else rs.destination.Set(want, true);
     auto &stores = spec->record.relativestores;
     if (none_of(stores.begin(), stores.end(), [&](const auto &s) {
-            return s.intail == rs.intail && s.arraytarget == rs.arraytarget && s.result == rs.result &&
+            return s.intail == rs.intail && s.pointee == rs.pointee && s.result == rs.result &&
                    s.source == rs.source && s.destination == rs.destination;
         }))
         stores.push_back(rs);
@@ -4288,7 +4288,7 @@ inline void TypeCheck::CheckCalleeRelative(Call *call, FnSpec *spec, vector<Val>
             }
         }
         dest.intail |= s.intail;
-        if (!RelativeDestination(source, dest, call, true, true, s.arraytarget)) {
+        if (!RelativeDestination(source, dest, s.pointee, call, true, true)) {
             auto target = source.Root() ? string(source.Root()->name) : string("static data");
             auto receiver = dest.result ? cat("result ", dest.resultindex + 1, " of ", dest.result->sf->name)
                 : dest.roots.Root() ? string(dest.roots.Root()->name) : string("a temporary or argument slot");
@@ -4297,8 +4297,8 @@ inline void TypeCheck::CheckCalleeRelative(Call *call, FnSpec *spec, vector<Val>
                             target, " to receiving storage ", receiver));
         }
         if (s.result >= 0 && dest.reached && !dest.result && !source.None())
-            RecordLinkStore(dest.roots, dest.reached, { dest.appended ? EL_BACKWARD : EL_ANY, s.arraytarget },
-                            call, dest.intail);
+            RecordLinkStore(dest.roots, dest.reached,
+                            { s.pointee, dest.appended ? EL_BACKWARD : EL_ANY, dest.intail }, call);
     }
 }
 
