@@ -2008,7 +2008,7 @@ inline void TypeCheck::ReplayEnvExits(FnSpec *spec) {
 // and those it may have assigned, where none could be (FnRecord::outerexits).
 // The exit leaves the bodies checked in the frames above tf too, each of
 // which records what it had assigned by then for a call reusing it.
-inline void TypeCheck::NoteExit(int tf, const vector<RetRoot> &results, const OuterExit *added) {
+inline void TypeCheck::NoteExit(int tf, const vector<RetRoot> &results, const FnRecord::OuterExit *added) {
     auto e = frames[tf].exits;
     if (!reachable || !e) return;
     auto isassigned = [&](VarDef *v) {
@@ -2030,12 +2030,16 @@ inline void TypeCheck::NoteExit(int tf, const vector<RetRoot> &results, const Ou
     };
     auto target = frames[tf].spec;
     auto current = RealFrameIndex();
+    auto exitlinks = [&] {
+        return FnRecord::ExitLinks { CallerKills(frames[current].spec, true), cur.links.ClassStores() };
+    };
     // The caller replays this exit after applying the callee's stores. Each
     // activation unwinds its own defers before passing the result on.
     if (current != tf) {
         auto mine = frames[current].exits;
         if (!mine) return;
-        OuterExit x { target };
+        FnRecord::OuterExit x { target };
+        x.links = exitlinks();
         for (size_t i = 0; i < mine->vars.size(); i++) {
             auto v = mine->vars[i];
             if (isassigned(v)) x.assigned.emplace(v, assignedplace(v));
@@ -2055,6 +2059,7 @@ inline void TypeCheck::NoteExit(int tf, const vector<RetRoot> &results, const Ou
                 }
             }
             o.maybeassigned.insert(x.maybeassigned.begin(), x.maybeassigned.end());
+            o.links.Join(x.links);
             merge(o.results);
             return;
         }
@@ -2070,49 +2075,36 @@ inline void TypeCheck::NoteExit(int tf, const vector<RetRoot> &results, const Ou
     }
     if (target) {
         merge(target->record.retroots);
-        // A nonlocal exit or a callback need not have this activation's
-        // current paths. Only export overwrites that every exit proves.
-        vector<FnRecord::CallerKill> out;
-        if (!added && !frames.back().isfunval) {
-            auto stores = cur.links.ClassStores();
-            target->record.exitlinkstores.insert(stores.begin(), stores.end());
-            out = CallerKills(target, true);
-        } else target->record.unknownexitlinks = true;
-        auto &all = target->record.exitoverwrites;
-        if (!e->reached) all = std::move(out);
-        else FnRecord::IntersectKills(all, out);
+        auto &all = target->record.exitlinks;
+        if (!e->reached) all = exitlinks();
+        else all.Join(exitlinks());
     }
     e->reached = true;
 }
 
 // A nonlocal return leaves this activation through its caller's defer chain.
 // The ordinary continuation of the call keeps its own flow state.
-inline void TypeCheck::ReplayOuterExits(const FnSpec *spec, const vector<OuterExit> &exits) {
-    for (auto &x : exits) {
-        auto tf = FrameOfSpec(x.target);
-        if (tf < 0) continue;
-        auto flow = SaveFlow();
-        // Specialization has already applied the callee's ordinary exits
-        // to captured variables. Start this exit with their entry bindings
-        // and apply only the assignments made along the nonlocal return.
-        for (auto &e : flow.locals) {
-            auto v = e.var;
-            for (auto &r : spec->envreads) if (r.var == v) {
-                v->assigned = r.assigned;
-                v->maybeassigned = r.maybeassigned;
-                v->refplace = r.refplace;
-                break;
-            }
-            if (auto it = x.assigned.find(v); it != x.assigned.end()) {
-                v->assigned = true;
-                v->refplace = it->second;
-            }
-            v->maybeassigned |= x.maybeassigned.count(v) != 0;
+inline void TypeCheck::ReplayOuterExit(int tf, const FnSpec *spec, const FnRecord::OuterExit &x,
+                                       const FlowState &entry) {
+    // Specialization has already applied the callee's ordinary exits
+    // to captured variables. Start this exit with their entry bindings
+    // and apply only the assignments made along the nonlocal return.
+    for (auto &e : entry.locals) {
+        auto v = e.var;
+        for (auto &r : spec->envreads) if (r.var == v) {
+            v->assigned = r.assigned;
+            v->maybeassigned = r.maybeassigned;
+            v->refplace = r.refplace;
+            break;
         }
-        ExitLinkDefers(std::max(frames[tf].scopebase, CurRealFrame().scopebase));
-        NoteExit(tf, x.results, &x);
-        RestoreFlow(flow);
+        if (auto it = x.assigned.find(v); it != x.assigned.end()) {
+            v->assigned = true;
+            v->refplace = it->second;
+        }
+        v->maybeassigned |= x.maybeassigned.count(v) != 0;
     }
+    ExitLinkDefers(std::max(frames[tf].scopebase, CurRealFrame().scopebase));
+    NoteExit(tf, x.results, &x);
 }
 
 // A cycle's members read each other's records at their back edges, so each
@@ -3053,8 +3045,7 @@ inline bool TypeCheck::SameRecord(const FnRecord &a, const FnRecord &b, const Fn
     if (!RelativeStore::SameSet(a.relativestores, b.relativestores, Roots::Compare::Cycle))
         return why("relative destinations");
     if (a.mayreturn != b.mayreturn) return why("normal completion");
-    if (a.exitoverwrites != b.exitoverwrites || a.exitlinkstores != b.exitlinkstores ||
-        a.unknownexitlinks != b.unknownexitlinks) return why("link effects on return");
+    if (a.exitlinks != b.exitlinks) return why("link effects on return");
     auto sameresults = [](const vector<RetRoot> &x, const vector<RetRoot> &y) {
         return equal(x.begin(), x.end(), y.begin(), y.end(),
                      [](const auto &p, const auto &q) { return p.Same(q, Roots::Compare::Cycle); });
@@ -3062,7 +3053,7 @@ inline bool TypeCheck::SameRecord(const FnRecord &a, const FnRecord &b, const Fn
     if (!sameresults(a.retroots, b.retroots)) return why("return roots");
     if (!is_permutation(a.outerexits.begin(), a.outerexits.end(), b.outerexits.begin(), b.outerexits.end(),
             [&](const auto &p, const auto &q) {
-                return p.target == q.target && p.assigned == q.assigned &&
+                return p.target == q.target && p.links == q.links && p.assigned == q.assigned &&
                        p.maybeassigned == q.maybeassigned && sameresults(p.results, q.results);
             })) return why("nonlocal exits");
     auto sameeffect = [&](const ShrinkEffect &p, const ShrinkEffect &q) {
@@ -3230,7 +3221,7 @@ inline void TypeCheck::CheckSpecBodyOnce(FnSpec *spec, vector<Val> *argvals, Lin
             }
         }
         if (auto links = spec->roots[i].elementlinks)
-            RecordElementLinks(RootsOf(vd), pt, links, sf->body);
+            RecordElementLinks(Dest(vd), pt, links, sf->body);
         vd->assigned = vd->maybeassigned = true;
         for (auto li : spec->litparams) if (li == (int)i) vd->unsized = true;
         if (IsRefOrSlice(pt)) {
@@ -4190,7 +4181,7 @@ inline Val TypeCheck::CheckFunValCall(Call *c, const FnValBind &fb, TypeExpr *ex
             NoteRefPlace(vd, argvals[i]);
         } else {
             if (argvals[i].elementlinks)
-                RecordElementLinks(RootsOf(vd), ptypes[i], argvals[i].elementlinks, c->args[i]);
+                RecordElementLinks(Dest(vd), ptypes[i], argvals[i].elementlinks, c->args[i]);
             if (HoldsPlainRef(ptypes[i])) NoteHolderBinding(vd, argvals[i], c->args[i]);
         }
         // A literal parameter handed to the block stays one inside it.

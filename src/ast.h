@@ -754,32 +754,41 @@ struct ElementLink {
 // A value can contain links to several types. Join directions only for the
 // same pointee type and slot location, since clearing a tail keeps the header.
 struct ValueLinks {
-    small_vector<ElementLink, 1> slots;
+    struct Slot {
+        ElementLink link;
+        string_view path;  // Interned enclosing inline fields, relative to the value.
+        bool operator==(const Slot &) const = default;
+    };
+    small_vector<Slot, 1> slots;
     explicit operator bool() const { return !slots.empty(); }
-    bool Include(ElementLink link) {
+    bool Include(ElementLink link, string_view path = {}) {
         for (auto &known : slots) {
-            if (!known.SameSlotKind(link)) continue;
-            if (known.direction >= link.direction) return false;
-            known.direction = link.direction;
+            if (!known.link.SameSlotKind(link) || known.path != path) continue;
+            if (known.link.direction >= link.direction) return false;
+            known.link.direction = link.direction;
             return true;
         }
-        slots.push_back(link);
+        slots.push_back({ link, path });
         return true;
     }
     void Include(const ValueLinks &other, bool intail = false) {
-        for (auto link : other.slots) {
+        for (auto &[value, path] : other.slots) {
+            auto link = value;
             link.intail |= intail;
-            Include(link);
+            Include(link, path);
         }
     }
-    template<typename F> bool Any(F f) const { return any_of(slots.begin(), slots.end(), f); }
+    template<typename F> bool Any(F f) const {
+        return any_of(slots.begin(), slots.end(), [&](const Slot &s) { return f(s.link); });
+    }
     bool MayPointForward() const {
         return Any([](auto link) { return link.direction == EL_ANY; });
     }
     bool Covers(const ValueLinks &other) const {
-        return all_of(other.slots.begin(), other.slots.end(), [&](auto link) {
-            return Any([&](auto known) {
-                return known.SameSlotKind(link) && known.direction >= link.direction;
+        return all_of(other.slots.begin(), other.slots.end(), [&](const Slot &s) {
+            return any_of(slots.begin(), slots.end(), [&](const Slot &known) {
+                return known.path == s.path && known.link.SameSlotKind(s.link) &&
+                       known.link.direction >= s.link.direction;
             });
         });
     }
@@ -2454,15 +2463,6 @@ struct EnvRead {
     RefPlace refplace;
 };
 
-// An exit of a body outside a specialization's activation that its check
-// took (FnRecord::outerexits).
-struct OuterExit {
-    FnSpec *target = nullptr;
-    map<VarDef *, RefPlace> assigned;
-    set<VarDef *> maybeassigned;
-    vector<RetRoot> results; // As evaluated before unwinding, in the target's coordinates.
-};
-
 // The analysis a checked body exposes to its callers. A recursive round
 // moves this record aside and starts a fresh one; specialization identity,
 // parameters, lexical environment and annotated code are never snapshotted.
@@ -2482,7 +2482,6 @@ struct FnRecord {
     // A return-from to an outer body does not, although its C function returns
     // normally to propagate that exit. Unknown recursive calls may return.
     bool mayreturn = true;
-    vector<OuterExit> outerexits; // Nonlocal returns that completed this activation's defers.
     vector<RetRoot> retroots;      // Per ret: the checked returns' roots and the prediction.
     // External optional bindings this body (or a callee) may rebind.
     set<VarDef *> reboundoptionals;
@@ -2554,11 +2553,26 @@ struct FnRecord {
         vector<CallerKill> kills;
     };
     vector<ShrinkOrder> shrinkorders;
-    // Parts of reference arguments or globals overwritten on every normal return.
-    // Exit stores are applied after these guaranteed overwrites.
-    vector<CallerKill> exitoverwrites;
-    set<int> exitlinkstores;
-    bool unknownexitlinks = false;  // A nonlocal exit outside the checked activation.
+    // Effects on the caller's storage after this activation's defers.
+    // At each destination only common overwrites and possible writes survive.
+    struct ExitLinks {
+        vector<CallerKill> overwrites;
+        set<int> stores;
+        void Join(const ExitLinks &other) {
+            IntersectKills(overwrites, other.overwrites);
+            stores.insert(other.stores.begin(), other.stores.end());
+        }
+        bool operator==(const ExitLinks &) const = default;
+    };
+    ExitLinks exitlinks;  // Ordinary returns to the immediate caller.
+    struct OuterExit {
+        FnSpec *target = nullptr;
+        map<VarDef *, RefPlace> assigned;
+        set<VarDef *> maybeassigned;
+        vector<RetRoot> results; // As evaluated before unwinding, in the target's coordinates.
+        ExitLinks links;         // Stores and overwrites in this activation's coordinates.
+    };
+    vector<OuterExit> outerexits;
     size_t eventstart = 0;         // storeevents.size() when the body's check began.
     size_t eventend = 0;           // And when it ended.
     // Where those events pointed as the check left them, at the body's

@@ -59,11 +59,43 @@ fn distant_result(stop: bool) -> Node[] {
     return nodes;
 }
 
+fn break_result(stop: bool) -> Node[] {
+    block {
+        if stop {
+            defer { abort("stop"); }
+            break linked();
+        }
+        [Node {}]
+    }
+}
+
+fn block_tail(stop: bool) -> Node[] {
+    block {
+        if !stop { break [Node {}]; }
+        defer { abort("stop"); }
+        linked()
+    }
+}
+
+struct Stop { flag: bool }
+fn format(out: u8[>..]&, stop: Stop) { abort("stop"); }
+fn formatted_result(stop: bool) -> Node[] {
+    if stop {
+        defer { print([Stop { flag: true }; 2]); }
+        return linked();
+    }
+    [Node {}]
+}
+
 fn main() {
     var explicit: Node[>..<] = explicit_result(false);
     var tail: Node[>..<] = tail_result(false);
     var distant: Node[>..<] = distant_result(false);
     assert(explicit.len == 2 && tail.len == 2 && distant.len == 2);
+    var from_break: Node[>..<] = break_result(false);
+    var from_tail: Node[>..<] = block_tail(false);
+    var from_format: Node[>..<] = formatted_result(false);
+    assert(from_break.len == 1 && from_tail.len == 1 && from_format.len == 1);
     stopped(false);
     var nodes: Node[>..] = [Node {}, Node {}];
     { defer { nodes[0].next .= nodes[1]; } }

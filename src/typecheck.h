@@ -405,7 +405,7 @@ struct TypeCheck {
         bool valuelessbreak = false;
         // For SK_LOOP/SK_BLOCK: the join of the states at the breaks out of
         // it reached so far, which the construct exits in besides its own
-        // exit, if it has one (NoteBreak, JoinBreakFlow).
+        // exit, if it has one (CheckBreak, JoinBreakFlow).
         FlowState breakflow;
         bool breakflows = false;
         // For SK_LOOP: the join of the states at its back edges so far (the
@@ -1662,8 +1662,8 @@ struct TypeCheck {
     // callee takes -- a function value's `return`, a `return from`. A
     // callee records such an exit (FnRecord::outerexits), which a call reusing
     // it takes again.
-    void NoteExit(int tf, const vector<RetRoot> &results = {}, const OuterExit *added = nullptr);
-    void ReplayOuterExits(const FnSpec *spec, const vector<OuterExit> &exits);
+    void NoteExit(int tf, const vector<RetRoot> &results = {}, const FnRecord::OuterExit *added = nullptr);
+    void ReplayOuterExit(int tf, const FnSpec *spec, const FnRecord::OuterExit &exit, const FlowState &entry);
 
     // A loop body is checked as many times as it takes for what it feeds
     // back to its head to settle (CheckLoopPasses): the roots its rebinds
@@ -2341,8 +2341,7 @@ struct TypeCheck {
     void CheckBreak(Break *b);
     [[noreturn]] void JumpLeavesDefer(Node *at, const char *what);
     // A loop or block exits in the join of the states at its breaks
-    // (NoteBreak) and at its own exit, where it has one (JoinBreakFlow).
-    void NoteBreak(int si);
+    // (CheckBreak) and at its own exit, where it has one (JoinBreakFlow).
     void JoinBreakFlow(const Scope &sc, bool ownexit);
     void CheckContinue(Node *n);
 
@@ -2746,13 +2745,12 @@ struct TypeCheck {
     // The deepest root among the references a literal under construction
     // holds: its holder root (§9.2). Each literal owns its accumulator, so
     // checking a nested literal cannot replace its enclosing literal's facts.
-    void NoteLitElem(LitDeep &deep, Node *at, const Val &v, TypeExpr *t);
+    void NoteLitElem(LitDeep &deep, Node *at, const Val &v, TypeExpr *t, string_view field = {});
     void HolderFromLit(Val &v, const LitDeep &deep);
     void AddStoreEvent(const StoreEvent &e);
     void NoteRefPlace(VarDef *vd, const Val &v);
     RefPlace ArgumentPlace(FnSpec *spec, VarDef *param, const vector<Val> &args);
-    void RecordElementLinks(const Roots &owners, TypeExpr *reached, const ValueLinks &links, Node *at,
-                            LinkLocation place = {}, const LinkField &field = {});
+    void RecordElementLinks(const Dest &dest, TypeExpr *type, const ValueLinks &links, Node *at);
     void RecordLinkStore(const Roots &owners, TypeExpr *reached, ElementLink link, Node *at,
                          LinkLocation place = {}, const LinkField &field = {});
     void NoteSlotStore(const StoreEvent &e);

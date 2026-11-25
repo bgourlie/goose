@@ -1077,9 +1077,7 @@ inline void TypeCheck::MustFit(Val &v, Node *n, TypeExpr *dt) {
     auto from = LoadType(v.type);
     if (FitsAt(v, dt)) {
         if (v.elementlinks && !curdst.discarded && !IsRefOrSlice(dt) && !curdst.roots.None())
-            RecordElementLinks(curdst.roots, curdst.reached ? curdst.reached : dt, v.elementlinks,
-                               n, { curdst.place.intail || IsArrayKind(dt, A_GROW), curdst.place.param },
-                               curdst.field);
+            RecordElementLinks(curdst, dt, v.elementlinks, n);
         if (IsIntT(dt) && !TypeEq(from, dt)) {
             RelyOnNamed(v, n);
             if (v.flexint && dt->intstorage != IS_VARINT) RetypeFlexInt(n, dt);
@@ -1372,9 +1370,10 @@ inline bool TypeCheck::FitsAt(Val &v, TypeExpr *dt) {
             }
             // All slots in the converted array now belong to its element run.
             ValueLinks links;
-            for (auto link : v.elementlinks.slots) {
+            for (auto &[value, path] : v.elementlinks.slots) {
+                auto link = value;
                 link.intail = IsArrayKind(dt, A_GROW);
-                links.Include(link);
+                links.Include(link, path);
             }
             v.elementlinks = std::move(links);
             v.type = dt;
@@ -3211,7 +3210,7 @@ inline TypeCheck::LitDeep TypeCheck::CheckInits(StructLit *sl, vector<Field> &fi
             auto fv = fi.fromdefault
                           ? CheckDefaultInit(fi.val, ft, selft, sl, fields[sl->fieldindices[k]])
                           : CheckValue(fi.val, ft);
-            NoteLitElem(deep, fi.val, fv, ft);
+            NoteLitElem(deep, fi.val, fv, ft, selft->kind == TY_STRUCT ? fi.name : string_view {});
             if (component && HoldsPlainRef(ft)) NoteHolderBinding(component, fv, fi.val);
         }
     }

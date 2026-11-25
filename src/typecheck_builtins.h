@@ -955,7 +955,7 @@ inline void TypeCheck::CheckRenderable(Call *c, const char *what, TypeExpr *t, N
         c->fmtspecs.push_back({ t, sp });
         if (seen.executes) {
             ApplyCalleeStorage(c, sp, hookargs, "format", { nullptr, arg }, true);
-            ApplyCalleeRebinds(sp);
+            CalleesReturn({ sp }, reachable);
         }
         return;
     }
@@ -1019,7 +1019,10 @@ inline void TypeCheck::CheckRenderable(Call *c, const char *what, TypeExpr *t, N
                 auto loop = CheckLoopPasses(at, head, element);
                 // A dynamic sequence can be empty. A nonempty fixed array
                 // leaves with the effects of its last element in force.
-                if (count > 0 && loop.backedges) RestoreFlow(loop.backedge);
+                if (count > 0) {
+                    if (loop.backedges) RestoreFlow(loop.backedge);
+                    else reachable = false;
+                }
             }
             return;
         }
@@ -1339,14 +1342,17 @@ inline ValueLinks TypeCheck::LiveElementLinks(VarDef *owner, TypeExpr *target, T
     bool cleared = t && KilledFor(owner, owner, t, arr, since, true, replaced);
     auto emptiestail = replaced && ResizableArrayIn(replaced);
     ValueLinks links;
-    auto retain = [&](ElementLink link) {
-        if (link && !(emptiestail && link.intail) && LinkMayReachElements(arr, link.pointee))
-            links.Include(link);
+    auto retain = [&](ElementLink link, const LinkField &field) {
+        if (!link || (emptiestail && link.intail) || !LinkMayReachElements(arr, link.pointee)) return;
+        // A value read out of its owner carries its field paths with it.
+        // Shrink queries only need the types and directions of retained links.
+        auto named = !target && field.base == owner && !field.path.empty();
+        links.Include(link, named ? ast.Intern(field.path) : string_view {});
     };
     for (auto &[part, at] : cur.links.live) {
         if (part.owner != owner) continue;
         if (storage && cleared && at < since) continue;
-        retain(part.link);
+        retain(part.link, part.field);
     }
     auto spec = CurRealFrame().spec;
     // A named callee records shrinks of captured owners as external shrinks.
@@ -1358,7 +1364,7 @@ inline ValueLinks TypeCheck::LiveElementLinks(VarDef *owner, TypeExpr *target, T
             if (e.container == owner && e.elementlink &&
                 none_of(cur.kills.begin(), cur.kills.end(), [&](const Kill &k) {
                     return k.relative && k.container == owner && i < k.at && e.linkfield.Within(k.base, k.path);
-                })) retain(e.elementlink);
+                })) retain(e.elementlink, e.linkfield);
         }
     }
     return links;
@@ -1901,10 +1907,19 @@ inline void TypeCheck::CheckLinkShrink(const LinkShrink &s) {
 // so it never points into a grow-shrink array (§5.2), even where FitsAt has
 // no destination to check it against: in an argument, which passes none
 // since parameters die before their arguments' roots, or in a result.
-inline void TypeCheck::NoteLitElem(LitDeep &deep, Node *at, const Val &v, TypeExpr *t) {
+inline void TypeCheck::NoteLitElem(LitDeep &deep, Node *at, const Val &v, TypeExpr *t, string_view field) {
     if (!t) return;
     auto isrs = IsRefOrSlice(t);
-    if (!isrs) deep.elementlinks.Include(v.elementlinks, IsArrayKind(t, A_GROW));
+    // A struct field has a stable path. An array element or variant payload
+    // can only identify the enclosing array or enum when the value is stored.
+    if (!isrs) {
+        for (auto &[value, path] : v.elementlinks.slots) {
+            auto link = value;
+            link.intail |= IsArrayKind(t, A_GROW);
+            auto member = field.empty() ? string_view {} : ast.Intern(cat(".", field, path));
+            deep.elementlinks.Include(link, member);
+        }
+    }
     if (!isrs && !HoldsPlainRef(t)) return;
     if (v.isnull) return;
     const Roots &roots = isrs ? v.AsRoots() : ContentsOf(v);
@@ -2017,10 +2032,14 @@ inline RefPlace TypeCheck::ArgumentPlace(FnSpec *spec, VarDef *param, const vect
 
 // Internal links move with the complete element run. The destination alone
 // owns both ends, including when a call maps the store through a parameter.
-inline void TypeCheck::RecordElementLinks(const Roots &owners, TypeExpr *reached,
-                                          const ValueLinks &links, Node *at, LinkLocation place,
-                                          const LinkField &field) {
-    for (auto link : links.slots) RecordLinkStore(owners, reached, link, at, place, field);
+inline void TypeCheck::RecordElementLinks(const Dest &dest, TypeExpr *type, const ValueLinks &links, Node *at) {
+    auto place = dest.place;
+    place.intail |= IsArrayKind(type, A_GROW);
+    for (auto &[link, path] : links.slots) {
+        auto field = dest.field;
+        if (field.base && dest.fieldsteps) field.path += path;
+        RecordLinkStore(dest.roots, dest.reached ? dest.reached : type, link, at, place, field);
+    }
 }
 
 inline void TypeCheck::RecordLinkStore(const Roots &owners, TypeExpr *reached,
@@ -4299,14 +4318,21 @@ inline void TypeCheck::ApplyCalleeShrinks(Node *at, FnSpec *spec, vector<Val> &a
     };
     for (auto &h : hits) apply(h, judge(h));
     ApplyCalleeLiveShrinks(at, spec, argvals, name);
-    // On a long-distance return this activation also unwinds. The callee
-    // may have written any of the replayed stores before taking that exit.
-    ReplayOuterExits(spec, rec->outerexits);
-    if (applyexits && ordered && !rec->unknownexitlinks) {
-        cur.links = std::move(entrylinks);
-        for (auto &k : rec->exitoverwrites) argkill(k, true);
-        projectlinks(&rec->exitlinkstores);
+    auto projectexit = [&](const FnRecord::ExitLinks &exit) {
+        if (!ordered) return;
+        cur.links = entrylinks;
+        for (auto &k : exit.overwrites) argkill(k, true);
+        projectlinks(&exit.stores);
+    };
+    for (auto &exit : rec->outerexits) {
+        auto tf = FrameOfSpec(exit.target);
+        if (tf < 0) continue;
+        auto flow = SaveFlow();
+        projectexit(exit.links);
+        ReplayOuterExit(tf, spec, exit, flow);
+        RestoreFlow(flow);
     }
+    if (applyexits) projectexit(rec->exitlinks);
 }
 
 inline bool TypeCheck::BuiltInPlace(TypeExpr *elem) {

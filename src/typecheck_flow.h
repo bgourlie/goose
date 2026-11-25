@@ -1847,6 +1847,9 @@ inline Val TypeCheck::CheckEarlyBlock(EarlyBlock *x, TypeExpr *expected, bool wa
     if (!reachable) v.type = nullptr;
     auto sc = scopes.back();
     PopScope();
+    // Even a tail whose defer aborts was constructed with the block's
+    // result type. Its links only reach the receiver if it completes.
+    if (!reachable) v.elementlinks = {};
     x->body->exprtype = v.type ? v.type : ast.voidtype;
     JoinBreakFlow(sc, true);
     reachable = reachable || sc.hasbreak;  // Exits via the tail or any break.
@@ -2203,6 +2206,7 @@ inline void TypeCheck::CheckBreak(Break *b) {
     if (si == -2) Error(b, "break cannot cross a const for expansion boundary");
     if (si == -3) JumpLeavesDefer(b, "break");
     if (si < 0) Error(b, "break outside of a loop or block");
+    Val exit;
     if (b->val) {
         if (!Is<LoopExpr>(scopes[si].node) && !Is<EarlyBlock>(scopes[si].node))
             Error(b, "break with a value exits loop/block only");
@@ -2235,7 +2239,6 @@ inline void TypeCheck::CheckBreak(Break *b) {
         // but for a number's: an integer constant, or a float of literals,
         // adapts as a branch's does (§6.4), relying on the named constants
         // it was read from (RelyOnNamed).
-        Val exit;
         exit.SetProv(v);
         exit.type = v.type;
         if (v.type && v.type->kind == TY_REF) exit.refplace = v.refplace;
@@ -2264,35 +2267,29 @@ inline void TypeCheck::CheckBreak(Break *b) {
         // Nothing after the break can complete a [] that took no element type
         // here: the construct's value does not carry the literal form.
         if (v.emptyarr) Error(b->val, "cannot infer array element type");
-        // Checking the value opened and closed scopes of its own, so the
-        // construct's scope is addressed afresh rather than through a
-        // reference taken before.
-        auto &sc = scopes[si];
+    }
+    ExitLinkDefers(si);
+    auto &sc = scopes[si];
+    if (b->val) {
+        // All constructed values must agree on a type, including one whose
+        // defer aborts after construction. Only completing breaks carry links.
+        if (!reachable) exit.elementlinks = {};
         sc.breakvalue = JoinBranches(sc.breakvalue, sc.breaktype != nullptr, exit, true, b, true,
                                      sc.onjoinpath);
-        if (!sc.breaktype) sc.breaktype = v.type;
+        if (!sc.breaktype) sc.breaktype = exit.type;
         if (auto e = Is<EarlyBlock>(sc.node)) e->breaks.push_back(b);
         else if (auto l = Is<LoopExpr>(sc.node)) l->breaks.push_back(b);
     } else {
-        auto &sc = scopes[si];
         if (sc.breaktype)
             Error(b, "this construct mixes valueless and valued breaks");
         sc.valuelessbreak = true;
     }
-    NoteBreak(si);
+    if (reachable) {
+        sc.hasbreak = true;
+        sc.breakflow = sc.breakflows ? JoinFlow(sc.breakflow, SaveFlow()) : SaveFlow();
+        sc.breakflows = true;
+    }
     reachable = false;
-}
-
-// A break out of the loop or block of scope si: where it can be reached,
-// the construct exits in what holds here too.
-inline void TypeCheck::NoteBreak(int si) {
-    if (!reachable) return;
-    ExitLinkDefers(si);
-    if (!reachable) return;
-    auto &sc = scopes[si];
-    sc.hasbreak = true;
-    sc.breakflow = sc.breakflows ? JoinFlow(sc.breakflow, SaveFlow()) : SaveFlow();
-    sc.breakflows = true;
 }
 
 // Leaves the flow after a loop or block as the join of every exit of it
@@ -2950,7 +2947,7 @@ inline void TypeCheck::CheckBindingRoot(VarDef *d, const Val &v, Node *at) {
     auto t = v.type;
     if (!t || v.isnull) return;
     auto isrs = IsRefOrSlice(t);
-    if (v.elementlinks && !isrs) RecordElementLinks(RootsOf(d), t, v.elementlinks, at);
+    if (v.elementlinks && !isrs) RecordElementLinks(Dest(d), t, v.elementlinks, at);
     if (!isrs && !HoldsPlainRef(t)) return;
     const Roots &roots = isrs ? v.AsRoots() : ContentsOf(v);
     // A global is storage, which no reference into a grow-shrink array is
