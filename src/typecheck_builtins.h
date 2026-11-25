@@ -1581,7 +1581,7 @@ inline bool TypeCheck::KilledFor(VarDef *c, VarDef *base, TypeExpr *t, TypeExpr 
     // A reference into c whose pointee is of c's own type points at the
     // whole of it: no value holds one of its own type by value.
     auto whole = [&](VarDef *b) {
-        if (relative && !c->type && b->type && IsPlainRef(b->type) && b->ref.Exact() &&
+        if (relative && !c->type && b->type && IsAddressRef(b->type) && b->ref.Exact() &&
             b->ref.Root() == c && TopConstEq(b->type->ref->sub, t)) return c;
         if (b == c || !b->type || b->type->kind != TY_REF || !c->type || IsRefOrSlice(c->type))
             return b;
@@ -3178,14 +3178,14 @@ inline vector<FnRecord::CallerKill> TypeCheck::CallerKills(FnSpec *spec, bool re
     for (auto &k : cur.kills) {
         auto base = k.base;
         if (!k.relative || !base->type || (!base->isglobal && base->ownerspec == spec)) continue;
-        if (base != k.container && (base->isvar || !IsPlainRef(base->type) ||
+        if (base != k.container && (base->isvar || !IsAddressRef(base->type) ||
                                     !base->ref.Exact() || RefRootOf(base) != k.container))
             continue;
         out.push_back({ -1, k.path, true, k.container, base });
     }
     for (size_t p = 0; p < spec->params.size(); p++) {
         auto param = spec->params[p];
-        if (!IsPlainRef(param->type)) continue;
+        if (!IsAddressRef(param->type)) continue;
         for (auto &k : cur.kills) {
             if ((relativeonly && !k.relative) || k.base != param || k.container != RefRootOf(param)) continue;
             FnRecord::CallerKill kill { (int)p, k.path, k.relative };

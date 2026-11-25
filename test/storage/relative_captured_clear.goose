@@ -6,6 +6,12 @@ fn clear_array(nodes: Node[>..]&) {
     reset();
 }
 
+fn clear_optional(nodes: Node[>..]&?, nested: bool) {
+    assert(nodes);
+    fn reset() { nodes.clear(); }
+    if nested { reset(); } else { nodes.clear(); }
+}
+
 fn clear_field(list: List&, direct: bool) {
     let alias: List&;
     alias .= list;
@@ -21,6 +27,15 @@ fn main() {
     nodes.push(Node {});
     nodes.pop_n(1);
     assert(nodes.len == 0);
+    for nested in [false, true] {
+        nodes.push(Node {});
+        nodes.push(Node {});
+        nodes[0].next .= nodes[1];
+        clear_optional(nodes, nested);
+        nodes.push(Node {});
+        nodes.pop_n(1);
+        assert(nodes.len == 0);
+    }
 
     var list = List { head: Node {}, nodes: [] };
     for direct in [false, true] {
