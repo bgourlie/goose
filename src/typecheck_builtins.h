@@ -975,6 +975,7 @@ inline void TypeCheck::CheckRenderable(Call *c, const char *what, TypeExpr *t, N
     // part's slot is the value, as writable as that is (UserFormatIn).
     auto child = [&](TypeExpr *ft, bool throughref, int component = -1) {
         auto v = value;
+        v.refplace = {};  // The hook receives a part or a stored reference.
         if (component >= 0) v.TakeAlts(ProjectRoots(value, t, component));
         v.hasslot = ft->kind == TY_SLICE;
         if (v.hasslot) v.slot = v;
@@ -1491,7 +1492,8 @@ inline bool TypeCheck::KillPath(Node *n, VarDef *&base, string &path) {
 // owner. Record that identity even if the reference used to reach it is
 // rebound later. For a subobject we still need a stable field path.
 inline std::optional<TypeCheck::Kill> TypeCheck::OverwrittenPart(Node *n, const Roots &loc,
-                                                TypeExpr *target, bool relative, size_t at) {
+                                                TypeExpr *target, bool relative, size_t at,
+                                                const RefPlace *place) {
     if (!loc.Exact()) return {};
     auto owner = loc.Root();
     if (!owner || IsTemp(owner)) return {};
@@ -1499,7 +1501,11 @@ inline std::optional<TypeCheck::Kill> TypeCheck::OverwrittenPart(Node *n, const 
         return Kill { owner, owner, "", at, true };
     VarDef *base = nullptr;
     string path;
-    if (!KillPath(n, base, path) || (!IsRefOrSlice(base->type) && base != owner)) return {};
+    if (place && place->base) {
+        base = place->base;
+        path = place->path;
+    } else if (!KillPath(n, base, path)) return {};
+    if (!IsRefOrSlice(base->type) && base != owner) return {};
     Kill kill { owner, base, std::move(path), at, relative };
     // A reference field names its slot. An overwrite through it affects its pointee.
     if (relative && !KillNamesType(kill, target)) return {};
@@ -1512,7 +1518,7 @@ inline std::optional<TypeCheck::Kill> TypeCheck::OverwrittenPart(Node *n, const 
 inline std::optional<TypeCheck::Kill> TypeCheck::ArgumentKill(Node *arg, const Val &v,
                                                 TypeExpr *pointee, bool relative, size_t at) {
     if (auto u = Is<Unary>(arg); u && u->op == T_BITAND) arg = u->child;
-    auto kill = OverwrittenPart(arg, v, pointee, relative, at);
+    auto kill = OverwrittenPart(arg, v, pointee, relative, at, relative ? &v.refplace : nullptr);
     if (!kill) return {};
     auto base = kill->base, owner = kill->container;
     if (!relative && (owner->isglobal || owner->captured)) return {};
@@ -1929,42 +1935,24 @@ inline void TypeCheck::AddStoreEvent(const StoreEvent &e) {
     origin(evs.size() - 1);
 }
 
-// A directly bound element occupies its slot. A slice can view other storage,
-// and a reference element binds to the pointee loaded out of the slot.
-inline LinkLocation TypeCheck::ElementLocation(Node *sequence, TypeExpr *t) {
-    if (t->kind != TY_ARRAY || t->arr->sub->kind == TY_REF) return {};
-    if (IsArrayKind(t, A_GROW)) return { true };
-    return ReferentLocation(sequence);
-}
-
-// Where a checked argument binds by reference. Direct field and fixed-array
-// steps preserve the containing location. A reference stored in such a slot
-// may point elsewhere, even to a header field of the very same owner.
-inline LinkLocation TypeCheck::ReferentLocation(Node *n) {
-    if (auto u = Is<Unary>(n); u && u->op == T_BITAND) n = u->child;
-    if (auto id = Is<Ident>(n); id && id->vdef) return id->vdef->refplace.location;
-    auto dot = Is<Dot>(n);
-    auto index = Is<Index>(n);
-    if (!dot && !index) return {};
-    auto obj = dot ? dot->obj : index->obj;
-    if (!obj->exprtype) return {};
-    auto t = obj->exprtype;
-    if (t->kind == TY_REF) t = t->ref->sub;
-    if (index) return ElementLocation(obj, t);
-    if (!dot->IsField() || dot->fieldidx < 0) return {};
-    auto fields = FieldRuns(t);
-    if (fields.size() != 1) return {};
-    auto ft = (*fields[0].ftypes)[dot->fieldidx];
-    if (!ft || ft->kind == TY_REF) return {};
-    return ReferentLocation(obj);
+// An address taken from a path can identify an exact part of its owner.
+// Keep it on the reference so a value-producing construct can join it.
+inline void TypeCheck::NoteRefPath(Node *n, Val &v) {
+    auto target = v.type->ref->sub;
+    if (!HasRelRefT(target) || v.refplace.base) return;
+    if (auto k = ArgumentKill(n, v, target, true, 0)) {
+        v.refplace.base = k->base;
+        if (!k->path.empty()) v.refplace.path = ast.Intern(std::move(k->path));
+    }
 }
 
 // An immutable binding keeps both the location of the pointee and the exact
 // path a whole overwrite there can be expressed against.
 inline void TypeCheck::NoteRefPlace(VarDef *vd, Node *arg, const Val &v) {
-    if (vd->isvar || !IsPlainRef(vd->type) || !HasRelRefT(vd->type->ref->sub)) return;
+    if (vd->isvar || vd->type->kind != TY_REF || IsRelRef(vd->type) ||
+        !HasRelRefT(vd->type->ref->sub)) return;
     RefPlace place;
-    place.location = ReferentLocation(arg);
+    place.location = v.refplace.location;
     // A captured let can be initialized in a shorter-lived scope. Keep
     // facts expressed in bindings that will still exist wherever it is read.
     if (place.location.param && Depth(place.location.param) > Depth(vd)) place.location.param = nullptr;
@@ -1972,7 +1960,8 @@ inline void TypeCheck::NoteRefPlace(VarDef *vd, Node *arg, const Val &v) {
         auto k = ArgumentKill(arg, v, vd->type->ref->sub, true, 0);
         if (k && Depth(k->base) <= Depth(vd)) {
             place.base = k->base;
-            if (!k->path.empty()) place.path = ast.Intern(std::move(k->path));
+            if (k->path == v.refplace.path) place.path = v.refplace.path;
+            else if (!k->path.empty()) place.path = ast.Intern(std::move(k->path));
         }
     }
     vd->refplace = place;
@@ -2144,8 +2133,7 @@ inline Roots TypeCheck::ClassArgRoots(TypeExpr *pt, const Val &v) {
 // names assigns the slice variable each such storage may be (StoreIntoSlot).
 // A store into a holder grows its contents as the caller's own would, which
 // a loop around the call feeds back (NoteFact).
-inline void TypeCheck::ApplyCalleeStores(FnSpec *spec, vector<Val> &argvals,
-                                       const vector<Node *> &argnodes, Node *at,
+inline void TypeCheck::ApplyCalleeStores(FnSpec *spec, vector<Val> &argvals, Node *at,
                                        vector<int> *origins) {
     auto base = storeevents.size();
     // The class event each store added from `from` on replays.
@@ -2566,8 +2554,8 @@ inline void TypeCheck::ApplyCalleeStores(FnSpec *spec, vector<Val> &argvals,
                 // parameter used to reach the slot supplies its location.
                 auto it = find(spec->params.begin(), spec->params.end(), e.linkparam);
                 auto p = (size_t)(it - spec->params.begin());
-                place = it != spec->params.end() && p < argnodes.size()
-                            ? ReferentLocation(argnodes[p]) : LinkLocation {};
+                place = it != spec->params.end() && p < argvals.size()
+                            ? argvals[p].refplace.location : LinkLocation {};
             }
             RecordLinkStore(mapped(e.container, !e.bound), e.reached, e.elementlink, at, place);
         } else {
@@ -4083,7 +4071,7 @@ inline void TypeCheck::ApplyCalleeShrinks(Node *at, FnSpec *spec, vector<Val> &a
             ~Restore() { r = saved; }
         } restore { replay, replay };
         replay = { -1, &classorigins, classbase };
-        ApplyCalleeStores(spec, argvals, argnodes, at, &origins);
+        ApplyCalleeStores(spec, argvals, at, &origins);
     }
     // The record read: none in a cycle's first round (RecordOf), whose back
     // edge shrinks nothing yet.

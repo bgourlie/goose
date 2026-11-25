@@ -771,6 +771,9 @@ struct ValueLinks {
 // override returns one.
 enum ConstKind { CK_NONE, CK_INT, CK_FLT };
 struct Val : Prov {
+    // Storage denoted by an lvalue, or by a reference when non-null. A
+    // copied value and a reference read back from a slot have no known place.
+    RefPlace refplace;
     TypeExpr *type = nullptr;
     ConstKind ck = CK_NONE;
     int64_t ival = 0;

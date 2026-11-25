@@ -1163,6 +1163,10 @@ inline Val TypeCheck::MergeVals(const Val &a, bool areach, const Val &b, bool br
         v.contents = ContentsOf(a);
         v.contents.Add(ContentsOf(b));
     }
+    if (v.type && v.type->kind == TY_REF) {
+        // Only arms that can produce a pointee constrain its location.
+        v.refplace = a.isnull ? b.refplace : b.isnull ? a.refplace : a.refplace.Common(b.refplace);
+    }
     v.isnull = a.isnull && b.isnull;   // Both null: still a null, which names no root.
     // Both []: still a [], which takes the array type it meets (§6.4).
     v.emptyarr = a.emptyarr && b.emptyarr;
@@ -1320,6 +1324,7 @@ inline Val TypeCheck::TempCopy(Val v) {
     if (!v.type || v.isnull || v.type->kind == TY_REF || v.type->kind == TY_VOID ||
         v.type->kind == TY_FN)
         return v;
+    v.refplace = {};
     if (v.type->kind == TY_SLICE) {
         v.lvalue = false;
         v.slot = Prov {};
@@ -2084,7 +2089,10 @@ inline void TypeCheck::CheckFor(ForLoop *x) {
             // An element that is itself a reference binds as the one it holds
             // either way, there being no references to references (§3.8).
             if (byref && elem->kind != TY_REF) {
-                elementplace = ElementLocation(x->iter, t);
+                if (t->kind == TY_ARRAY) {
+                    elementplace = iv.refplace.location;
+                    elementplace.intail |= IsArrayKind(t, A_GROW);
+                }
                 bindtype = ast.RefTo(elem, x->line);
             } else {
                 // An element that *is* a relative reference loads as a
@@ -2231,6 +2239,7 @@ inline void TypeCheck::CheckBreak(Break *b) {
         Val exit;
         exit.SetProv(v);
         exit.type = v.type;
+        if (v.type && v.type->kind == TY_REF) exit.refplace = v.refplace;
         if (IntConsts(v, exit.litlo, exit.lithi)) {
             exit.litint = true;
             exit.nonneg = exit.litlo >= 0;

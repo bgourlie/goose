@@ -3207,7 +3207,7 @@ inline void TypeCheck::CheckSpecBodyOnce(FnSpec *spec, vector<Val> *argvals, Lin
         auto vd = NewVar(p.name, pt, p.line.line ? p.line : sf->line, p.isvar,
                          i < oldparams.size() ? oldparams[i] : nullptr);
         vd->isparam = true;
-        if (!vd->isvar && IsPlainRef(pt)) vd->refplace.location.param = vd;
+        if (!vd->isvar && pt->kind == TY_REF && !IsRelRef(pt)) vd->refplace.location.param = vd;
         if (auto links = spec->roots[i].elementlinks)
             RecordElementLinks(RootsOf(vd), pt, links, sf->body);
         vd->assigned = vd->maybeassigned = true;

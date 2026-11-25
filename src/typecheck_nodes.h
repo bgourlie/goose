@@ -91,6 +91,10 @@ inline Val Ident::Check(TypeCheck &tc, TypeExpr *) {
         v.type = tc.LoadType(t);
         if (IsRefOrSlice(t)) {
             v.SetProv(tc.RefProvOf(vd));
+            if (t->kind == TY_REF) {
+                v.refplace = vd->refplace;
+                if (!vd->isvar && !vd->istemp && !v.refplace.base) v.refplace.base = vd;
+            }
             v.lvalue = t->kind == TY_SLICE;   // A slice variable is storage; a reference is the pointee's path.
             if (v.lvalue) {
                 v.slot.Set(vd, true);
@@ -495,13 +499,21 @@ inline Val Dot::Check(TypeCheck &tc, TypeExpr *) {
     TypeCheck::LVal lv;
     lv.type = t;
     lv.SetProv(ov);
+    lv.place = ov.refplace.location;
     lv.intemp = tc.TempContents(ov, lv.contents);
     tc.ResolveMemberLValue(lv, this);
     if (lv.intemp) tc.NoRelRefTempRead(obj, t, lv.type);
     return tc.ContainerRead(lv);
 }
 
-inline Val Call::Check(TypeCheck &tc, TypeExpr *expected) { return tc.CheckCall(this, expected); }
+inline Val Call::Check(TypeCheck &tc, TypeExpr *expected) {
+    auto v = tc.CheckCall(this, expected);
+    // Return summaries map storage owners. An argument and the result can
+    // share an owner while denoting different subobjects.
+    v.refplace = {};
+    for (auto &r : tc.lastcallrets) r.refplace = {};
+    return v;
+}
 
 inline Val Index::Check(TypeCheck &tc, TypeExpr *) {
     TypeCheck::DestScope ds(tc, TypeCheck::Dest {});

@@ -120,6 +120,7 @@ inline TypeCheck::LVal TypeCheck::LValueBase(Node *n, bool cmpview) {
     LVal lv;
     lv.type = v.type;
     lv.SetProv(v);
+    if (v.type->kind == TY_REF) lv.place = v.refplace.location;
     // A value result is materialized in its own temporary storage. References
     // and slices instead retain the (possibly inexact) owner they borrow.
     lv.intemp = TempContents(v, lv.contents);
@@ -155,6 +156,7 @@ inline void TypeCheck::DerefLValue(LVal &lv, Node *at) {
     if (lv.var) {
         RequireAssigned(lv.var, at);
         lv.SetProv(RefProvOf(lv.var));
+        lv.place = lv.var->refplace.location;
     } else if (lv.fromstorage) {
         // Crossing a reference the path read out of a container: it is a
         // read-back, so where it points is re-derived, and it is as writable
@@ -162,8 +164,8 @@ inline void TypeCheck::DerefLValue(LVal &lv, Node *at) {
         // relative one loads as an ordinary reference into the same pool,
         // so it keeps the container's root.
         ReadBackLVal(lv);
+        lv.place = {};
     }
-    lv.place = lv.var ? lv.var->refplace.location : LinkLocation {};
     lv.type = lv.type->ref->sub;
     lv.reached = LoadType(lv.type);
     lv.var = nullptr;
@@ -267,6 +269,7 @@ inline bool TypeCheck::SlotLoadWritable(TypeExpr *t, bool path) {
 // reference or slice is a read-back (ReadBackLVal).
 inline Val TypeCheck::ContainerRead(LVal lv) {
     Val v;
+    if (lv.type->kind != TY_REF) v.refplace.location = lv.place;
     if (lv.type->kind == TY_SLICE) {
         v.slot = lv;
         v.hasslot = true;
@@ -728,6 +731,7 @@ inline Val TypeCheck::DecayRef(const Val &v) {
     Val r;
     r.type = LoadType(v.type->ref->sub);
     r.pointee = true;
+    r.refplace = v.refplace;
     // A slice is the one its slot holds, as writable as that is, and the
     // slot is where the reference points (Val::slot). Any other pointee
     // lies where the reference points, as writable as the reference, as a
@@ -788,6 +792,7 @@ inline Node *TypeCheck::AutoRef(Node *n, Val &v, bool writes) {
     v.type = ast.RefTo(ast.PlainOf(StorageType(v)), n->line);
     v.type->cq = !v.writable;   // The reference carries a const value's qualifier.
     v.lvalue = false;
+    NoteRefPath(n, v);
     u->exprtype = v.type;
     return u;
 }
@@ -1524,11 +1529,15 @@ inline Val TypeCheck::CheckRefOf(Unary *x) {
         Val v;
         v.type = LoadType(lv.type);  // Relative refs load as plain (§3.9).
         v.SetProv(RefProvOf(lv.var));
+        v.refplace = lv.var->refplace;
+        NoteRefPath(x->child, v);
         return v;
     }
     Val v;
     v.type = ast.RefTo(ast.PlainOf(lv.type), x->line);
     v.SetProv(lv);
+    v.refplace.location = lv.place;
+    NoteRefPath(x->child, v);
     // A field or an element of a const type is as read-only through a
     // reference as a variable of one (§9.5); a slice's qualifier is about
     // its elements, not the slot the reference names.

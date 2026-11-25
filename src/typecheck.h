@@ -2639,7 +2639,7 @@ struct TypeCheck {
     // hold a view into an `arr`'s elements, since which event.
     bool KillPath(Node *n, VarDef *&base, string &path);
     std::optional<Kill> OverwrittenPart(Node *n, const Roots &loc, TypeExpr *target, bool relative,
-                                        size_t at);
+                                        size_t at, const RefPlace *place = nullptr);
     std::optional<Kill> ArgumentKill(Node *arg, const Val &v, TypeExpr *pointee, bool relative, size_t at);
     void NoteKill(Node *lval, const Roots &loc, TypeExpr *target, const Val &v, size_t at);
     void NoteOverwrite(Node *path, const Roots &loc, size_t at, bool relative, TypeExpr *target);
@@ -2698,8 +2698,7 @@ struct TypeCheck {
     void NoteLitElem(LitDeep &deep, Node *at, const Val &v, TypeExpr *t);
     void HolderFromLit(Val &v, const LitDeep &deep);
     void AddStoreEvent(const StoreEvent &e);
-    LinkLocation ElementLocation(Node *sequence, TypeExpr *t);
-    LinkLocation ReferentLocation(Node *n);
+    void NoteRefPath(Node *n, Val &v);
     void NoteRefPlace(VarDef *vd, Node *arg, const Val &v);
     void RecordElementLinks(const Roots &owners, TypeExpr *reached, const ValueLinks &links, Node *at,
                             LinkLocation place = {});
@@ -2734,8 +2733,7 @@ struct TypeCheck {
                                      set<VarDef *> &seen);
     // `origins`: for each store event the call adds, the index of the class
     // event it replays, -1 for any other (CallOrder).
-    void ApplyCalleeStores(FnSpec *spec, vector<Val> &argvals, const vector<Node *> &argnodes,
-                           Node *at, vector<int> *origins = nullptr);
+    void ApplyCalleeStores(FnSpec *spec, vector<Val> &argvals, Node *at, vector<int> *origins = nullptr);
     void NoteHolderBinding(VarDef *d, const Val &v, Node *at);
 
     // Whether a global may hold a reference into a global array is known
