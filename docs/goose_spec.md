@@ -1441,6 +1441,14 @@ reference parameter that a caller may bind to the global being assigned, and
 a use through a call into a recursive cycle still being checked, which
 counts as using every global and every variable in scope.
 
+A `return`, `break`, or `continue` that leaves the right-hand side may
+abandon the replacement only if the receiver's storage goes out of scope
+on that exit and no defer observes it while unwinding. This includes a
+`return from` taken by a callee. An exit caught inside the right-hand side
+can still supply the value normally. For a receiver that survives, evaluate
+the potentially exiting computation first: write `let n = f(); xs = [n];`
+when `f()` could return from the function assigning to `xs`.
+
 Where the assignment names the array as a field (`t.chars = …`), the
 right-hand side may still name those other fields of the holding value that
 cannot lead back to the array. These are flat fields (§1.1), and fields

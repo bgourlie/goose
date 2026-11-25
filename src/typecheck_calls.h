@@ -2000,7 +2000,11 @@ inline void TypeCheck::ReplayEnvExits(FnSpec *spec) {
 // and those it may have assigned, where none could be (FnRecord::outerexits).
 // The exit leaves the bodies checked in the frames above tf too, each of
 // which records what it had assigned by then for a call reusing it.
-inline void TypeCheck::NoteExit(int tf, const vector<RetRoot> &results, const FnRecord::OuterExit *added) {
+inline void TypeCheck::NoteExit(int tf, Node *at, const vector<RetRoot> &results,
+                                const FnRecord::OuterExit *added, vector<FnRecord::InterruptedAssign> interrupted) {
+    auto current = RealFrameIndex();
+    interrupted = CheckExitScopes(std::max(frames[tf].scopebase, frames[current].scopebase), at,
+                                  current != tf, std::move(interrupted));
     auto e = frames[tf].exits;
     if (!reachable || !e) return;
     auto isassigned = [&](VarDef *v) {
@@ -2021,7 +2025,6 @@ inline void TypeCheck::NoteExit(int tf, const vector<RetRoot> &results, const Fn
         for (size_t i = 0; i < results.size(); i++) to[i].Include(results[i]);
     };
     auto target = frames[tf].spec;
-    auto current = RealFrameIndex();
     auto exitlinks = [&] {
         return FnRecord::ExitLinks { CallerKills(frames[current].spec, true), cur.links.ClassStores() };
     };
@@ -2032,6 +2035,7 @@ inline void TypeCheck::NoteExit(int tf, const vector<RetRoot> &results, const Fn
         if (!mine) return;
         FnRecord::OuterExit x { target };
         x.links = exitlinks();
+        x.interrupted = std::move(interrupted);
         for (auto writes : { &cur.interruptedresults, &cur.links.resultlinks })
             for (auto &link : *writes)
                 if (link.resultowner != target) link.AddTo(x.partialresults);
@@ -2055,6 +2059,7 @@ inline void TypeCheck::NoteExit(int tf, const vector<RetRoot> &results, const Fn
             }
             o.maybeassigned.insert(x.maybeassigned.begin(), x.maybeassigned.end());
             o.links.Join(x.links);
+            for (auto &a : x.interrupted) a.AddTo(o.interrupted);
             for (auto &link : x.partialresults) link.AddTo(o.partialresults);
             merge(o.results);
             return;
@@ -2080,8 +2085,8 @@ inline void TypeCheck::NoteExit(int tf, const vector<RetRoot> &results, const Fn
 
 // A nonlocal return leaves this activation through its caller's defer chain.
 // The ordinary continuation of the call keeps its own flow state.
-inline void TypeCheck::ReplayOuterExit(int tf, const FnSpec *spec, const FnRecord::OuterExit &x,
-                                       const FlowState &entry) {
+inline void TypeCheck::ReplayOuterExit(int tf, FnSpec *spec, const FnRecord::OuterExit &x,
+                                       const FlowState &entry, Node *at, vector<Val> &args) {
     // Specialization has already applied the callee's ordinary exits
     // to captured variables. Start this exit with their entry bindings
     // and apply only the assignments made along the nonlocal return.
@@ -2099,8 +2104,16 @@ inline void TypeCheck::ReplayOuterExit(int tf, const FnSpec *spec, const FnRecor
         }
         v->maybeassigned |= x.maybeassigned.count(v) != 0;
     }
-    ExitLinkDefers(std::max(frames[tf].scopebase, CurRealFrame().scopebase));
-    NoteExit(tf, x.results, &x);
+    auto interrupted = x.interrupted;
+    for (auto &a : interrupted) {
+        a.place = CallerPlace(a.place, spec, args);
+        Roots mapped;
+        mapped.unknown = a.owners.unknown;
+        for (auto &owner : a.owners.alts)
+            mapped.Add(RetAltVal(spec, owner, args, a.type, at).AsRoots());
+        a.owners = std::move(mapped);
+    }
+    NoteExit(tf, at, x.results, &x, std::move(interrupted));
 }
 
 // A cycle's members read each other's records at their back edges, so each
@@ -3050,6 +3063,11 @@ inline bool TypeCheck::SameRecord(const FnRecord &a, const FnRecord &b, const Fn
     if (!is_permutation(a.outerexits.begin(), a.outerexits.end(), b.outerexits.begin(), b.outerexits.end(),
             [&](const auto &p, const auto &q) {
                 return p.target == q.target && p.links == q.links && p.assigned == q.assigned &&
+                       is_permutation(p.interrupted.begin(), p.interrupted.end(), q.interrupted.begin(),
+                           q.interrupted.end(), [](const auto &a, const auto &b) {
+                               return a.lval == b.lval && a.place == b.place &&
+                                      a.owners.Same(b.owners, Roots::Compare::Cycle);
+                           }) &&
                        RelativeStore::SameSet(p.partialresults, q.partialresults, Roots::Compare::Cycle) &&
                        p.maybeassigned == q.maybeassigned && sameresults(p.results, q.results);
             })) return why("nonlocal exits");
@@ -3524,9 +3542,8 @@ inline void TypeCheck::CheckSpecBodyOnce(FnSpec *spec, vector<Val> *argvals, Lin
             rr.set = true;
         }
     } else if (reachable) {
-        ExitLinkDefers(frames[fi].scopebase);
+        NoteExit(fi, spec->body);
         scopes.back().defers.clear();
-        NoteExit(fi);
         if (reachable && spec->retsknown && !spec->rets.empty())
             Error(sf->body, cat("function ", sf->name,
                                 " can fall off the end without returning value(s)"));
@@ -3674,8 +3691,7 @@ inline void TypeCheck::FinishReturn(int tf, const vector<Val> &vals, Node *at) {
         rr.freshview = isrs && vals[i].freshview;
         rr.set = true;
     }
-    ExitLinkDefers(std::max(frames[tf].scopebase, CurRealFrame().scopebase));
-    NoteExit(tf, results);
+    NoteExit(tf, at, results);
 }
 
 // One root a result may have, as this call sees it: a parameter's class root

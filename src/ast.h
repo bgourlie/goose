@@ -2641,6 +2641,20 @@ struct FnRecord {
         bool operator==(const ExitLinks &) const = default;
     };
     ExitLinks exitlinks;  // Ordinary returns to the immediate caller.
+    struct InterruptedAssign {
+        Node *lval;
+        TypeExpr *type;
+        Roots owners;
+        RefPlace place;
+        void AddTo(vector<InterruptedAssign> &all) const {
+            for (auto &a : all) if (a.lval == lval) {
+                a.owners.Add(owners);
+                a.place = a.place.Common(place);
+                return;
+            }
+            all.push_back(*this);
+        }
+    };
     struct OuterExit {
         FnSpec *target = nullptr;
         map<VarDef *, RefPlace> assigned;
@@ -2648,6 +2662,7 @@ struct FnRecord {
         vector<RetRoot> results; // As evaluated before unwinding, in the target's coordinates.
         ExitLinks links;         // Stores and overwrites in this activation's coordinates.
         vector<RelativeStore> partialresults; // Writes into results whose construction was interrupted.
+        vector<InterruptedAssign> interrupted; // Receivers still owned outside this activation.
     };
     vector<OuterExit> outerexits;
     size_t eventstart = 0;         // storeevents.size() when the body's check began.

@@ -2060,7 +2060,8 @@ inline void TypeCheck::NoteRefPlace(VarDef *vd, const Val &v) {
     if (vd->isvar) return;
     RefPlace place;
     if (vd->type->kind == TY_SLICE && !vd->isglobal) place = v.sliceplace;
-    else if (IsAddressRef(vd->type) && HasRelRefT(vd->type->ref->sub))
+    else if (IsAddressRef(vd->type) && (HasRelRefT(vd->type->ref->sub) ||
+                                        (hasdefers && !v.refplace.path.empty())))
         place = StoragePlace(v, vd->type->ref->sub, v.refplace);
     else return;
     // A captured let can be initialized in a shorter-lived scope. Keep
@@ -4390,7 +4391,7 @@ inline void TypeCheck::ApplyCalleeShrinks(Node *at, FnSpec *spec, vector<Val> &a
             if (s.resultowner == spec) ApplyRelativeStore(at, spec, argvals, s, true);
             else s.AddTo(cur.links.resultlinks); // Already in the enclosing result owner's coordinates.
         }
-        ReplayOuterExit(tf, spec, exit, flow);
+        ReplayOuterExit(tf, spec, exit, flow, at, argvals);
         RestoreFlow(flow);
     }
     if (applyexits) projectexit(rec->exitlinks);
@@ -4617,6 +4618,50 @@ inline TypeCheck::Alias TypeCheck::ReachesBuilt(VarDef *v, VarDef *built, bool e
     return worst;
 }
 
+// Storage a deferred use can observe while unwinding. Follow stored views
+// when the use can read them, including when a whole holder is passed on.
+inline vector<TypeCheck::LiveView> TypeCheck::DeferredUseViews(VarDef *v, Dot *field, bool apart) {
+    vector<LiveView> views;
+    if (!v->type) return views;
+    auto ref = IsRefOrSlice(v->type);
+    auto t = ref ? PointeeOf(v->type) : v->type;
+    Prov storage;
+    storage.TakeAlts(ref ? RefRootsOf(v) : RootsOf(v));
+    if (ref) storage.byteview = v->ref.byteview;
+    // Reading a scalar field of a holder does not follow the references in
+    // its siblings. Intermediate reference fields on the path do get read.
+    auto follows = !field || !field->exprtype || HoldsPlainRef(field->exprtype);
+    auto first = field;
+    while (first && Is<Dot>(first->obj)) {
+        first = Is<Dot>(first->obj);
+        follows |= first->exprtype && IsRefOrSlice(first->exprtype);
+    }
+    auto add = [&](const Prov &where, TypeExpr *type, bool direct) {
+        if (direct) views.push_back({ where, type });
+        if (!follows || !HoldsPlainRef(type)) return;
+        HeldViews(where, type, false, views);
+        if (v->isglobal) {
+            Prov global;
+            global.Set(v, false);
+            vector<TypeExpr *> reached;
+            ReachedThroughRefs(type, reached);
+            for (auto ft : reached) views.push_back({ global, ft, true });
+        }
+    };
+    if (ClassOf(t) == SC_ROOT) {
+        // A root struct's fields have independent owners. Passing the
+        // group can expose any component; selecting a field exposes one.
+        auto inst = GetStructInst(t);
+        for (size_t i = 0; i < inst->ftypes.size(); i++) {
+            if (inst->st->fields[i].ispad || (first && first->fieldidx != (int)i)) continue;
+            Prov where;
+            where.TakeAlts(ProjectRoots(storage, t, (int)i));
+            add(where, inst->ftypes[i], true);
+        }
+    } else add(storage, t, ref && !apart);
+    return views;
+}
+
 // The array a whole assignment replaces has no contents while the
 // right-hand side runs: the old ones are gone, and the new ones are built
 // over them (§4.4). Nothing the right-hand side runs may use it, then:
@@ -4625,7 +4670,7 @@ inline TypeCheck::Alias TypeCheck::ReachesBuilt(VarDef *v, VarDef *built, bool e
 // names outside its own activation. A use the checker cannot show to be of
 // a different array is an error, as a growth is (CheckGrowsSince).
 inline void TypeCheck::CheckBuiltUses(Node *rhs, Node *lval, TypeExpr *target,
-                                      const Roots &built, TypeExpr *arr) {
+                                      const Roots &built, TypeExpr *arr, const RefPlace *onexit) {
     if (!built.Root() || IsTemp(built.Root())) return;
     auto what = ExprStr(lval);
     auto base = lval;
@@ -4635,7 +4680,10 @@ inline void TypeCheck::CheckBuiltUses(Node *rhs, Node *lval, TypeExpr *target,
     // text does not.
     auto report = [&](Node *at, Alias may, VarDef *root, VarDef *b, const string &how,
                       const string &why) {
-        auto msg = cat("cannot ", how, " in the value assigned to ", what, ": ",
+        auto msg = onexit ? cat("a defer on this exit can observe ", what,
+                                " partially rebuilt (§4.4); evaluate the computation that can exit "
+                                "before assigning to ", what, " at ", Where(lval->line))
+                          : cat("cannot ", how, " in the value assigned to ", what, ": ",
                        why.empty() ? string() : cat(why, ", and "),
                        "that value is built over the old contents of ", what,
                        " (§4.4); build it in a variable of its own, and assign copy() of "
@@ -4643,9 +4691,29 @@ inline void TypeCheck::CheckBuiltUses(Node *rhs, Node *lval, TypeExpr *target,
         if (may == AL_YES) Error(at, msg);
         growconflicts.push_back({ at, CurRealFrame().spec, root, b, msg });
     };
-    auto check = [&](Node *at, VarDef *v, const string &how, const string &via) {
+    auto check = [&](Node *at, VarDef *v, const string &how, const string &via, Dot *field = nullptr) {
+        vector<LiveView> views;
+        auto apart = false;
+        if (onexit && v->type) {
+            if (IsRefOrSlice(v->type) && onexit->base && onexit->base == v->refplace.base)
+                apart = !FieldPathWithin(onexit->path, v->refplace.path) &&
+                        !FieldPathWithin(v->refplace.path, onexit->path);
+            views = DeferredUseViews(v, field, apart);
+        }
         for (auto &b : built.alts) {
             if (!b.root || IsTemp(b.root)) continue;
+            for (const auto &view : views) {
+                auto owner = b.root;
+                while (owner->componentowner && view.pointee &&
+                       TopConstEq(owner->componentbase, view.pointee)) owner = owner->componentowner;
+                if (owner == b.root && view.pointee && !view.contents && !CanContain(target, view.pointee) &&
+                    !MayHoldBuilt(view.pointee, lval, target) && !view.p.byteview) continue;
+                for (auto &r : view.p.alts) {
+                    auto may = MayAliasRoots(r.root, r.exact, owner, b.exact);
+                    if (may != AL_NO) report(at, may, r.root, owner, how, via);
+                }
+            }
+            if (apart) continue;
             VarDef *root = nullptr;
             auto may = ReachesBuilt(v, b.root, b.exact, lval, target, arr, root);
             if (may == AL_NO) continue;
@@ -4694,7 +4762,7 @@ inline void TypeCheck::CheckBuiltUses(Node *rhs, Node *lval, TypeExpr *target,
     EachUse(rhs,
             [&](Ident *id, Node *path) {
                 if (FieldsApart(path, lval, target)) return;
-                check(id, id->vdef, cat("use ", ExprStr(path)), string());
+                check(id, id->vdef, cat("use ", ExprStr(path)), string(), Is<Dot>(path));
                 if (path != id) checkread(id, path);
             },
             [&](Call *c, FnSpec *sp) {

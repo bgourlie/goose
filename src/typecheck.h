@@ -402,6 +402,7 @@ struct TypeCheck {
     };
     struct DeferEnv;
     struct DeferredLinks {
+        Block *body = nullptr;
         vector<pair<LinkShrink, LinkEffects>> shrinks;
         LinkEffects exit;
         bool completes = true;
@@ -1684,8 +1685,10 @@ struct TypeCheck {
     // callee takes -- a function value's `return`, a `return from`. A
     // callee records such an exit (FnRecord::outerexits), which a call reusing
     // it takes again.
-    void NoteExit(int tf, const vector<RetRoot> &results = {}, const FnRecord::OuterExit *added = nullptr);
-    void ReplayOuterExit(int tf, const FnSpec *spec, const FnRecord::OuterExit &exit, const FlowState &entry);
+    void NoteExit(int tf, Node *at, const vector<RetRoot> &results = {},
+                  const FnRecord::OuterExit *added = nullptr, vector<FnRecord::InterruptedAssign> interrupted = {});
+    void ReplayOuterExit(int tf, FnSpec *spec, const FnRecord::OuterExit &exit, const FlowState &entry,
+                         Node *at, vector<Val> &args);
 
     // A loop body is checked as many times as it takes for what it feeds
     // back to its head to settle (CheckLoopPasses): the roots its rebinds
@@ -2627,7 +2630,9 @@ struct TypeCheck {
     LinkEffects CurrentLinkEffects();
     void ApplyLinkEffects(const LinkEffects &effects);
     void CheckLinkShrink(const LinkShrink &shrink);
-    void ExitLinkDefers(int first);
+    void ExitLinkDefers(int first, span<const FnRecord::InterruptedAssign> interrupted = {});
+    vector<FnRecord::InterruptedAssign> CheckExitScopes(int first, Node *at, bool outer = false,
+            vector<FnRecord::InterruptedAssign> interrupted = {});
     bool InDeferBody();
     void NoteDeferMention(VarDef *v);
     void CheckDefers();
@@ -3009,6 +3014,14 @@ struct TypeCheck {
         TypeExpr *arr = nullptr;
     };
 
+    // A whole resizable assignment remains open while its RHS is checked.
+    struct Rebuild {
+        Rebuild *outer;
+        int depth;
+        Node *lval;
+        TypeExpr *type;
+        const LVal &receiver;
+    };
     // The state of the body being checked, which a body checked inside it
     // (a call's, CheckSpecBodyOnce) starts afresh and hands back when it
     // ends, an error's throw included (BodyScope): the caller's statement
@@ -3016,6 +3029,7 @@ struct TypeCheck {
     // from the summary. A function value's body is checked in its call's
     // statement and keeps it (CheckFunValCall).
     struct BodyState {
+        Rebuild *rebuild = nullptr;
         // The node being checked and every node it is nested in (PathEntry).
         vector<PathEntry> nodepath;
         // The argument print, str or format is rendering, and as which
@@ -3139,9 +3153,11 @@ struct TypeCheck {
     // The right-hand side of a whole assignment runs while the array's new
     // contents are built over its old ones (§4.4), so nothing it runs may
     // use the array: name it, or a reference to it, directly or in a
-    // function it calls. The location assigned is `lval`, of type `target`.
+    // function it calls. Also used for defers that unwind an interrupted
+    // assignment: onexit identifies the receiver's field when known.
     void CheckBuiltUses(Node *rhs, Node *lval, TypeExpr *target, const Roots &built,
-                        TypeExpr *arr);
+                        TypeExpr *arr, const RefPlace *onexit = nullptr);
+    vector<LiveView> DeferredUseViews(VarDef *v, Dot *field, bool apart);
     Alias ReachesBuilt(VarDef *v, VarDef *built, bool exact, Node *lval, TypeExpr *target,
                        TypeExpr *arr, VarDef *&root);
     bool MayHoldBuilt(TypeExpr *y, Node *lval, TypeExpr *target);

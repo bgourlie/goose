@@ -680,7 +680,10 @@ inline void TypeCheck::ProjectField(Prov &storage, RefPlace &place, TypeExpr *ow
     } else if (owner->kind != TY_STRUCT) {
         place = place.Inside();
     } else if (place.base && !place.enclosing) {
-        if (HasRelRefT((*fields.ftypes)[i]))
+        // A defer can hold a reference to a sibling of the field being
+        // rebuilt. Retain those paths even when the fields have no links.
+        if (HasRelRefT((*fields.ftypes)[i]) ||
+            (hasdefers && (ClassOf(owner) == SC_RESIZABLE || !place.path.empty())))
             place.path = ast.Intern(cat(place.path, ".", (*fields.fields)[i].name));
         else place = { place.location };
     }

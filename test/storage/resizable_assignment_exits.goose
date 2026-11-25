@@ -1,0 +1,72 @@
+fn number(stop: bool) -> i64 {
+    if stop { return from replace; }
+    return 3;
+}
+
+fn replace(xs: i64[>..<]&, stop: bool) {
+    let n = number(stop);
+    xs = [2, n];
+}
+
+fn finish() -> i64 { return 4 from operand; }
+fn operand() -> i64 { finish() }
+
+fn discard(early: bool, observed: i64&) {
+    var xs: i64[>..<] = [0];
+    defer { observed++; }
+    xs = [1, if early { return; } else { 2 }];
+    assert(xs.len == 2);
+}
+
+fn leave() -> i64 { return from outer; }
+fn install(xs: i64[>..<]&) { xs = [1, leave()]; }
+fn relay(xs: i64[>..<]&) { install(xs); }
+fn outer() {
+    var xs: i64[>..<] = [0];
+    relay(xs);
+}
+
+struct Bag { tag: i64, xs: i64[>..<] }
+struct Box { tag: i64, items: i64[>..<]& }
+fn siblings(stop: bool) {
+    var bag = Bag { tag: 7, xs: [1] };
+    let tag .= bag.tag;
+    let box = Box { tag: 8, items: bag.xs };
+    defer { assert(tag == 7 && box.tag == 8); }
+    bag.xs = [2, if stop { return; } else { 3 }];
+}
+
+fn named_result(stop: bool) -> i64[>..<] {
+    var xs: i64[>..<] = [1, 2];
+    xs = [5, if stop { return [7, 8]; } else { 6 }];
+    return xs;
+}
+
+root struct State { items: i64[>..<], spare: i64[>..<] }
+fn components(stop: bool) {
+    var state = State { items: [1], spare: [9] };
+    let alias .= state;
+    defer { assert(alias.spare.len == 1); }
+    state.items = [2, if stop { return; } else { 3 }];
+}
+
+fn main() {
+    var xs: i64[>..<] = [9];
+    replace(xs, true);
+    assert(xs.len == 1 && xs[0] == 9);
+    replace(xs, false);
+    assert(xs.len == 2 && xs[1] == 3);
+    xs = [block { break operand(); }, loop { break 5; }];
+    assert(xs.len == 2 && xs[0] == 4 && xs[1] == 5);
+    var observed = 0;
+    discard(true, observed);
+    discard(false, observed);
+    assert(observed == 2);
+    outer();
+    siblings(true);
+    siblings(false);
+    let other = named_result(true);
+    assert(other.len == 2 && other[0] == 7 && other[1] == 8);
+    components(true);
+    print("ok");
+}

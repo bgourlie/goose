@@ -2266,7 +2266,7 @@ inline void TypeCheck::CheckBreak(Break *b) {
         // here: the construct's value does not carry the literal form.
         if (v.emptyarr) Error(b->val, "cannot infer array element type");
     }
-    ExitLinkDefers(si);
+    CheckExitScopes(si, b);
     auto &sc = scopes[si];
     if (b->val) {
         if (reachable || exit.HasResultType()) {
@@ -2308,7 +2308,7 @@ inline void TypeCheck::CheckContinue(Node *n) {
     if (si == -3) JumpLeavesDefer(n, "continue");
     if (si < 0) Error(n, "continue outside of a loop");
     if (!reachable) return;
-    ExitLinkDefers(si);
+    CheckExitScopes(si, n);
     if (!reachable) return;
     auto &sc = scopes[si];
     sc.backedge = sc.backedges ? JoinFlow(sc.backedge, SaveFlow()) : SaveFlow();
@@ -2348,9 +2348,7 @@ inline void TypeCheck::CheckDefer(Defer *d) {
                 vars.size(), localfns.size(), scopes.back().defers.size(), blockpos, cur.nodepath,
                 SaveFlow(), std::move(bindings) });
         }
-        if (!effects.completes || effects.env || !effects.shrinks.empty() ||
-            !effects.exit.writes.live.empty() || !effects.exit.overwrites.empty())
-            scopes.back().defers.push_back(std::move(effects));
+        scopes.back().defers.push_back(std::move(effects));
     }
     d->exprtype = ast.voidtype;
 }
@@ -2387,8 +2385,10 @@ inline TypeCheck::DeferredLinks TypeCheck::CheckDeferredBody(Defer *d) {
             if (v->isvar) v->narrowed = nullptr;
     PushScope(SK_DEFER, d);
     DeferredLinks effects;
+    effects.body = d->body;
     {
         Saved collecting(cur.deferring, &effects);
+        Saved<Rebuild *> active(cur.rebuild, nullptr); // Checked now, executed on scope exit.
         cur.links = {};
         erase_if(cur.kills, [](const Kill &k) { return k.relative; });
         deferbodies++;
@@ -2458,11 +2458,13 @@ inline void TypeCheck::ApplyLinkEffects(const LinkEffects &effects) {
     }
 }
 
-inline void TypeCheck::ExitLinkDefers(int first) {
+inline void TypeCheck::ExitLinkDefers(int first, span<const FnRecord::InterruptedAssign> interrupted) {
     if (!reachable) return;
     for (auto i = (int)scopes.size(); i-- > first;) {
         for (auto it = scopes[i].defers.rbegin(); it != scopes[i].defers.rend(); ++it) {
             RefreshDeferredBody(*it);
+            for (auto &a : interrupted)
+                CheckBuiltUses(it->body, a.lval, a.type, a.owners, ResizableArrayIn(a.type), &a.place);
             for (auto &[shrink, before] : it->shrinks) {
                 Saved links(cur.links, cur.links);
                 Saved kills(cur.kills, cur.kills);
@@ -2476,6 +2478,31 @@ inline void TypeCheck::ExitLinkDefers(int first) {
             ApplyLinkEffects(it->exit);
         }
     }
+}
+
+// An exit crossing a whole resizable assignment can discard the receiver
+// only with its owner. Defers run first. A long-distance return may still
+// discard a caller's owner, so carry it to the next activation for checking.
+inline vector<FnRecord::InterruptedAssign> TypeCheck::CheckExitScopes(
+        int first, Node *at, bool outer, vector<FnRecord::InterruptedAssign> interrupted) {
+    if (!reachable) return {};
+    for (auto r = cur.rebuild; r && first < r->depth; r = r->outer) {
+        auto place = StoragePlace(r->receiver, r->type, r->receiver.place);
+        FnRecord::InterruptedAssign { r->lval, r->type, r->receiver, place }.AddTo(interrupted);
+    }
+    ExitLinkDefers(first, interrupted);
+    if (!reachable) return {};
+    for (auto &a : interrupted) {
+        erase_if(a.owners.alts, [&](const RootAlt &owner) {
+            return owner.exact && !IsClassRoot(owner.root) && Depth(owner.root) > first;
+        });
+        if (!outer && (!a.owners.None() || a.owners.unknown))
+            Error(at, cat("this exit can leave ", ExprStr(a.lval), " partially rebuilt (§4.4); "
+                          "evaluate the computation that can exit before assigning to ", ExprStr(a.lval),
+                          " at ", Where(a.lval->line)));
+    }
+    erase_if(interrupted, [](const auto &a) { return a.owners.None() && !a.owners.unknown; });
+    return interrupted;
 }
 
 // Whether the code being checked is written in a defer body: one of the
@@ -3022,7 +3049,12 @@ inline Val TypeCheck::CheckAssignedValue(Assign *a, TypeExpr *target, TypeExpr *
     }
     SlotScope ss(*this, true);
     auto base = cur.growlog.size();
-    auto v = CheckValueAt(a->rhs, target, dest);
+    Val v;
+    {
+        Rebuild r { cur.rebuild, CurDepth(), a->lval, target, built };
+        Saved active(cur.rebuild, arr ? &r : cur.rebuild);
+        v = CheckValueAt(a->rhs, target, dest);
+    }
     NoteStorageWrite(built, target, reachable || construction.started);
     if (arr && !built.None()) {
         CheckGrowsSince(base, built, cat("the value assigned to ", ExprStr(a->lval)), target);
