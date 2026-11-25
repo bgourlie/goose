@@ -1434,22 +1434,37 @@ inline bool TypeCheck::KillPath(Node *n, VarDef *&base, string &path) {
     return true;
 }
 
+// An exact location of the owner's own value type can only be the whole
+// owner. Record that identity even if the reference used to reach it is
+// rebound later. For a subobject we still need a stable field path.
+inline std::optional<TypeCheck::Kill> TypeCheck::OverwrittenPart(Node *n, const Roots &loc,
+                                                TypeExpr *target, bool relative, size_t at) {
+    if (!loc.Exact()) return {};
+    auto owner = loc.Root();
+    if (!owner || IsTemp(owner)) return {};
+    if (relative && owner->type && !IsRefOrSlice(owner->type) && TopConstEq(owner->type, target))
+        return Kill { owner, owner, "", at, true };
+    VarDef *base = nullptr;
+    string path;
+    if (!KillPath(n, base, path) || (!IsRefOrSlice(base->type) && base != owner)) return {};
+    Kill kill { owner, base, std::move(path), at, relative };
+    // A reference field names its slot. An overwrite through it affects its pointee.
+    if (relative && !KillNamesType(kill, target)) return {};
+    return kill;
+}
+
 // Express an overwrite through a reference parameter in its argument's
 // storage. A reference field names the slot itself, so confirm that the
 // path ends at the pointee for a relative overwrite.
 inline std::optional<TypeCheck::Kill> TypeCheck::ArgumentKill(Node *arg, const Val &v,
                                                 TypeExpr *pointee, bool relative, size_t at) {
-    if (!v.Exact()) return {};
-    auto x = v.Root();
-    if (!x || IsTemp(x) || (!relative && (x->isglobal || x->captured))) return {};
     if (auto u = Is<Unary>(arg); u && u->op == T_BITAND) arg = u->child;
-    VarDef *base = nullptr;
-    string path;
-    if (!KillPath(arg, base, path)) return {};
-    if (IsRefOrSlice(base->type) ? !base->ref.Exact() || base->ref.Root() != x : base != x)
+    auto kill = OverwrittenPart(arg, v, pointee, relative, at);
+    if (!kill) return {};
+    auto base = kill->base, owner = kill->container;
+    if (!relative && (owner->isglobal || owner->captured)) return {};
+    if (IsRefOrSlice(base->type) && (!base->ref.Exact() || base->ref.Root() != owner))
         return {};
-    Kill kill { x, base, path, at, relative };
-    if (relative && !KillNamesType(kill, pointee)) return {};
     return kill;
 }
 
@@ -1471,19 +1486,11 @@ inline void TypeCheck::NoteKill(Node *lval, const Roots &loc, TypeExpr *target, 
 
 inline void TypeCheck::NoteOverwrite(Node *lval, const Roots &loc, size_t at, bool relative,
                                      TypeExpr *target) {
-    if (!reachable || !loc.Exact()) return;
-    auto container = loc.Root();
-    if (!container || (!relative && container->isglobal) || IsTemp(container)) return;
-    VarDef *base = nullptr;
-    string path;
-    if (!KillPath(lval, base, path) || (!relative && base->isglobal)) return;
-    if (!IsRefOrSlice(base->type) && base != container) return;
-    Kill kill { container, base, path, at, relative };
-    // Clearing or assigning through a reference field replaces the pointee.
-    // The field path names the reference slot itself.
-    if (relative && !KillNamesType(kill, target)) return;
-    erase_if(cur.kills, [&](const Kill &k) { return k.SamePart(kill); });
-    cur.kills.push_back(std::move(kill));
+    if (!reachable) return;
+    auto kill = OverwrittenPart(lval, loc, target, relative, at);
+    if (!kill || (!relative && (kill->container->isglobal || kill->base->isglobal))) return;
+    erase_if(cur.kills, [&](const Kill &k) { return k.SamePart(*kill); });
+    cur.kills.push_back(std::move(*kill));
     if (relative) ApplyLinkKill(cur.kills.back());
 }
 

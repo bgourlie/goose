@@ -2633,6 +2633,8 @@ struct TypeCheck {
     // in force empty every slot of a `t` at `base` in container c that can
     // hold a view into an `arr`'s elements, since which event.
     bool KillPath(Node *n, VarDef *&base, string &path);
+    std::optional<Kill> OverwrittenPart(Node *n, const Roots &loc, TypeExpr *target, bool relative,
+                                        size_t at);
     std::optional<Kill> ArgumentKill(Node *arg, const Val &v, TypeExpr *pointee, bool relative, size_t at);
     void NoteKill(Node *lval, const Roots &loc, TypeExpr *target, const Val &v, size_t at);
     void NoteOverwrite(Node *path, const Roots &loc, size_t at, bool relative, TypeExpr *target);
