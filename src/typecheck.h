@@ -2121,6 +2121,9 @@ struct TypeCheck {
     bool ShrinkMayFree(VarDef *root, TypeExpr *bound, bool growonly, TypeExpr *of,
                        bool byteview, TypeExpr *receiver = nullptr, const RefPlace *place = nullptr);
     bool InRetainedField(VarDef *owner, TypeExpr *pointee, VarDef *base, string_view path);
+    bool CanContainLinkTarget(TypeExpr *field, TypeExpr *pointee) {
+        return field && (CanContain(field, pointee) || (IsU8(pointee) && Viewable(field)));
+    }
     bool ShrinkMayMove(VarDef *root, TypeExpr *bound, TypeExpr *t);
     void CheckHeldShrinks(Node *at, const string &op, VarDef *root,
                           const string &what, bool growonly, TypeExpr *bound = nullptr,
@@ -2857,7 +2860,7 @@ struct TypeCheck {
     void NoteOverwrite(Node *path, const Roots &loc, size_t at, TypeExpr *target,
                        const RefPlace *place = nullptr, Node *value = nullptr);
     bool KilledFor(VarDef *c, VarDef *base, TypeExpr *t, TypeExpr *arr, size_t &since,
-                   bool relative = false, TypeExpr *replaced = nullptr);
+                   bool relative = false, TypeExpr *replaced = nullptr, Node *shrink = nullptr);
     TypeExpr *FieldPathType(VarDef *base, string_view path);
     TypeExpr *KillPartType(const Kill &k) { return FieldPathType(k.base, k.path); }
     void ApplyLinkKill(const Kill &k);

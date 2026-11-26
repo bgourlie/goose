@@ -827,26 +827,26 @@ struct ElementLink {
 struct ValueLinks {
     struct Slot {
         ElementLink link;
-        string_view path;  // Interned enclosing inline fields, relative to the value.
+        string_view path, target;  // Enclosing fields of the slot and target, relative to this value.
         bool operator==(const Slot &) const = default;
     };
     small_vector<Slot, 1> slots;
     explicit operator bool() const { return !slots.empty(); }
-    bool Include(ElementLink link, string_view path = {}) {
+    bool Include(ElementLink link, string_view path = {}, string_view target = {}) {
         for (auto &known : slots) {
-            if (!known.link.SameSlotKind(link) || known.path != path) continue;
+            if (!known.link.SameSlotKind(link) || known.path != path || known.target != target) continue;
             if (known.link.direction >= link.direction) return false;
             known.link.direction = link.direction;
             return true;
         }
-        slots.push_back({ link, path });
+        slots.push_back({ link, path, target });
         return true;
     }
     void Include(const ValueLinks &other, bool intail = false) {
-        for (auto &[value, path] : other.slots) {
+        for (auto &[value, path, target] : other.slots) {
             auto link = value;
             link.intail |= intail;
-            Include(link, path);
+            Include(link, path, target);
         }
     }
     template<typename F> bool Any(F f) const {
@@ -858,7 +858,7 @@ struct ValueLinks {
     bool Covers(const ValueLinks &other) const {
         return all_of(other.slots.begin(), other.slots.end(), [&](const Slot &s) {
             return any_of(slots.begin(), slots.end(), [&](const Slot &known) {
-                return known.path == s.path && known.link.SameSlotKind(s.link) &&
+                return known.path == s.path && known.target == s.target && known.link.SameSlotKind(s.link) &&
                        known.link.direction >= s.link.direction;
             });
         });

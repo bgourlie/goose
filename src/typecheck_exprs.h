@@ -1448,10 +1448,10 @@ inline bool TypeCheck::FitsAt(Val &v, TypeExpr *dt, bool delivered) {
             }
             // All slots in the converted array now belong to its element run.
             ValueLinks links;
-            for (auto &[value, path] : v.elementlinks.slots) {
+            for (auto &[value, path, target] : v.elementlinks.slots) {
                 auto link = value;
                 link.intail = IsArrayKind(dt, A_GROW);
-                links.Include(link, path);
+                links.Include(link, path, target);
             }
             v.elementlinks = std::move(links);
             v.type = dt;
@@ -1514,7 +1514,7 @@ inline bool TypeCheck::FitsAt(Val &v, TypeExpr *dt, bool delivered) {
                     pointee = LinkPointee(pointee);
                     auto &place = v.refplace;
                     auto part = place.base ? FieldPathType(place.base, place.path) : nullptr;
-                    if (part && CanContain(part, pointee)) target = { place.base, string(place.path) };
+                    if (CanContainLinkTarget(part, pointee)) target = { place.base, string(place.path) };
                 }
                 auto fits = dt->ref->pool ? want && links.Exact() && have == want
                     : RelativeDestination(links, curdst, pointee, fitnode, recordingrelative, target);

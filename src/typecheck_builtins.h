@@ -438,6 +438,7 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
             Val v;
             v.type = cu8slice;   // A read-only view, in its type too (§9.5).
             v.SetProv(rv);
+            v.sliceplace = rv.ElementPlace();
             // The bytes of a live structure: reading them is what they are
             // for, and writing them would forge the relative references the
             // checker otherwise proves (§3.9), so the view is never writable.
@@ -1432,8 +1433,10 @@ inline ValueLinks TypeCheck::LiveElementLinks(VarDef *owner, TypeExpr *target, T
         if (target && target->kind == TY_ARRAY && InRetainedField(owner, link.pointee, to.base, to.path)) return;
         // A value read out of its owner carries its field paths with it.
         // Shrink queries only need the types and directions of retained links.
-        auto named = !target && field.base == owner && !field.path.empty();
-        links.Include(link, named ? ast.Intern(field.path) : string_view {});
+        auto path = [&](const LinkField &part) -> string_view {
+            return !target && part.base == owner ? ast.Intern(part.path) : string_view {};
+        };
+        links.Include(link, path(field), path(to));
     };
     for (auto &[part, write] : cur.links.live) {
         if (part.owner != owner) continue;
@@ -1471,7 +1474,8 @@ inline bool TypeCheck::InRetainedField(VarDef *owner, TypeExpr *pointee, VarDef 
                            base->ref.Exact() && base->ref.Root() == owner &&
                            ClassOf(base->type->ref->sub) == SC_RESIZABLE)) return false;
     auto field = FieldPathType(base, path);
-    return field && !IsRefOrSlice(field) && ClassOf(field) != SC_RESIZABLE && CanContain(field, pointee);
+    return field && !IsRefOrSlice(field) && ClassOf(field) != SC_RESIZABLE &&
+           CanContainLinkTarget(field, pointee);
 }
 
 // Whether a reference to `of`, or a byte view, may point into what a shrink
@@ -1854,7 +1858,7 @@ inline void TypeCheck::NoteOverwrite(Kill kill, TypeExpr *target, Node *value) {
     if (MayKeepLimitedSlots(target, kill, value)) {
         // Kills name fields, not individual indices. Publish the fully
         // overwritten siblings and retain the array's previous link facts.
-        if (kill.relative && IsArrayKind(target, A_LIMITED)) {
+        if (IsArrayKind(target, A_LIMITED)) {
             kill.prefixonly = true;
         } else if (target->kind == TY_STRUCT) {
             auto si = GetStructInst(target);
@@ -1924,7 +1928,7 @@ inline void TypeCheck::ApplyLinkKill(const Kill &k) {
 // storage, which no kill of this one empties. `since` gets the earliest kill
 // relied on; with none relied on, nothing is said.
 inline bool TypeCheck::KilledFor(VarDef *c, VarDef *base, TypeExpr *t, TypeExpr *arr,
-                                 size_t &since, bool relative, TypeExpr *replaced) {
+                                 size_t &since, bool relative, TypeExpr *replaced, Node *shrink) {
     since = SIZE_MAX;
     if (cur.kills.empty()) return false;
     // A reference into c whose pointee is of c's own type points at the
@@ -1941,12 +1945,14 @@ inline bool TypeCheck::KilledFor(VarDef *c, VarDef *base, TypeExpr *t, TypeExpr 
         if (relative && !RetainsRelativeSlot(ft, arr, replaced)) return true;
         std::optional<size_t> latest;
         for (auto &k : cur.kills) {
-            if (k.container != c || k.relative != relative || k.prefixonly) continue;
+            if (k.container != c || k.relative != relative) continue;
             auto kb = whole(k.base);
             if (kb != c || !k.path.empty()) {
                 if (kb != base) continue;
                 if (k.path != path && !(relative && FieldPathWithin(path, k.path))) continue;
             }
+            if (k.prefixonly && (!shrink || !IsArrayKind(ft, A_LIMITED) ||
+                                 MayViewLimitedSlot(k, ft, shrink))) continue;
             latest = latest ? std::max(*latest, k.at) : k.at;
         }
         if (latest && (!relative || ft->kind != TY_STRUCT)) {
@@ -2133,7 +2139,7 @@ inline void TypeCheck::GrowOnlyShrinkAt(Node *c, const string &op, VarDef *vd,
             // the views a path the holder keeps may have been followed to.
             auto from = LiveEventBase(v);
             size_t since;
-            if (!pathslive && KilledFor(v, v, LoadType(t), arrtype, since))
+            if (!pathslive && KilledFor(v, v, LoadType(t), arrtype, since, false, nullptr, c))
                 from = std::max(from, since);
             if (!HolderMayPointInto(v, vd, arrtype, from, &where, &hit, &via, &incoming) ||
                 !UsedAfter(v))
@@ -2202,11 +2208,13 @@ inline void TypeCheck::NoteLitElem(LitDeep &deep, Node *at, const Val &v, TypeEx
     // A struct field has a stable path. An array element or variant payload
     // can only identify the enclosing array or enum when the value is stored.
     if (!isrs) {
-        for (auto &[value, path] : v.elementlinks.slots) {
+        for (auto &[value, path, target] : v.elementlinks.slots) {
             auto link = value;
             link.intail |= IsArrayKind(t, A_GROW);
-            auto member = field.empty() ? string_view {} : ast.Intern(cat(".", field, path));
-            deep.elementlinks.Include(link, member);
+            auto member = [&](string_view part) -> string_view {
+                return field.empty() ? string_view {} : ast.Intern(cat(".", field, part));
+            };
+            deep.elementlinks.Include(link, member(path), member(target));
         }
     }
     if (!isrs && !HoldsPlainRef(t)) return;
@@ -2351,9 +2359,11 @@ inline LinkField TypeCheck::MapStoreField(FnSpec *spec, const vector<Val> &args,
 // Internal links move with the complete element run. The destination alone
 // owns both ends, including when a call maps the store through a parameter.
 inline void TypeCheck::RecordElementLinks(const Dest &dest, TypeExpr *type, const ValueLinks &links, Node *at) {
-    for (auto [link, path] : links.slots) {
+    for (auto [link, path, target] : links.slots) {
         link.intail |= IsArrayKind(type, A_GROW);
-        StoreElementLink(dest, type, link, at, {}, path);
+        auto to = dest.field;
+        if (to.base && dest.fieldsteps) to.path += target;
+        StoreElementLink(dest, type, link, at, {}, path, to);
     }
 }
 
@@ -3998,7 +4008,7 @@ inline void TypeCheck::NoteLiveViews(Node *at, const string &prefix, VarDef *roo
             set<VarDef *> seen;
             auto from = LiveEventBase(v);
             size_t since;
-            if (!pathslive && KilledFor(v, v, LoadType(t), arrtype, since))
+            if (!pathslive && KilledFor(v, v, LoadType(t), arrtype, since, false, nullptr, at))
                 from = std::max(from, since);
             RecordedViews(v, from, t, vs, seen);
         }

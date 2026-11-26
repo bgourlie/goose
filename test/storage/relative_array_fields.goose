@@ -80,6 +80,18 @@ fn overwrite_plain_slots() {
     assert(saved.link == null);
 }
 
+fn release_plain_slot() {
+    var values: i64[>..] = [42];
+    var slots: PlainEntry[..] = [PlainEntry { link: values[0] }];
+    {
+        let saved .= slots[0];
+        slots = [];
+        assert(saved.link .== values[0]);
+    }
+    values.clear();
+    assert(slots.len == 0);
+}
+
 fn unrelated_view() {
     var x = Saved { slots: [Entry {}], values: [42] };
     var independent = Entry {};
@@ -246,6 +258,7 @@ fn main() {
     root_component();
     retained_limited_slot();
     overwrite_plain_slots();
+    release_plain_slot();
     unrelated_view();
     sibling_field_view();
     replace_all_slots();
