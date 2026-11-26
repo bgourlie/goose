@@ -768,42 +768,87 @@ struct WriteRegions {
     }
 };
 
+struct LinkField {
+    VarDef *base = nullptr;
+    string path;  // Dot-separated fields of this variable or stable parameter's pointee.
+    bool Within(VarDef *owner, string_view enclosing) const {
+        return base && base == owner && FieldPathWithin(path, enclosing);
+    }
+    bool ApartFrom(VarDef *owner, string_view other) const {
+        return base && base == owner && !FieldPathWithin(path, other) && !FieldPathWithin(other, path);
+    }
+    auto operator<=>(const LinkField &) const = default;
+};
+
+// Flow snapshots share field identities. Most places name a whole variable
+// and need neither an allocated path nor an element binding.
+struct PlacePool {
+    WriteRegionPool regions;
+    set<string> paths;
+    set<LinkField> boundfields;
+
+    const string *Path(string path) {
+        return path.empty() ? nullptr : &*paths.insert(std::move(path)).first;
+    }
+    const LinkField *Bound(VarDef *base, string path = {}) {
+        return &*boundfields.insert(LinkField { base, std::move(path) }).first;
+    }
+    const LinkField *Project(const LinkField *field, string_view suffix, string_view separator = {}) {
+        if (!field || suffix.empty()) return field;
+        return Bound(field->base, cat(field->path, separator, suffix));
+    }
+};
+
 // A storage location. A field path can name the slot itself or a field
 // containing it, e.g. the array when the slot is one of its elements.
 struct RefPlace {
     LinkLocation location;
     VarDef *base = nullptr;
-    string_view path;
+    const string *path = nullptr;
     bool nullonly = false;  // No pointee on this path. The default is an unknown place.
     bool enclosing = false;
+    bool boundenclosing = false;
     WriteRegions regions;
+    const LinkField *bound = nullptr; // The same place or a containing field, relative to an immutable binding.
 
+    string_view Path() const { return path ? string_view(*path) : string_view {}; }
+
+    void ForgetBound() { bound = nullptr; boundenclosing = false; }
     RefPlace WithoutPath() const {
         auto part = *this;
         part.base = nullptr;
-        part.path = {};
+        part.path = nullptr;
         part.enclosing = false;
+        part.ForgetBound();
         return part;
     }
     RefPlace Inside(bool intail = false) const {
         auto part = *this;
         part.enclosing = base != nullptr;
+        part.boundenclosing = bound != nullptr;
         part.location.intail |= intail;
         return part;
     }
 
-    RefPlace Common(const RefPlace &other, WriteRegionPool &pool) const {
+    RefPlace Common(const RefPlace &other, PlacePool &pool) const {
         if (nullonly) return other;
         if (other.nullonly) return *this;
         RefPlace common;
         common.location.intail = location.intail && other.location.intail;
         if (location.param == other.location.param) common.location.param = location.param;
-        common.regions = regions.Join(other.regions, pool);
+        common.regions = regions.Join(other.regions, pool.regions);
+        if (bound == other.bound) {
+            common.bound = bound;
+            common.boundenclosing = boundenclosing || other.boundenclosing;
+        }
         if (base && base == other.base) {
             common.base = base;
             common.path = path;
-            while (!FieldPathWithin(other.path, common.path))
-                common.path = common.path.substr(0, common.path.rfind('.'));
+            if (path != other.path) {
+                auto prefix = Path(), right = other.Path();
+                while (!FieldPathWithin(right, prefix)) prefix = prefix.substr(0, prefix.rfind('.'));
+                common.path = prefix == right ? other.path : pool.Path(string(prefix));
+            }
             common.enclosing = enclosing || other.enclosing || path != other.path;
         }
         return common;
@@ -2010,9 +2055,16 @@ struct VarDef {
     bool isparam = false;
     RefPlace refplace;       // Pointee or viewed elements known on this control-flow path.
     RefPlace SlicePlace() const { return slotref ? RefPlace {} : refplace; }
-    RefPlace PointeePlace() {
+    RefPlace PointeePlace(PlacePool &pool) {
         auto place = refplace;
         if (!isvar && !istemp && !place.base && !place.nullonly) place.base = this;
+        // Indexing names only the enclosing array. A let also names its
+        // particular pointee for as long as this binding is in scope.
+        if (place.enclosing && (!place.bound || place.boundenclosing) &&
+            !isvar && !istemp && !isglobal && IsAddressRef(type) && ref.Exact()) {
+            place.bound = pool.Bound(this);
+            place.boundenclosing = false;
+        }
         return place;
     }
     // Independently owned fields of a root declaration. These synthetic
@@ -2426,18 +2478,6 @@ template<typename K> struct BoundShrink {
     ShrinkEffect effect;
 };
 
-struct LinkField {
-    VarDef *base = nullptr;
-    string path;  // Dot-separated fields of this variable or stable parameter's pointee.
-    bool Within(VarDef *owner, string_view enclosing) const {
-        return base && base == owner && FieldPathWithin(path, enclosing);
-    }
-    bool ApartFrom(VarDef *owner, string_view other) const {
-        return base && base == owner && !FieldPathWithin(path, other) && !FieldPathWithin(other, path);
-    }
-    auto operator<=>(const LinkField &) const = default;
-};
-
 // Each pair of relative overwrites guarantees its common storage: the
 // narrower field if one contains the other. Ordinary holder overwrites
 // describe exact paths. Several pairs can prove the same field.
@@ -2475,6 +2515,7 @@ struct StoreEvent {
     // verified element run. Mapping this event requires only the destination.
     ElementLink elementlink;
     LinkField storefield;  // The part containing the written slot, when known.
+    const LinkField *boundfield = nullptr; // Relative store within a bound element of that part.
     LinkField linktarget;  // The part a self-relative link points into, when known.
     bool wholecopy = false; // An entire holder copied to this exact field.
     VarDef *linkparam = nullptr; // Direct destination parameter, even when parameters share a class.
@@ -2617,7 +2658,7 @@ struct RetRoot {
                RelativeStore::SameSet(resultlinks, other.resultlinks, how);
     }
 
-    void Include(const RetRoot &other, WriteRegionPool &pool) {
+    void Include(const RetRoot &other, PlacePool &pool) {
         elementlinks.Include(other.elementlinks);
         if (other.intactprefix) intactprefix = intactprefix.value_or(true) && *other.intactprefix;
         for (auto &link : other.resultlinks) link.AddTo(resultlinks);
@@ -2790,7 +2831,7 @@ struct FnRecord {
         TypeExpr *type;
         Roots owners;
         RefPlace place;
-        void AddTo(vector<InterruptedAssign> &all, WriteRegionPool &pool) const {
+        void AddTo(vector<InterruptedAssign> &all, PlacePool &pool) const {
             for (auto &a : all) if (a.lval == lval) {
                 a.owners.Add(owners);
                 a.place = a.place.Common(place, pool);
@@ -3171,7 +3212,7 @@ struct Ast {
     // interned here: the lexer delivers their parts as separate tokens.
     map<string_view, Namespace> namespaces;
     deque<string> interned;
-    WriteRegionPool writeregions;
+    PlacePool places;
 
     // Shared instances of the primitive types.
     TypeExpr *inttypes[IS_VARINT + 1];

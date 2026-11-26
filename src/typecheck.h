@@ -295,6 +295,7 @@ struct TypeCheck {
             LinkField field;
             int summary;
             LinkField target;
+            const LinkField *boundfield;
             auto operator<=>(const Part &) const = default;
             auto operator<=>(VarDef *v) const { return std::compare_three_way {}(owner, v); }
         };
@@ -333,10 +334,25 @@ struct TypeCheck {
         };
         map<ArrayLit *, FillLinks> fills;
         void Add(const StoreEvent &e, size_t index, std::optional<string_view> suffix = {}) {
-            Part part { e.container, e.elementlink, e.storefield, e.linkclass, e.linktarget };
+            Part part { e.container, e.elementlink, e.storefield, e.linkclass, e.linktarget, e.boundfield };
             Write write { index, suffix };
             auto [it, added] = live.try_emplace(std::move(part), write);
             if (!added) it->second.Include(write);
+        }
+        // Once a binding expires, its outstanding writes still belong to
+        // the enclosing field. A fresh iteration can bind a different slot.
+        template<typename F> void ForgetBindings(F expired) {
+            for (auto it = live.begin(); it != live.end();) {
+                auto field = it->first.boundfield;
+                if (!field || !expired(field->base)) {
+                    ++it;
+                    continue;
+                }
+                auto entry = live.extract(it++);
+                entry.key().boundfield = nullptr;
+                auto merged = live.insert(std::move(entry));
+                if (!merged.inserted) merged.position->second.Include(merged.node.mapped());
+            }
         }
         void Join(const LinkFlow &other) {
             for (auto &link : other.resultlinks) link.AddTo(resultlinks);
@@ -402,7 +418,9 @@ struct TypeCheck {
     struct Dest {
         LinkLocation place;
         LinkField field;
+        const LinkField *boundfield = nullptr;
         bool fieldsteps = true;  // An element or variant can only name its enclosing field.
+        bool boundsteps = true;
         Roots roots;
         FnSpec *result = nullptr;
         int resultindex = 0;
@@ -434,7 +452,9 @@ struct TypeCheck {
         Dest(const Prov &storage, const RefPlace &part)
             : Dest(storage, false, storage.reached) {
             place = part.location;
-            field = { part.base, string(part.path) };
+            field = { part.base, string(part.Path()) };
+            boundfield = part.bound;
+            boundsteps = !part.boundenclosing;
             fieldsteps = !part.enclosing;
         }
         // A variable's own storage.
@@ -2918,6 +2938,9 @@ struct TypeCheck {
         auto [first, last] = cur.links.live.equal_range(v);
         cur.links.live.erase(first, last);
         erase_if(cur.kills, [&](const Kill &k) { return k.container == v; });
+        if (!v->type || v->isvar || !IsAddressRef(v->type)) return;
+        cur.links.ForgetBindings([&](VarDef *base) { return base == v; });
+        erase_if(cur.kills, [&](const Kill &k) { return k.relative && k.base == v; });
     }
     void ForgetLocal(VarDef *v) {
         if (cur.links.live.empty() && cur.kills.empty()) return;
@@ -2939,13 +2962,14 @@ struct TypeCheck {
     void NoteRefPlace(VarDef *vd, const Val &v);
     RefPlace ArgumentPlace(FnSpec *spec, VarDef *param, const vector<Val> &args);
     LinkField MapStoreField(FnSpec *spec, const vector<Val> &args, VarDef *owner,
-                            const Roots &mapped, LinkField field);
+                            const Roots &mapped, LinkField field, const LinkField **bound = nullptr);
     void RecordElementLinks(const Dest &dest, TypeExpr *type, const ValueLinks &links, Node *at);
     void StoreElementLink(const Dest &dest, TypeExpr *type, ElementLink link, Node *at,
                           const Roots &borrowed, string_view path = {}, const LinkField &target = {});
     void FinishFill(ArrayLit *fill, const Dest &dest);
     void RecordLinkStore(const Roots &owners, TypeExpr *reached, ElementLink link, Node *at,
-                         LinkLocation place = {}, const LinkField &field = {}, const LinkField &target = {});
+                         LinkLocation place = {}, const LinkField &field = {}, const LinkField &target = {},
+                         const LinkField *boundfield = nullptr);
     void NoteSlotStore(const StoreEvent &e);
     // How NeverStoredError words a grow-shrink array `gs` a value pointing at
     // `roots` may point into: as the array itself where it is the value's one

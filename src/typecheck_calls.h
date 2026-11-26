@@ -2072,7 +2072,7 @@ inline void TypeCheck::NoteExit(int tf, Node *at, const vector<RetRoot> &results
     if (!reachable || !e) return;
     auto merge = [&](vector<RetRoot> &to) {
         if (to.size() < results.size()) to.resize(results.size());
-        for (size_t i = 0; i < results.size(); i++) to[i].Include(results[i], ast.writeregions);
+        for (size_t i = 0; i < results.size(); i++) to[i].Include(results[i], ast.places);
     };
     auto target = frames[tf].spec;
     auto exitlinks = [&] {
@@ -2103,13 +2103,13 @@ inline void TypeCheck::NoteExit(int tf, Node *at, const vector<RetRoot> &results
                 auto p = x.assigned.find(it->first);
                 if (p == x.assigned.end()) it = o.assigned.erase(it);
                 else {
-                    it->second = it->second.Common(p->second, ast.writeregions);
+                    it->second = it->second.Common(p->second, ast.places);
                     ++it;
                 }
             }
             o.maybeassigned.insert(x.maybeassigned.begin(), x.maybeassigned.end());
             o.links.Join(x.links);
-            for (auto &a : x.interrupted) a.AddTo(o.interrupted, ast.writeregions);
+            for (auto &a : x.interrupted) a.AddTo(o.interrupted, ast.places);
             for (auto &link : x.partialresults) link.AddTo(o.partialresults);
             merge(o.results);
             return;
@@ -2120,7 +2120,7 @@ inline void TypeCheck::NoteExit(int tf, Node *at, const vector<RetRoot> &results
     }
     for (size_t i = 0; i < e->vars.size(); i++) {
         auto v = e->vars[i];
-        e->places[i] = e->reached ? e->places[i].Common(v->refplace, ast.writeregions) : v->refplace;
+        e->places[i] = e->reached ? e->places[i].Common(v->refplace, ast.places) : v->refplace;
         e->assigned[i] = (!e->reached || e->assigned[i]) && v->assigned;
         e->maybeassigned[i] = (e->reached && e->maybeassigned[i]) || v->maybeassigned;
     }
@@ -3168,7 +3168,8 @@ inline bool TypeCheck::SameRecord(const FnRecord &a, const FnRecord &b, const Fn
     }
     auto sameevents = [&](const StoreEvent &p, const StoreEvent &q) {
         return p.container == q.container && p.elementlink == q.elementlink && p.linkparam == q.linkparam &&
-               p.storefield == q.storefield && p.linktarget == q.linktarget && p.wholecopy == q.wholecopy &&
+               p.storefield == q.storefield && p.boundfield == q.boundfield &&
+               p.linktarget == q.linktarget && p.wholecopy == q.wholecopy &&
                p.root == q.root && p.src == q.src &&
                p.exact == q.exact && p.byteview == q.byteview && p.bound == q.bound &&
                p.slot == q.slot && p.sliceref == q.sliceref && p.classread == q.classread &&
@@ -3748,8 +3749,8 @@ inline void TypeCheck::FinishReturn(int tf, const vector<Val> &vals, Node *at) {
                 if (!v || v->isglobal) return true;
                 if (v->ownerspec == tspec) return v->isparam;
                 return any_of(tspec->envreads.begin(), tspec->envreads.end(), [&](const EnvRead &r) {
-                    return r.var == v || r.refplace.base == v || r.refplace.location.param == v ||
-                           r.refplace.regions.Find(v);
+                    return r.var == v || r.refplace.base == v || (r.refplace.bound && r.refplace.bound->base == v) ||
+                           r.refplace.location.param == v || r.refplace.regions.Find(v);
                 });
             };
             if (!stable(place.location.param)) place.location.param = nullptr;
@@ -3758,6 +3759,7 @@ inline void TypeCheck::FinishReturn(int tf, const vector<Val> &vals, Node *at) {
                 break;
             }
             if (!stable(place.base)) place = place.WithoutPath();
+            if (place.bound && !stable(place.bound->base)) place.ForgetBound();
             rr.place = place;
         }
         rr.heldparam = holder ? HeldParam(tspec, vals[i]) : -1;
@@ -3832,13 +3834,14 @@ inline RefPlace TypeCheck::CallerPlace(RefPlace place, FnSpec *spec, const vecto
             auto actual = ArgumentPlace(spec, r.owner, args);
             if (actual.nullonly) continue;
             part = actual.regions;
-            if (r.copied) part = part.FixedField(ast.writeregions);
+            if (r.copied) part = part.FixedField(ast.places.regions);
         }
-        mapped = first ? part : mapped.Join(part, ast.writeregions);
+        mapped = first ? part : mapped.Join(part, ast.places.regions);
         first = false;
         if (mapped.All().empty()) break;
     }
     place.regions = mapped;
+    if (place.bound && place.bound->base->ownerspec == spec) place.ForgetBound();
     if (auto p = place.location.param; p && p->ownerspec == spec) {
         auto loc = ArgumentPlace(spec, p, args).location;
         place.location = { place.location.intail || loc.intail, loc.param };
@@ -3849,8 +3852,10 @@ inline RefPlace TypeCheck::CallerPlace(RefPlace place, FnSpec *spec, const vecto
             place.nullonly = actual.nullonly;
             return place.WithoutPath();
         }
-        if (!actual.enclosing && !place.path.empty())
-            actual.path = ast.Intern(cat(actual.path, place.path));
+        if (!actual.boundenclosing) actual.bound = ast.places.Project(actual.bound, place.Path());
+        actual.boundenclosing |= actual.bound && place.enclosing;
+        if (!actual.enclosing && place.path)
+            actual.path = ast.places.Path(cat(actual.Path(), place.Path()));
         actual.enclosing |= place.enclosing;
         actual.location = place.location;
         actual.regions = mapped;
@@ -4509,6 +4514,7 @@ inline void TypeCheck::ApplyRelativeStore(Node *call, FnSpec *spec, vector<Val> 
             if (!dest.reached) dest.reached = spec->rets[i];
         }
         if (dest.fieldsteps) dest.field.path += s.field;
+        if (dest.boundsteps) dest.boundfield = ast.places.Project(dest.boundfield, s.field);
         dest.discarded |= !survives;
     }
     dest.place.intail |= s.intail;

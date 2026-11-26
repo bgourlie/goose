@@ -1003,7 +1003,7 @@ inline TypeCheck::FlowState TypeCheck::JoinFlow(const FlowState &a, const FlowSt
                     (a.reachable && aa.maybeassigned) || (b.reachable && bb.maybeassigned),
                     narrow(aa.narrowed, bb.narrowed),
                     !a.reachable ? bb.refplace : !b.reachable ? aa.refplace
-                                                              : aa.refplace.Common(bb.refplace, ast.writeregions),
+                                                              : aa.refplace.Common(bb.refplace, ast.places),
                     (!a.reachable || aa.intactprefix) && (!b.reachable || bb.intactprefix) };
     }
     // A global stays narrowed where every reachable side narrowed it.
@@ -1022,10 +1022,12 @@ inline TypeCheck::FlowState TypeCheck::JoinFlow(const FlowState &a, const FlowSt
     else joined.kills = IntersectKills(a.kills, b.kills);
     joined.links = a.reachable ? a.links : b.links;
     if (a.reachable && b.reachable) joined.links.Join(b.links);
-    erase_if(joined.links.live, [&](const auto &entry) {
-        return Depth(entry.first.owner) > CurDepth();
+    auto expired = [&](VarDef *v) { return Depth(v) > CurDepth(); };
+    erase_if(joined.links.live, [&](const auto &entry) { return expired(entry.first.owner); });
+    joined.links.ForgetBindings(expired);
+    erase_if(joined.kills, [&](const Kill &k) {
+        return expired(k.container) || (k.relative && expired(k.base));
     });
-    erase_if(joined.kills, [&](const Kill &k) { return Depth(k.container) > CurDepth(); });
     joined.reachable = a.reachable || b.reachable;
     return joined;
 }
@@ -1193,8 +1195,8 @@ inline Val TypeCheck::MergeVals(const Val &a, bool areach, const Val &b, bool br
         v.contents = ContentsOf(a);
         v.contents.Add(ContentsOf(b));
     }
-    if (v.type && v.type->kind == TY_REF) v.refplace = a.refplace.Common(b.refplace, ast.writeregions);
-    if (v.type && v.type->kind == TY_SLICE) v.sliceplace = a.sliceplace.Common(b.sliceplace, ast.writeregions);
+    if (v.type && v.type->kind == TY_REF) v.refplace = a.refplace.Common(b.refplace, ast.places);
+    if (v.type && v.type->kind == TY_SLICE) v.sliceplace = a.sliceplace.Common(b.sliceplace, ast.places);
     v.elementlinks = a.elementlinks;
     v.elementlinks.Include(b.elementlinks);
     v.intactprefix = a.intactprefix && b.intactprefix;
@@ -2503,6 +2505,7 @@ inline void TypeCheck::ApplyLinkEffects(const LinkEffects &effects) {
     // must be able to discard them even on a second exit or loop pass.
     for (auto &[part, write] : effects.writes.live) {
         storeevents.push_back(storeevents[write.at]);
+        storeevents.back().boundfield = part.boundfield;
         cur.links.Add(storeevents.back(), storeevents.size() - 1, write.suffix);
     }
 }
@@ -2539,7 +2542,7 @@ inline vector<FnRecord::InterruptedAssign> TypeCheck::CheckExitScopes(
     if (!reachable) return {};
     for (auto r = cur.rebuild; r && first < r->depth; r = r->outer) {
         auto place = StoragePlace(r->receiver, r->type, r->receiver.place);
-        FnRecord::InterruptedAssign { r->lval, r->type, r->receiver, place }.AddTo(interrupted, ast.writeregions);
+        FnRecord::InterruptedAssign { r->lval, r->type, r->receiver, place }.AddTo(interrupted, ast.places);
     }
     RunExitDefers(first, interrupted);
     if (!reachable) return {};

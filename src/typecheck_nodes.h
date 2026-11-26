@@ -92,7 +92,7 @@ inline Val Ident::Check(TypeCheck &tc, TypeExpr *) {
         v.type = tc.LoadType(t);
         if (IsRefOrSlice(t)) {
             v.SetProv(tc.RefProvOf(vd));
-            if (t->kind == TY_REF) v.refplace = vd->PointeePlace();
+            if (t->kind == TY_REF) v.refplace = vd->PointeePlace(tc.ast.places);
             v.lvalue = t->kind == TY_SLICE;   // A slice variable is storage; a reference is the pointee's path.
             if (v.lvalue) {
                 v.sliceplace = vd->SlicePlace();
@@ -244,6 +244,7 @@ inline Val ArrayLit::Check(TypeCheck &tc, TypeExpr *expected) {
     }
     TypeCheck::FlagScope inelement(tc.curdst.place.intail, tc.curdst.place.intail || (expected && IsArrayKind(expected, A_GROW)));
     TypeCheck::FlagScope nofieldsteps(tc.curdst.fieldsteps, false);
+    TypeCheck::FlagScope noboundsteps(tc.curdst.boundsteps, false);
     // A fixed array and an appended run write their elements in order.
     // Other array representations write their length before the elements.
     if (starts && expected && expected->kind == TY_ARRAY && !IsArrayKind(expected, A_FIXED)) {

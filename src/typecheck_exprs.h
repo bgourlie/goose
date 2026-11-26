@@ -173,7 +173,7 @@ inline void TypeCheck::DerefLValue(LVal &lv, Node *at) {
     if (lv.var) {
         RequireAssigned(lv.var, at);
         lv.SetProv(RefProvOf(lv.var));
-        lv.place = lv.var->PointeePlace();
+        lv.place = lv.var->PointeePlace(ast.places);
     } else if (lv.fromstorage) {
         // Crossing a reference the path read out of a container: it is a
         // read-back, so where it points is re-derived, and it is as writable
@@ -615,7 +615,7 @@ template<typename F> void TypeCheck::HeldOperands(F f) {
                     Val v;
                     v.TakeAlts(roots);
                     v.type = ast.RefTo(pointee, fill->line);
-                    if (target.base) v.refplace = { {}, target.base, ast.Intern(target.path), false, true };
+                    if (target.base) v.refplace = { {}, target.base, ast.places.Path(target.path), false, true };
                     f(Held { nullptr, std::move(v) });
                 };
                 for (auto &[slot, roots] : pending->second.slots) hold(slot.link.pointee, roots, slot.target);
@@ -719,9 +719,10 @@ inline void TypeCheck::ProjectField(Prov &storage, RefPlace &place, TypeExpr *ow
         place = place.Inside();
     } else {
         if (!place.regions.All().empty() && GetStructInst(owner)->frameobj && ClassOf((*fields.ftypes)[i]) == SC_FIXED)
-            place.regions = place.regions.FixedField(ast.writeregions);
-        if (!place.base || place.enclosing) return;
-        place.path = ast.Intern(cat(place.path, ".", (*fields.fields)[i].name));
+            place.regions = place.regions.FixedField(ast.places.regions);
+        auto name = (*fields.fields)[i].name;
+        if (!place.boundenclosing) place.bound = ast.places.Project(place.bound, name, ".");
+        if (place.base && !place.enclosing) place.path = ast.places.Path(cat(place.Path(), ".", name));
     }
 }
 
@@ -1527,8 +1528,8 @@ inline bool TypeCheck::FitsAt(Val &v, TypeExpr *dt, bool delivered) {
                 if (recordingrelative && !dt->ref->pool) {
                     pointee = LinkPointee(pointee);
                     auto &place = v.refplace;
-                    auto part = place.base ? FieldPathType(place.base, place.path) : nullptr;
-                    if (CanContainLinkTarget(part, pointee)) target = { place.base, string(place.path) };
+                    auto part = place.base ? FieldPathType(place.base, place.Path()) : nullptr;
+                    if (CanContainLinkTarget(part, pointee)) target = { place.base, string(place.Path()) };
                 }
                 auto fits = dt->ref->pool ? want && links.Exact() && have == want
                     : RelativeDestination(links, curdst, pointee, fitnode, recordingrelative, target);
@@ -1650,7 +1651,7 @@ inline Val TypeCheck::CheckRefOf(Unary *x) {
         Val v;
         v.type = LoadType(lv.type);  // Relative refs load as plain (§3.9).
         v.SetProv(RefProvOf(lv.var));
-        v.refplace = StoragePlace(v, v.type->ref->sub, lv.var->PointeePlace());
+        v.refplace = StoragePlace(v, v.type->ref->sub, lv.var->PointeePlace(ast.places));
         return v;
     }
     Val v;
@@ -3311,6 +3312,8 @@ inline TypeCheck::LitDeep TypeCheck::CheckInits(StructLit *sl, vector<Field> &fi
                              ? RootComponent(rootowner, selft, sl->fieldindices[k]) : nullptr;
         DestScope ds(*this, component ? Dest(component) : curdst);
         curdst.fieldsteps &= selft->kind == TY_STRUCT;
+        curdst.boundsteps &= selft->kind == TY_STRUCT;
+        if (curdst.boundsteps) curdst.boundfield = ast.places.Project(curdst.boundfield, fi.name, ".");
         if (!component && curdst.fieldsteps && (curdst.field.base || curdst.result) &&
             (HasRelRefT(ft) || (hasdefers && HoldsPlainRef(ft))))
             Append(curdst.field.path, ".", fields[sl->fieldindices[k]].name);
