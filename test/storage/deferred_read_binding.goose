@@ -46,6 +46,7 @@ fn replace_slice_binding(stop: bool) {
     var spare: i64[1] = [7];
     var view = buf.header[..];
     defer {
+        assert(view.len == 1);
         view = spare[..];
         assert(view[0] == 7);
     }

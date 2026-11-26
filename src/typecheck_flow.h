@@ -2633,7 +2633,10 @@ inline void TypeCheck::NoteStorageRead(Node *n) {
     auto v = id ? id->vdef : nullptr;
     auto spec = CurRealFrame().spec;
     if (!v || !v->type || !spec) return;
-    auto ref = IsRefOrSlice(v->type);
+    // A saved slice carries its own length, even if its elements are in
+    // the object being replaced. A slice field's descriptor lives in its holder.
+    auto descriptor = header && property->obj == id && v->type->kind == TY_SLICE;
+    auto ref = IsRefOrSlice(v->type) && !descriptor;
     if (!cur.deferring && !ref && !v->isglobal && v->ownerspec == spec) return;
     auto holder = ref ? PointeeOf(v->type) : v->type;
     auto place = ref ? (v->type->kind == TY_SLICE ? v->SlicePlace() : v->PointeePlace(ast.places))
