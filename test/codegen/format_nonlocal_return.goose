@@ -88,6 +88,10 @@ fn check_format_overload() {
 }
 
 struct EarlyStop {}
+struct Later {}
+struct Message { first: EarlyStop, second: Later }
+enum Either { Stop { first: EarlyStop, second: Later }, Continue { value: i64 } }
+fn format(out: u8[>..]&, l: Later) { out.format(later_global); }
 fn format(out: u8[>..]&, s: EarlyStop) { return 7 from early; }
 fn format(out: u8[>..]&, s: EarlyStop, other: MaybeStop) { abort("wrong overload"); }
 fn early(mode: i64, flag: bool) {
@@ -98,14 +102,22 @@ fn early(mode: i64, flag: bool) {
     if mode == 1 { format(out, EarlyStop {}, read() + 1); }
     if mode == 2 { format(out, EarlyStop {}, if flag { return true; } else { 3 }); }
     if mode == 3 { format(out, EarlyStop {}, jump() + 1); }
+    if mode == 4 { print(Message { first: EarlyStop {}, second: Later {} }); }
+    if mode == 5 {
+        let message: Either = if flag { Either.Stop { first: EarlyStop {}, second: Later {} } }
+                              else { Either.Continue { value: 42 } };
+        out.format(message);
+        assert(out == "Continue { 42 }");
+    }
     return 42;
 }
-let early_results = [early(0, true), early(1, true), early(2, true), early(3, true)];
+let early_results = [early(0, true), early(1, true), early(2, true), early(3, true),
+                     early(4, true), early(5, true)];
 let later_global: i64 = 8;
 
 fn main() {
     for value in early_results { assert(value == 7); }
-    assert(early(4, true) == 42);
+    assert(early(5, false) == 42 && str(Later {}) == "8");
     check_format_overload();
     assert(render(true) == 5 && order == 13);
     order = 0;

@@ -200,7 +200,8 @@ inline void CodeGen::RenderLoc(Loc &out, Loc lv, TypeExpr *t, bool nested, Call 
             t->Dump(name);
             RenderLit(out, cat(name, " { "));
             auto first = true;
-            for (auto i = 0; i < (int)si->st->fields.size(); i++) {
+            auto count = Call::RenderFieldCount(c, si->ftypes);
+            for (size_t i = 0; i < count; i++) {
                 if (si->st->fields[i].ispad) continue;
                 if (!first) RenderLit(out, ", ");
                 first = false;
@@ -284,7 +285,8 @@ inline void CodeGen::RenderVariant(Loc &out, Loc lv, TypeExpr *t, Call *c, Line 
     }
     RenderLit(out, cat(v.name, " { "));
     auto first = true;
-    for (auto i = 0; i < (int)v.fields.size(); i++) {
+    auto count = Call::RenderFieldCount(c, ei->vftypes[vi]);
+    for (size_t i = 0; i < count; i++) {
         if (v.fields[i].ispad) continue;
         if (!first) RenderLit(out, ", ");
         first = false;

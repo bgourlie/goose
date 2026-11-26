@@ -1076,8 +1076,11 @@ inline void TypeCheck::CheckRenderable(Call *c, const char *what, TypeExpr *t, N
         CheckRenderable(c, what, ft, at, seen, v, out);
     };
     auto fields = [&](const FieldRun &run) {
-        for (size_t i = 0; i < run.ftypes->size(); i++)
+        size_t i = 0;
+        for (; i < run.ftypes->size() && reachable; i++)
             if (auto ft = (*run.ftypes)[i]) child(ft, IsRefOrSlice(ft), &run, i);
+        auto &count = c->fmtfieldcounts[run.ftypes];
+        count = std::max(count, i);
     };
     switch (t->kind) {
         case TY_INT: case TY_FLT: case TY_BOOL: return;
@@ -1677,10 +1680,79 @@ inline void TypeCheck::NoteOverwrite(Node *lval, const Roots &loc, size_t at, Ty
     if (!reachable) return;
     auto kill = OverwrittenPart(lval, loc, target, at, place);
     if (!kill || (!kill->relative && (kill->container->isglobal || kill->base->isglobal))) return;
-    NoteOverwrite(std::move(*kill));
+    NoteOverwrite(std::move(*kill), target);
 }
 
-inline void TypeCheck::NoteOverwrite(Kill kill) {
+// A limited array keeps its capacity slots across assignment (§5.3). Once
+// the live count changes, the old suffix can only be observed through an
+// existing view of an element or one of its parts.
+inline bool TypeCheck::MayViewLimitedSlot(const Kill &part, TypeExpr *array) {
+    auto owner = part.container;
+    if (!owner || owner->isglobal || !owner->type || owner->ownerspec != CurRealFrame().spec)
+        return true;  // The caller may hold such a view.
+    // Old links inside this array cannot make their own removed slots
+    // reachable. Newly constructed links and links in siblings can.
+    for (auto &[slot, at] : cur.links.live)
+        if (slot.owner == owner && !(at < part.at && slot.field.Within(part.base, part.path)) &&
+            LinkMayReachElements(array, slot.link.pointee)) return true;
+    bool viewed = false;
+    ShrinkScanVars([&](VarDef *v) {
+        if (!viewed && v->type && CanHoldViewInto(v->type, array)) viewed = true;
+    });
+    HeldOperands([&](const Held &h) {
+        auto t = h.v.type;
+        if (viewed || !t) return;
+        viewed = CanHoldViewInto(t, array) || (h.location && LinkMayReachElements(array, t)) ||
+                 (h.elems && t->kind == TY_ARRAY && LinkMayReachElements(array, t->arr->sub));
+    });
+    return viewed;
+}
+
+inline bool TypeCheck::MayKeepLimitedSlots(TypeExpr *t, const Kill &part, Node *value) {
+    if (!t || !(part.relative ? HasRelRefT(t) : HoldsPlainRef(t))) return false;
+    if (t->kind == TY_ARRAY) {
+        if (ClassOf(t) == SC_RESIZABLE) return false;  // The old element storage is released.
+        auto lit = Is<ArrayLit>(value);
+        if (IsArrayKind(t, A_LIMITED)) {
+            int64_t count = -1;
+            if (lit && !lit->capexpr) {
+                if (!lit->fillval) count = (int64_t)lit->elems.size();
+                else ConstInt(lit->fillcount, count);
+            }
+            if ((!t->arr->sizeexpr || count != ArraySize(t->arr)) && MayViewLimitedSlot(part, t))
+                return true;
+        }
+        auto elem = part;
+        elem.base = nullptr;  // Field paths do not distinguish array elements.
+        if (lit && !lit->fillval && !lit->elems.empty())
+            return any_of(lit->elems.begin(), lit->elems.end(), [&](Node *e) {
+                return MayKeepLimitedSlots(t->arr->sub, elem, e);
+            });
+        return MayKeepLimitedSlots(t->arr->sub, elem, lit ? lit->fillval : nullptr);
+    }
+    auto lit = Is<StructLit>(value);
+    for (auto &run : FieldRuns(t)) for (size_t i = 0; i < run.ftypes->size(); i++)
+        if (MayKeepLimitedSlots((*run.ftypes)[i], part.Field((*run.fields)[i].name),
+                                lit ? lit->InitFor((int)i) : nullptr))
+            return true;
+    return false;
+}
+
+inline void TypeCheck::NoteOverwrite(Kill kill, TypeExpr *target, Node *value) {
+    if (MayKeepLimitedSlots(target, kill, value)) {
+        // Kills name fields, not individual indices. Publish the fully
+        // overwritten siblings and retain the array's previous link facts.
+        if (target->kind == TY_STRUCT) {
+            auto si = GetStructInst(target);
+            auto lit = Is<StructLit>(value);
+            for (size_t i = 0; i < si->ftypes.size(); i++) {
+                auto ft = si->ftypes[i];
+                if (!ft || !(kill.relative ? HasRelRefT(ft) : HoldsPlainRef(ft))) continue;
+                NoteOverwrite(kill.Field(si->st->fields[i].name), ft, lit ? lit->InitFor((int)i) : nullptr);
+            }
+        }
+        return;
+    }
     // A branch or call may already have delivered this part at a more
     // precise boundary than the enclosing assignment can establish.
     for (auto &k : cur.kills) {

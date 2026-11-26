@@ -1068,7 +1068,10 @@ inline Val TypeCheck::CheckValue(Node *&n, TypeExpr *expected, bool callsite, bo
         if (from->kind == TY_VARIANT && (expected->enu->varmode || FixedPlacedResult(from)))
             construction->started = true;
     }
-    if (delivery && reachable && v.HasResultType()) NoteOverwrite(std::move(*delivery));
+    if (delivery && reachable && v.HasResultType()) {
+        auto part = KillPartType(*delivery);
+        if (part) NoteOverwrite(std::move(*delivery), part, n);
+    }
     if (construction && v.HasResultType() && reachable && !branch) {
         // In-place literals and calls delivering the array in its own
         // representation already recorded the count and element writes.

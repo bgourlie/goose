@@ -1929,6 +1929,10 @@ never corrupt memory. Indexing through the array checks against current
 length; access through retained references does not (they were validly
 created).
 
+Assigning a shorter value can leave previously initialized slots beyond
+the new length untouched. A link in such a slot still constrains a shrink
+of its target (§5.1) if a retained reference or slice can reach the slot.
+
 An array conversion that takes only the live elements of a limited array
 must also preserve their self-relative links. The compiler rejects the
 conversion if a retained link may point to a slot beyond the live length.

@@ -243,6 +243,11 @@ struct TypeCheck {
         string path;
         size_t at = 0;
         bool relative = false;
+        Kill Field(string_view name) const {
+            auto field = *this;
+            Append(field.path, ".", name);
+            return field;
+        }
         bool SameStorage(const Kill &other) const {
             return container == other.container && base == other.base && relative == other.relative;
         }
@@ -2815,7 +2820,9 @@ struct TypeCheck {
     std::optional<Kill> MapParamPart(FnSpec *spec, const vector<Node *> &args, const vector<Val> &vals,
                                      size_t param, const string &path, bool relative, size_t at);
     void NoteKill(Node *lval, const LVal &loc, TypeExpr *target, const Val &v, size_t at);
-    void NoteOverwrite(Kill kill);
+    bool MayViewLimitedSlot(const Kill &part, TypeExpr *array);
+    bool MayKeepLimitedSlots(TypeExpr *t, const Kill &part, Node *value = nullptr);
+    void NoteOverwrite(Kill kill, TypeExpr *target, Node *value = nullptr);
     void NoteOverwrite(Node *path, const Roots &loc, size_t at, TypeExpr *target,
                        const RefPlace *place = nullptr);
     bool KilledFor(VarDef *c, VarDef *base, TypeExpr *t, TypeExpr *arr, size_t &since,

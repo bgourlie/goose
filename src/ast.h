@@ -1328,6 +1328,16 @@ NODE(Call)
     // occur in the arguments, by type (§3.7).
     vector<pair<TypeExpr *, FnSpec *>> fmtspecs;
     vector<Call *> fmtcontexts; // One immutable hook set per rendered argument.
+    // On an argument's context, the reachable prefix of each struct or
+    // variant's instantiated field list. An exiting hook ends that sequence.
+    map<const vector<TypeExpr *> *, size_t> fmtfieldcounts;
+    static size_t RenderFieldCount(const Call *context, const vector<TypeExpr *> &fields) {
+        if (context) {
+            auto it = context->fmtfieldcounts.find(&fields);
+            if (it != context->fmtfieldcounts.end()) return it->second;
+        }
+        return fields.size();
+    }
     // Typecheck: the defaults of the trailing parameters the call leaves out
     // (§7.1), `ndefaults` fresh clones in args from args[firstdefault] on,
     // where the arguments would be. A diagnostic prints the call without

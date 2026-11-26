@@ -4010,8 +4010,9 @@ completes a pending `var x = []` receiver.
 renderability per type (`CheckRenderable`) and look up a user `format`
 overload in the type's namespace, then globally, specializing it with each
 rendered argument's permissions and provenance (`fmtspecs`, `fmtcontexts`).
-Nested hooks obey the same constraints. Their effects are applied between
-rendered arguments (§3.10, **Format overloads**).
+Nested hooks obey the same constraints. A formatter that exits stops its
+field sequence. The argument's context records the reachable field count
+for each struct and variant so code generation emits the same sequence.
 `to_bytes`/`bytes_of` require `ImageSafe` element types (no plain references,
 slices or `in pool` references), `from_bytes` the stricter `VerifiableElem`
 (every relative reference points at an element or a variant of it). A

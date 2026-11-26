@@ -49,9 +49,30 @@ fn root_component() {
     st.list.nodes.clear();
 }
 
+struct Entry { link: i64&<u32>? }
+struct Saved { first: Entry&<u32>?, slots: Entry[..2], values: i64[>..] }
+
+fn retained_limited_slot() {
+    var x = Saved { slots: [Entry {}], values: [42] };
+    x.slots[0].link .= x.values[0];
+    x.first .= x.slots[0];
+    x.slots = [];
+    {
+        let first .= x.first;
+        if first { assert(first.link .== x.values[0]); } else { abort("missing first"); }
+    }
+    x.slots = [Entry {}, Entry {}];
+    {
+        let first .= x.first;
+        if first { assert(first.link == null); }
+    }
+    x.values.clear();
+}
+
 fn main() {
     nested_arrays();
     indexed_field(1);
     root_component();
+    retained_limited_slot();
     print("ok");
 }
