@@ -1526,8 +1526,15 @@ inline bool TypeCheck::FitsAt(Val &v, TypeExpr *dt, bool delivered) {
                                   : cat("this reference is rooted at ", vroot));
                     return false;
                 }
-                if (recordingrelative && !dt->ref->pool && !curdst.result)
-                    StoreElementLink(curdst, dt, { pointee, curdst.appended ? EL_BACKWARD : EL_ANY }, fitnode, links);
+                if (recordingrelative && !dt->ref->pool && !curdst.result) {
+                    LinkField target;
+                    auto &place = v.refplace;
+                    auto part = place.base ? FieldPathType(place.base, place.path) : nullptr;
+                    if (part && CanContain(part, pointee))
+                        target = { place.base, string(place.path) };
+                    StoreElementLink(curdst, dt, { pointee, curdst.appended ? EL_BACKWARD : EL_ANY },
+                                     fitnode, links, {}, target);
+                }
                 v.type = dt;
                 return true;
             }

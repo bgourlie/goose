@@ -50,7 +50,7 @@ fn root_component() {
 }
 
 struct Entry { link: i64&<u32>?, flag: bool = false }
-struct Saved { first: Entry&<u32>?, flag: bool = true, slots: Entry[..2] = [Entry {}, Entry {}], values: i64[>..] }
+struct Saved { first: Entry&<u32>?, flag: bool = true, other: Entry = Entry {}, slots: Entry[..2] = [Entry {}, Entry {}], values: i64[>..] }
 
 fn retained_limited_slot() {
     var x = Saved { slots: [Entry {}], values: [42] };
@@ -109,7 +109,7 @@ fn replace_all_slots() {
     assert(x.first == null && x.slots[0].link == null && x.values[0] == 43);
     x.first .= x.slots[1];
     x.slots[1].link .= x.values[0];
-    x = Saved { null, true, [Entry {}; 2], [44] };
+    x = Saved { null, true, Entry {}, [Entry {}; 2], [44] };
     assert(x.first == null && x.slots[1].link == null && x.values[0] == 44);
     x.first .= x.slots[1];
     x.slots[1].link .= x.values[0];
@@ -171,6 +171,41 @@ fn replace_in_branches(choice: i64) {
     assert(x.slots[1].link == null);
 }
 
+fn clear_slots(slots: Entry[..2]&) { slots.clear(); }
+fn save_other(x: Saved&) { x.first .= x.other; }
+fn link_then_clear(x: Saved&) {
+    x.slots[0].link .= x.values[0];
+    x.slots.clear();
+}
+
+fn clear_through_helper() {
+    var x = Saved { values: [42] };
+    x.slots[1].link .= x.values[0];
+    clear_slots(x.slots);
+    x.values.clear();
+    assert(x.values.len == 0);
+    x.slots.push(Entry {});
+    x.values.push(43);
+    link_then_clear(x);
+    x.values.clear();
+}
+
+fn disjoint_target() {
+    var x = Saved { values: [42] };
+    x.first .= x.other;
+    x.slots[1].link .= x.values[0];
+    x.slots.clear();
+    x.values.clear();
+    assert(x.first .== x.other);
+    x.values.push(43);
+    x.slots.push(Entry {});
+    save_other(x);
+    x.slots[0].link .= x.values[0];
+    clear_slots(x.slots);
+    x.values.clear();
+    assert(x.first .== x.other);
+}
+
 fn main() {
     nested_arrays();
     indexed_field(1);
@@ -185,5 +220,7 @@ fn main() {
     flat_slot_view();
     replace_in_branches(0);
     replace_in_branches(1);
+    clear_through_helper();
+    disjoint_target();
     print("ok");
 }

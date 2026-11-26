@@ -243,6 +243,7 @@ struct TypeCheck {
         string path;
         size_t at = 0;
         bool relative = false;
+        bool prefixonly = false;  // Old limited-array slots may still be observable through views.
         Kill Field(string_view name) const {
             auto field = *this;
             Append(field.path, ".", name);
@@ -251,7 +252,9 @@ struct TypeCheck {
         bool SameStorage(const Kill &other) const {
             return container == other.container && base == other.base && relative == other.relative;
         }
-        bool SamePart(const Kill &other) const { return SameStorage(other) && path == other.path; }
+        bool SamePart(const Kill &other) const {
+            return SameStorage(other) && path == other.path && prefixonly == other.prefixonly;
+        }
         bool operator==(const Kill &) const = default;
     };
     static vector<Kill> IntersectKills(const vector<Kill> &a, const vector<Kill> &b) {
@@ -290,6 +293,7 @@ struct TypeCheck {
             ElementLink link;
             LinkField field;
             int summary;
+            LinkField target;
             auto operator<=>(const Part &) const = default;
             auto operator<=>(VarDef *v) const { return std::compare_three_way {}(owner, v); }
         };
@@ -322,7 +326,7 @@ struct TypeCheck {
         };
         map<ArrayLit *, FillLinks> fills;
         void Add(const StoreEvent &e, size_t index, std::optional<string_view> suffix = {}) {
-            Part part { e.container, e.elementlink, e.storefield, e.linkclass };
+            Part part { e.container, e.elementlink, e.storefield, e.linkclass, e.linktarget };
             Write write { index, suffix };
             auto [it, added] = live.try_emplace(std::move(part), write);
             if (!added) it->second.Include(write);
@@ -335,9 +339,10 @@ struct TypeCheck {
                 if (!added) it->second.Include(write);
             }
         }
-        set<int> ClassStores() const {
-            set<int> stores;
-            for (auto &[part, at] : live) if (part.summary >= 0) stores.insert(part.summary);
+        FnRecord::LinkStores ClassStores() const {
+            FnRecord::LinkStores stores;
+            for (auto &[part, write] : live)
+                if (part.summary >= 0) FnRecord::IncludeStore(stores, part.summary, write.suffix);
             return stores;
         }
         // Loop convergence depends on the possible writes, not event numbers.
@@ -2913,10 +2918,10 @@ struct TypeCheck {
     RefPlace ArgumentPlace(FnSpec *spec, VarDef *param, const vector<Val> &args);
     void RecordElementLinks(const Dest &dest, TypeExpr *type, const ValueLinks &links, Node *at);
     void StoreElementLink(const Dest &dest, TypeExpr *type, ElementLink link, Node *at,
-                          const Roots &borrowed, string_view path = {});
+                          const Roots &borrowed, string_view path = {}, const LinkField &target = {});
     void FinishFill(ArrayLit *fill, const Dest &dest);
     void RecordLinkStore(const Roots &owners, TypeExpr *reached, ElementLink link, Node *at,
-                         LinkLocation place = {}, const LinkField &field = {});
+                         LinkLocation place = {}, const LinkField &field = {}, const LinkField &target = {});
     void NoteSlotStore(const StoreEvent &e);
     // How NeverStoredError words a grow-shrink array `gs` a value pointing at
     // `roots` may point into: as the array itself where it is the value's one

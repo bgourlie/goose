@@ -2439,6 +2439,9 @@ struct LinkField {
     bool Within(VarDef *owner, string_view enclosing) const {
         return base && base == owner && FieldPathWithin(path, enclosing);
     }
+    bool ApartFrom(VarDef *owner, string_view other) const {
+        return base && base == owner && !FieldPathWithin(path, other) && !FieldPathWithin(other, path);
+    }
     auto operator<=>(const LinkField &) const = default;
 };
 
@@ -2456,9 +2459,15 @@ vector<K> CommonOverwrites(const vector<K> &a, const vector<K> &b, F evidence) {
             if (FieldPathWithin(right.path, left.path)) part = &right;
             else if (!FieldPathWithin(left.path, right.path)) continue;
         }
-        auto it = find_if(common.begin(), common.end(), [&](const K &k) { return k.SamePart(*part); });
+        // A full overwrite also covers a nested array's live prefix.
+        // Emptying only a prefix says nothing about named subfields.
+        if ((left.prefixonly && part->path != left.path) ||
+            (right.prefixonly && part->path != right.path)) continue;
+        auto overlap = *part;
+        overlap.prefixonly = left.prefixonly || right.prefixonly;
+        auto it = find_if(common.begin(), common.end(), [&](const K &k) { return k.SamePart(overlap); });
         bool first = it == common.end();
-        auto &out = first ? common.emplace_back(*part) : *it;
+        auto &out = first ? common.emplace_back(std::move(overlap)) : *it;
         evidence(out, left, right, first);
     }
     return common;
@@ -2473,6 +2482,7 @@ struct StoreEvent {
     // verified element run. Mapping this event requires only the destination.
     ElementLink elementlink;
     LinkField storefield;  // The part containing the written slot, when known.
+    LinkField linktarget;  // The part a self-relative link points into, when known.
     bool wholecopy = false; // An entire holder copied to this exact field.
     VarDef *linkparam = nullptr; // Direct destination parameter, even when parameters share a class.
     int linkclass = -1;          // Its index in the current body's class-store summary.
@@ -2725,12 +2735,13 @@ struct FnRecord {
         // that names it. Through a captured reference these can differ.
         VarDef *external = nullptr;
         VarDef *base = nullptr;
+        bool prefixonly = false;
         set<int> writes; // Ordinary class stores that may survive this overwrite at the shrink.
         bool SameStorage(const CallerKill &k) const {
             return param == k.param && external == k.external && base == k.base &&
                    relative == k.relative;
         }
-        bool SamePart(const CallerKill &k) const { return SameStorage(k) && path == k.path; }
+        bool SamePart(const CallerKill &k) const { return SameStorage(k) && path == k.path && prefixonly == k.prefixonly; }
         bool operator==(const CallerKill &) const = default;
     };
     static void IntersectKills(vector<CallerKill> &a, const vector<CallerKill> &b) {
@@ -2740,8 +2751,18 @@ struct FnRecord {
             out.writes.insert(right.writes.begin(), right.writes.end());
         });
     }
+    // Per class store, the limited-array field whose old suffix alone can
+    // still contain it. An unconditional occurrence keeps the write live.
+    using LinkStores = map<int, std::optional<string_view>>;
+    static void IncludeStore(LinkStores &stores, int index, std::optional<string_view> suffix) {
+        auto [it, added] = stores.try_emplace(index, suffix);
+        if (!added && it->second != suffix) it->second.reset();
+    }
+    static void JoinStores(LinkStores &stores, const LinkStores &other) {
+        for (auto &[index, suffix] : other) IncludeStore(stores, index, suffix);
+    }
     struct ShrinkOrder {
-        set<int> linkstores;       // Relative class stores still live at this shrink.
+        LinkStores linkstores;     // Relative class stores still live at this shrink.
         int param = -1;
         VarDef *external = nullptr;
         TypeExpr *bound = nullptr;
@@ -2753,10 +2774,10 @@ struct FnRecord {
     // At each destination only common overwrites and possible writes survive.
     struct ExitLinks {
         vector<CallerKill> overwrites;
-        set<int> stores;
+        LinkStores stores;
         void Join(const ExitLinks &other) {
             IntersectKills(overwrites, other.overwrites);
-            stores.insert(other.stores.begin(), other.stores.end());
+            JoinStores(stores, other.stores);
         }
         bool operator==(const ExitLinks &) const = default;
     };
