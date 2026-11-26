@@ -2821,7 +2821,7 @@ struct TypeCheck {
                                      size_t param, const string &path, bool relative, size_t at);
     void NoteKill(Assign *assign, const LVal &loc, TypeExpr *target, const Val &v, size_t at);
     bool MayViewLimitedSlot(const Kill &part, TypeExpr *array);
-    bool MayKeepLimitedSlots(TypeExpr *t, const Kill &part, Node *value = nullptr);
+    bool MayKeepLimitedSlots(TypeExpr *t, const Kill &part, Node *value);
     void NoteOverwrite(Kill kill, TypeExpr *target, Node *value = nullptr);
     void NoteOverwrite(Node *path, const Roots &loc, size_t at, TypeExpr *target,
                        const RefPlace *place = nullptr, Node *value = nullptr);

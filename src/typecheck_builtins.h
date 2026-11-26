@@ -1760,10 +1760,10 @@ inline bool TypeCheck::MayKeepLimitedSlots(TypeExpr *t, const Kill &part, Node *
             });
         return MayKeepLimitedSlots(t->arr->sub, elem, lit ? lit->fillval : nullptr);
     }
-    auto lit = Is<StructLit>(value);
+    auto lit = t->kind != TY_ENUM ? Is<StructLit>(value) : nullptr;
     for (auto &run : FieldRuns(t)) for (size_t i = 0; i < run.ftypes->size(); i++)
         if (MayKeepLimitedSlots((*run.ftypes)[i], part.Field((*run.fields)[i].name),
-                                lit ? lit->InitFor((int)i) : nullptr))
+                                lit ? lit->InitFor((int)i, *run.fields) : nullptr))
             return true;
     return false;
 }

@@ -708,11 +708,7 @@ inline void TypeCheck::ProjectField(Prov &storage, RefPlace &place, TypeExpr *ow
         if (!place.regions.All().empty() && GetStructInst(owner)->frameobj && ClassOf((*fields.ftypes)[i]) == SC_FIXED)
             place.regions = place.regions.FixedField(ast.writeregions);
         if (!place.base || place.enclosing) return;
-        // A defer can hold a reference to a sibling of the field being
-        // rebuilt. Retain those paths even when the fields have no links.
-        if (hasdefers || HasRelRefT((*fields.ftypes)[i]))
-            place.path = ast.Intern(cat(place.path, ".", (*fields.fields)[i].name));
-        else place = { place.location };
+        place.path = ast.Intern(cat(place.path, ".", (*fields.fields)[i].name));
     }
 }
 
@@ -3230,21 +3226,13 @@ inline TypeCheck::LitDeep TypeCheck::CheckInits(StructLit *sl, vector<Field> &fi
     vector<bool> got(fields.size(), false);
     auto pos = 0;
     for (auto &fi : sl->inits) {
-        auto idx = -1;
         CheckAccessorOwner(fi.val, fi.accessorowner, selft, sl);
+        auto idx = fi.FieldIndex(fields, pos);
+        if (idx < 0 && LacksByError(selft)) throw Abandoned {};
         if (named) {
-            for (auto i = 0; i < (int)fields.size(); i++)
-                if (!fields[i].ispad && fields[i].name == fi.name) { idx = i; break; }
-            if (idx < 0 && LacksByError(selft)) throw Abandoned {};
             if (idx < 0) Error(fi.val, cat(what, " has no field ", fi.name));
             if (got[idx]) Error(fi.val, cat("duplicate initializer for field ", fi.name));
-        } else {
-            while (pos < (int)fields.size() && fields[pos].ispad) pos++;
-            if (pos >= (int)fields.size() && LacksByError(selft)) throw Abandoned {};
-            if (pos >= (int)fields.size())
-                Error(fi.val, cat("too many initializers for ", what));
-            idx = pos++;
-        }
+        } else if (idx < 0) Error(fi.val, cat("too many initializers for ", what));
         got[idx] = true;
         sl->fieldindices.push_back(idx);
     }

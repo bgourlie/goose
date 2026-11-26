@@ -49,8 +49,8 @@ fn root_component() {
     st.list.nodes.clear();
 }
 
-struct Entry { link: i64&<u32>? }
-struct Saved { first: Entry&<u32>?, slots: Entry[..2], values: i64[>..] }
+struct Entry { link: i64&<u32>?, flag: bool = false }
+struct Saved { first: Entry&<u32>?, flag: bool = true, slots: Entry[..2], values: i64[>..] }
 
 fn retained_limited_slot() {
     var x = Saved { slots: [Entry {}], values: [42] };
@@ -90,6 +90,29 @@ fn unrelated_view() {
     assert(other.link == null);
 }
 
+fn sibling_field_view() {
+    var x = Saved { slots: [Entry {}], values: [42] };
+    x.slots[0].link .= x.values[0];
+    {
+        let flag .= x.flag;
+        x.slots = [];
+        assert(flag);
+    }
+    x.values.clear();
+}
+
+fn replace_all_slots() {
+    var x = Saved { slots: [Entry {}], values: [42] };
+    x.first .= x.slots[0];
+    x.slots[0].link .= x.values[0];
+    x = Saved { slots: [Entry {}, Entry {}], values: [43] };
+    assert(x.first == null && x.slots[0].link == null && x.values[0] == 43);
+    x.first .= x.slots[1];
+    x.slots[1].link .= x.values[0];
+    x = Saved { null, true, [Entry {}; 2], [44] };
+    assert(x.first == null && x.slots[1].link == null && x.values[0] == 44);
+}
+
 fn main() {
     nested_arrays();
     indexed_field(1);
@@ -97,5 +120,7 @@ fn main() {
     retained_limited_slot();
     overwrite_plain_slots();
     unrelated_view();
+    sibling_field_view();
+    replace_all_slots();
     print("ok");
 }

@@ -3118,7 +3118,8 @@ inline Val TypeCheck::CheckAssignedValue(Assign *a, TypeExpr *target, TypeExpr *
             // overwrite only once the assignment completes (NoteKill):
             // an exit from the RHS can still encounter the old header.
             auto part = OverwrittenPart(a->lval, built, target, storeevents.size(), &built.place);
-            auto replaced = MayKeepLimitedSlots(target, part.value_or(Kill { .relative = true })) ? arr : target;
+            auto keep = MayKeepLimitedSlots(target, part.value_or(Kill { .relative = true }), a->rhs);
+            auto replaced = keep ? arr : target;
             ShrinkThrough(a, "assign", ExprStr(a->lval), built, target, { SB_UNBALANCED, replaced });
         }
         NoteGrow(a, built, cat("assign ", ExprStr(a->lval)), target);

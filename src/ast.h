@@ -417,6 +417,16 @@ struct FieldInit {
     bool fromdefault = false;   // Checked in the type declaration's environment.
     int expansionbinding = 0;
     TypeExpr *accessorowner = nullptr;
+
+    int FieldIndex(const vector<Field> &fields, int &pos) const {
+        if (!name.empty()) {
+            for (int i = 0; i < (int)fields.size(); i++)
+                if (!fields[i].ispad && fields[i].name == name) return i;
+            return -1;
+        }
+        while (pos < (int)fields.size() && fields[pos].ispad) pos++;
+        return pos < (int)fields.size() ? pos++ : -1;
+    }
 };
 
 enum PatKind { P_WILDCARD, P_LIST };
@@ -1236,6 +1246,17 @@ NODE(StructLit)
     Node *InitFor(int fieldidx) const {
         for (size_t k = 0; k < fieldindices.size(); k++)
             if (fieldindices[k] == fieldidx) return inits[k].val;
+        return nullptr;
+    }
+    // An in-place assignment checks its initial shrink before checking
+    // the RHS. Only use a written initializer whose field is known then.
+    Node *InitFor(int fieldidx, const vector<Field> &fields) const {
+        if (!fieldindices.empty()) return InitFor(fieldidx);
+        int pos = 0;
+        for (const auto &fi : inits) {
+            if (fi.val->nkind == NK_ConstFor || fi.val->nkind == NK_ConstIf) return nullptr;
+            if (fi.FieldIndex(fields, pos) == fieldidx) return fi.val;
+        }
         return nullptr;
     }
 NODE_END

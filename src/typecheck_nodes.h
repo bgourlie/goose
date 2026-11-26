@@ -380,18 +380,11 @@ inline Val StructLit::Check(TypeCheck &tc, TypeExpr *expected) {
                         if (fi.name == st->fields[idx].name) written.push_back(&fi);
             }
             vector<pair<string_view, TypeExpr *>> b;
-            auto named = !written.empty() && !written[0]->name.empty();
             auto pos = 0;
             for (auto fi : written) {
-                Field *field = nullptr;
-                if (named) {
-                    for (auto &f2 : st->fields)
-                        if (!f2.ispad && f2.name == fi->name) { field = &f2; break; }
-                } else {
-                    while (pos < (int)st->fields.size() && st->fields[pos].ispad) pos++;
-                    if (pos < (int)st->fields.size()) field = &st->fields[pos++];
-                }
-                if (!field) continue;  // Reported properly below.
+                auto idx = fi->FieldIndex(st->fields, pos);
+                if (idx < 0) continue;  // Reported properly below.
+                auto field = &st->fields[idx];
                 // `self` says nothing about the arguments (its type is the
                 // literal's own), and has no meaning outside CheckInits.
                 if (Is<SelfRef>(fi->val)) continue;
