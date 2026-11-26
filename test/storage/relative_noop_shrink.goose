@@ -1,5 +1,6 @@
 struct Node { next: Node&<u32>? }
 struct List { head: Node&<u32>?, nodes: Node[>..] }
+struct Cells { head: i64&<u32>?, data: i64[>..] }
 const ZERO = 0;
 const ALSO_ZERO = ZERO + 0;
 
@@ -48,6 +49,11 @@ var shared: Node[>..] = [Node {}, Node {}];
 export fn keep_shared() { shared.resize(shared.len); }
 
 fn main() {
+    var cells = Cells { data: [1, 2] };
+    cells.head .= cells.data[1];
+    cells.data.resize(cells.data.len, 0);
+    cells.data.resize(cells.data.len, cells.data[0] + 1);
+    assert(cells.head .== cells.data[1]);
     through_mutable_ref();
     let pair: Node[] = limited_pair();
     assert(pair.len == 2 && pair[0].next .== pair[1]);

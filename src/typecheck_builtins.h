@@ -9,6 +9,18 @@ namespace goose {
 // ------------------------------------------------------------------
 // Builtins (§3.7, §9.3, §11.2) and array members (§3.3, §5.4).
 
+// These expressions only read their operands. A call (including an implicit
+// constructor default) can run user code between reading the count and resizing.
+inline bool ReadOnlyResizeFill(Node *n) {
+    if (Is<Ident>(n) || Is<IntLit>(n) || Is<FltLit>(n) || Is<BoolLit>(n) || Is<StrLit>(n) || Is<NullLit>(n))
+        return true;
+    if (auto u = Is<Unary>(n)) return ReadOnlyResizeFill(u->child);
+    if (auto b = Is<Binary>(n)) return ReadOnlyResizeFill(b->left) && ReadOnlyResizeFill(b->right);
+    if (auto d = Is<Dot>(n)) return ReadOnlyResizeFill(d->obj);
+    if (auto ix = Is<Index>(n)) return ReadOnlyResizeFill(ix->obj) && ReadOnlyResizeFill(ix->idx);
+    return false;
+}
+
 // The count and, for resize, the fill have already been checked in evaluation order.
 inline TypeCheck::SlotRemoval TypeCheck::CountedRemoval(BuiltinKind op, const vector<Node *> &args,
                                                         const Val &count, const Val &receiver, TypeExpr *array) {
@@ -17,7 +29,7 @@ inline TypeCheck::SlotRemoval TypeCheck::CountedRemoval(BuiltinKind op, const ve
     if (len && len->member == B_LEN && SamePath(args[0], len->obj, PathInterval::ConsecutiveReads)) {
         if (op == B_POP_N) return SlotRemoval::All;
         // A fill can change the receiver after its length was read.
-        if (args.size() == 2) return SlotRemoval::None;
+        if (args.size() == 2 || ReadOnlyResizeFill(args[2])) return SlotRemoval::None;
     }
     int64_t lo, hi;
     if (!IntConsts(count, lo, hi) || lo != 0 || hi != 0) return SlotRemoval::Possible;
