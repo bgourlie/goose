@@ -4265,18 +4265,19 @@ inline void TypeCheck::HeldViews(const Prov &p, TypeExpr *held, bool isvar,
 // source is, and what the callers did, which f takes the event for.
 template<typename F> void TypeCheck::EachHolderRoot(VarDef *holder, size_t from,
                                                     const RefPlace &selected, F f) {
-    set<tuple<VarDef *, VarDef *, string_view>> seen;
-    auto walk = [&](auto &&self, VarDef *h, size_t start, const RefPlace &read) -> void {
+    // A copied field can lead back to a selected path with an earlier
+    // event range than its direct read. Visit both ranges in that case.
+    set<tuple<VarDef *, size_t, VarDef *, string_view>> seen;
+    auto walk = [&](auto &&self, VarDef *h, size_t start, PlacePath read) -> void {
         auto path = read.Path();
-        if (!seen.emplace(h, read.Base(), path).second) return;
+        if (!seen.emplace(h, start, read.base, path).second) return;
         if (h->type && ClassOf(h->type) == SC_ROOT)
             for (auto c : h->components) if (c) self(self, c, start, read);
         for (auto i = start; i < storeevents.size(); i++) {
             auto e = storeevents[i];
             if (e.container != h || StoredLater(i)) continue;
             auto &field = e.storefield;
-            if (read.Base() && read.Base() == field.base &&
-                !FieldPathWithin(path, field.path) && !FieldPathWithin(field.path, path)) continue;
+            if (field.ApartFrom(read.base, path)) continue;
             if (e.ReadsOwnContents()) {
                 self(self, h, 0, {});
                 continue;
@@ -4284,11 +4285,10 @@ template<typename F> void TypeCheck::EachHolderRoot(VarDef *holder, size_t from,
             if (e.src && !e.src->isglobal && e.src->type) {
                 // Reading a copied struct field reads the same field of its
                 // source. An indirect source may have supplied any slot.
-                RefPlace source;
-                if (e.wholecopy && read.Base() && read.Base() == field.base &&
+                PlacePath source;
+                if (e.wholecopy && read.base && read.base == field.base &&
                     FieldPathWithin(path, field.path)) {
-                    auto suffix = ast.places.Path(string(path.substr(field.path.size())));
-                    source.fields = PlacePaths::Of({ e.src, suffix }, ast.places);
+                    source = { e.src, ast.places.Path(string(path.substr(field.path.size()))) };
                 }
                 self(self, e.src, 0, source);
                 continue;
@@ -4309,7 +4309,7 @@ template<typename F> void TypeCheck::EachHolderRoot(VarDef *holder, size_t from,
             if (e.root) f(e);
         }
     };
-    walk(walk, holder, from, selected);
+    selected.fields.Each([&](PlacePath p) { walk(walk, holder, from, p); });
 }
 
 // A shrink of ls.shrunk while what ls.live roots is still used, both as the
@@ -5111,10 +5111,7 @@ inline void TypeCheck::CheckDeferredReads(const DeferEffects &effects, const FnR
         storage.byteview = read.byteview;
         auto type = read.field ? read.field : read.holder;
         vector<LiveView> views;
-        auto apart = read.place.Base() && read.place.Base() == a.place.Base() &&
-                     !FieldPathWithin(read.place.Path(), a.place.Path()) &&
-                     !FieldPathWithin(a.place.Path(), read.place.Path());
-        if (!apart) views.push_back({ storage, type });
+        if (!read.place.fields.ApartFrom(a.place.fields)) views.push_back({ storage, type });
         // The inline slot may be disjoint even when its contents lead back
         // to the receiver. Consult the holder's stores on this exit.
         // A relative field can lead to another part of the holder. Its

@@ -2288,7 +2288,7 @@ inline void TypeCheck::ValidateCycle(FnSpec *spec, span<const Val> args, Node *c
             if (Depth(base) <= floor && (!IsClassRoot(base) || ActivationFloor(base) < floor)) return true;
             if (CurRealFrame().spec != spec || base->ownerspec != spec || !base->isparam ||
                 base->isvar || !IsAddressRef(base->type)) return false;
-            return ArgumentPlace(spec, base, args).fields.Single() == PlacePath { base };
+            return ArgumentPlace(spec, base, args).fields.Cover() == PlacePath { base };
         };
         for (auto &[v, binding] : spec->prev->reboundplaces) {
             if (v->isglobal) continue;

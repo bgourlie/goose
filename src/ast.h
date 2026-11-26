@@ -719,6 +719,10 @@ inline bool FieldPathWithin(string_view path, string_view enclosing) {
            (path.size() == enclosing.size() || path[enclosing.size()] == '.');
 }
 
+inline bool FieldPathsOverlap(string_view a, string_view b) {
+    return FieldPathWithin(a, b) || FieldPathWithin(b, a);
+}
+
 // Where a deferred write can land. A parameter stands for its argument's
 // storage until the call is mapped. For each owner, copied is true only if
 // every alternative for that owner lies in its frame object's fixed prefix.
@@ -775,7 +779,7 @@ struct LinkField {
         return base && base == owner && FieldPathWithin(path, enclosing);
     }
     bool ApartFrom(VarDef *owner, string_view other) const {
-        return base && base == owner && !FieldPathWithin(path, other) && !FieldPathWithin(other, path);
+        return base && base == owner && !FieldPathsOverlap(path, other);
     }
     auto operator<=>(const LinkField &) const = default;
 };
@@ -787,6 +791,12 @@ struct PlacePath {
     bool enclosing = false;
     string_view Path() const { return path ? string_view(*path) : string_view {}; }
     auto operator<=>(const PlacePath &) const = default;
+};
+
+struct SavedPlacePaths {
+    vector<PlacePath> paths;
+    PlacePath cover; // The common enclosing field, for checks that need one location.
+    operator span<const PlacePath>() const { return paths; }
 };
 
 struct PlacePathsLess {
@@ -802,16 +812,30 @@ struct PlacePool {
     WriteRegionPool regions;
     set<string> paths;
     set<LinkField> boundfields;
-    set<vector<PlacePath>, PlacePathsLess> pathsets;
-
-    const vector<PlacePath> *Paths(span<const PlacePath> paths) {
-        auto it = pathsets.lower_bound(paths);
-        if (it != pathsets.end() && !PlacePathsLess{}(paths, *it)) return &*it;
-        return &*pathsets.emplace_hint(it, paths.begin(), paths.end());
-    }
+    set<SavedPlacePaths, PlacePathsLess> pathsets;
 
     const string *Path(string path) {
         return path.empty() ? nullptr : &*paths.insert(std::move(path)).first;
+    }
+    PlacePath CommonField(PlacePath a, PlacePath b) {
+        if (a.base != b.base) return {};
+        a.enclosing |= b.enclosing || a.path != b.path;
+        if (a.path != b.path) {
+            auto prefix = a.Path();
+            while (!FieldPathWithin(b.Path(), prefix)) prefix = prefix.substr(0, prefix.rfind('.'));
+            a.path = prefix == b.Path() ? b.path : Path(string(prefix));
+        }
+        return a;
+    }
+    const SavedPlacePaths *Paths(span<const PlacePath> fields) {
+        auto it = pathsets.lower_bound(fields);
+        if (it != pathsets.end() && !PlacePathsLess{}(fields, *it)) return &*it;
+        auto cover = fields.front();
+        for (auto p : fields.subspan(1)) {
+            cover = CommonField(cover, p);
+            if (!cover.base) break;
+        }
+        return &*pathsets.emplace_hint(it, SavedPlacePaths { { fields.begin(), fields.end() }, cover });
     }
     const LinkField *Bound(VarDef *base, string path = {}) {
         return &*boundfields.insert(LinkField { base, std::move(path) }).first;
@@ -822,56 +846,76 @@ struct PlacePool {
     }
 };
 
-// Distinct formals can name the same caller field. Keep one enclosing path
-// per base until the call supplies its arguments. A missing base is unknown.
+// A binding can name different fields on different control-flow paths.
+// Keep all known alternatives through field selection and call substitution.
 struct PlacePaths {
     VarDef *whole = nullptr;                  // A single whole variable needs no allocation.
-    const vector<PlacePath> *saved = nullptr; // Otherwise intern the projected or alternative paths.
+    const SavedPlacePaths *saved = nullptr;   // Otherwise intern the projected or alternative paths.
 
     static PlacePaths Of(PlacePath p, PlacePool &pool) {
         if (!p.path && !p.enclosing) return { p.base };
         return { nullptr, pool.Paths({ &p, 1 }) };
     }
     bool Known() const { return whole || saved; }
-    bool Multiple() const { return saved && saved->size() > 1; }
-    PlacePath Single() const { return saved && saved->size() == 1 ? saved->front() : PlacePath { whole }; }
+    bool Multiple() const { return saved && saved->paths.size() > 1; }
+    PlacePath Cover() const { return saved ? saved->cover : PlacePath { whole }; }
     template<typename F> void Each(F f) const {
-        if (saved) for (auto p : *saved) f(p);
+        if (saved) for (auto p : saved->paths) f(p);
         else f(PlacePath { whole });
     }
+    template<typename F> bool Any(F f) const {
+        return saved ? any_of(saved->paths.begin(), saved->paths.end(), f) : whole && f(PlacePath { whole });
+    }
     template<typename F> bool AnyBase(F f) const {
-        if (!saved) return whole && f(whole);
-        return any_of(saved->begin(), saved->end(), [&](auto p) { return f(p.base); });
+        return Any([&](PlacePath p) { return f(p.base); });
+    }
+    bool ApartFrom(const PlacePaths &other) const {
+        auto a = Cover(), b = other.Cover();
+        if (!a.base || a.base != b.base) return false; // Distinct formal bases could alias.
+        if (!FieldPathsOverlap(a.Path(), b.Path())) return true;
+        return !Any([&](PlacePath p) {
+            return other.Any([&](PlacePath q) { return FieldPathsOverlap(p.Path(), q.Path()); });
+        });
     }
     bool operator==(const PlacePaths &) const = default;
+
+    static PlacePaths Alternatives(vector<PlacePath> paths, PlacePool &pool, bool backedge = false) {
+        sort(paths.begin(), paths.end(), [](PlacePath a, PlacePath b) {
+            return a.base == b.base ? a.Path() < b.Path() : std::less<VarDef *>{}(a.base, b.base);
+        });
+        size_t n = 0;
+        for (auto p : paths) {
+            if (n && paths[n - 1].base == p.base) {
+                auto &prev = paths[n - 1];
+                if (prev.path == p.path) { prev.enclosing |= p.enclosing; continue; }
+                // Descendants follow their enclosing field in path order.
+                if (prev.enclosing && FieldPathWithin(p.Path(), prev.Path())) continue;
+            }
+            paths[n++] = p;
+        }
+        paths.resize(n);
+        // Bound growth at a loop or recursive call. Retain an enclosing
+        // field per base when the exact alternatives no longer fit.
+        constexpr size_t maxbackedgepaths = 4;
+        if (backedge && n > maxbackedgepaths) {
+            n = 0;
+            for (auto p : paths) {
+                if (n && paths[n - 1].base == p.base) paths[n - 1] = pool.CommonField(paths[n - 1], p);
+                else paths[n++] = p;
+            }
+            if (n > maxbackedgepaths) return {};
+            paths.resize(n);
+        }
+        if (n == 1) return Of(paths.front(), pool);
+        return { nullptr, pool.Paths(paths) };
+    }
 
     PlacePaths Join(const PlacePaths &other, PlacePool &pool, bool backedge) const {
         if (*this == other) return *this;
         if (!Known() || !other.Known()) return {};
-        auto common = [&](PlacePath a, PlacePath b) {
-            a.enclosing |= b.enclosing || a.path != b.path;
-            if (a.path != b.path) {
-                auto prefix = a.Path();
-                while (!FieldPathWithin(b.Path(), prefix)) prefix = prefix.substr(0, prefix.rfind('.'));
-                a.path = prefix == b.Path() ? b.path : pool.Path(string(prefix));
-            }
-            return a;
-        };
-        auto left = Single(), right = other.Single();
-        if (left.base && left.base == right.base) return Of(common(left, right), pool);
-        auto paths = saved ? *saved : vector<PlacePath>{left};
-        other.Each([&](PlacePath p) {
-            auto it = lower_bound(paths.begin(), paths.end(), p, [](auto a, auto b) {
-                return std::less<VarDef *>{}(a.base, b.base);
-            });
-            if (it != paths.end() && it->base == p.base) *it = common(*it, p);
-            else paths.insert(it, p);
-        });
-        // Widen a growing set at a loop or recursive call. A finite branch
-        // join keeps all its bases for substitution, regardless of arm count.
-        constexpr size_t maxbackedgebases = 4;
-        if (backedge && paths.size() > maxbackedgebases) return {};
-        return { nullptr, pool.Paths(paths) };
+        auto paths = saved ? saved->paths : vector<PlacePath>{ { whole } };
+        other.Each([&](PlacePath p) { paths.push_back(p); });
+        return Alternatives(std::move(paths), pool, backedge);
     }
 
     PlacePaths Project(PlacePool &pool, string_view suffix, bool inside = false, string_view separator = {}) const {
@@ -882,10 +926,10 @@ struct PlacePaths {
             return p;
         };
         if (!Known() || (suffix.empty() && !inside)) return *this;
-        if (!Multiple()) return Of(project(Single()), pool);
-        auto paths = *saved;
+        if (!Multiple()) return Of(project(Cover()), pool);
+        auto paths = saved->paths;
         for (auto &p : paths) p = project(p);
-        return { nullptr, pool.Paths(paths) };
+        return Alternatives(std::move(paths), pool);
     }
 };
 
@@ -899,9 +943,9 @@ struct RefPlace {
     WriteRegions regions;
     const LinkField *bound = nullptr; // The same place or a containing field, relative to an immutable binding.
 
-    VarDef *Base() const { return fields.Single().base; }
-    string_view Path() const { return fields.Single().Path(); }
-    bool Enclosing() const { return fields.Single().enclosing; }
+    VarDef *Base() const { return fields.Cover().base; }
+    string_view Path() const { return fields.Cover().Path(); }
+    bool Enclosing() const { return fields.Cover().enclosing; }
 
     void ForgetBound() { bound = nullptr; boundenclosing = false; }
     RefPlace WithoutPath() const {
