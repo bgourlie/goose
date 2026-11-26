@@ -1779,13 +1779,13 @@ struct TypeCheck {
     // its check leaves them (FnSpec::envexits), which a call reusing it
     // leaves them as too.
     static EnvRead EnvReadOf(VarDef *vd);
-    static bool EnvIs(const VarDef *vd, const EnvRead &r);
+    static bool SameEnvFacts(const VarDef *vd, const EnvRead &r);
     void NoteEnvRead(VarDef *vd);
     void NoteCalleeEnvReads(FnSpec *callee);
     bool EnvUnchanged(const FnSpec *spec);
     void ShareCycleEnvReads(FnSpec *head);
     void RecordEnvExits(FnSpec *spec);
-    void ReplayEnvExits(FnSpec *spec);
+    void ReplayEnvExits(FnSpec *spec, span<const Val> args);
     // A body's caller finds the variables outside it assigned as all of the
     // body's exits agree, and maybe assigned where any may be (BodyExits):
     // its returns, the tail, a reachable end, and an exit of it that a
@@ -2692,6 +2692,7 @@ struct TypeCheck {
     }
     void CheckSpecBodyOnce(FnSpec *spec, vector<Val> *argvals, Line callline,
                            Call *call = nullptr);
+    void SettleCycle(FnSpec *spec, vector<Val> *argvals, Line callline, Call *call);
     bool SameRecord(const FnRecord &a, const FnRecord &b, const FnSpec *spec);
     bool ExternValueOk(TypeExpr *t, string &why);
     bool ExternParamOk(TypeExpr *t, string &why);
@@ -2707,7 +2708,7 @@ struct TypeCheck {
     Val RetAltVal(FnSpec *spec, const RootAlt &alt, vector<Val> &argvals, TypeExpr *t, Node *at);
     int HeldParam(FnSpec *spec, const Val &v);
     Val CallResult(Call *c, FnSpec *spec, vector<Val> &argvals);
-    RefPlace CallerPlace(RefPlace place, FnSpec *spec, const vector<Val> &args);
+    RefPlace CallerPlace(RefPlace place, FnSpec *spec, span<const Val> args);
     void ReturnThroughCalls(Val &v, int tf, Return *r);
     void CheckReturn(Return *r);
     FnSpec *EnsureThreadSpec(SFunction *sf, Line l);
@@ -2971,7 +2972,8 @@ struct TypeCheck {
     void HolderFromLit(Val &v, const LitDeep &deep);
     void AddStoreEvent(const StoreEvent &e);
     void NoteRefPlace(VarDef *vd, const Val &v);
-    RefPlace ArgumentPlace(FnSpec *spec, VarDef *param, const vector<Val> &args);
+    static RefPlace BindingPlace(const VarDef *vd, RefPlace place);
+    RefPlace ArgumentPlace(FnSpec *spec, VarDef *param, span<const Val> args);
     LinkField MapStoreField(FnSpec *spec, const vector<Val> &args, VarDef *owner,
                             const Roots &mapped, LinkField field, const LinkField **bound = nullptr);
     void RecordElementLinks(const Dest &dest, TypeExpr *type, const ValueLinks &links, Node *at);

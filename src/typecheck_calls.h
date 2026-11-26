@@ -539,9 +539,9 @@ inline Val TypeCheck::ResolveCall(Call *c, vector<SFunction *> &cands, FnSpec *e
     auto argsreach = reachable;
     RecheckArgs(c, cands, best, denv, argnodes, -1, {}, entry);
     BeginCallResults();
-    // Replay restored the caller's bindings. A completed callee now leaves
-    // its captures as its recorded exits did, just as at a reused call.
-    if (!spec->inprogress) ReplayEnvExits(spec);
+    // Argument checking restored the caller's bindings. Apply the callee's
+    // exits to the bindings at this call, just as at a reused call.
+    ReplayEnvExits(spec, argvals);
     NoteCallConstruction(spec->rets, spec);
     // An argument can overwrite the same storage that the callee links.
     // Apply the body effects after both passes over the arguments.
@@ -1905,8 +1905,8 @@ inline FnSpec *TypeCheck::GetOrCreateSpec(MatchInfo &mi, vector<Val> &argvals, N
         if (spec->stale) {
             spec->stale = false;
             CheckSpecBodyOnce(spec, &argvals, callnode->line, Is<Call>(callnode));
-        } else if (!spec->inprogress) {
-            ReplayEnvExits(spec);
+        } else {
+            ReplayEnvExits(spec, argvals);
         }
         NoteCalleeEnvReads(spec);
         return spec;
@@ -2007,19 +2007,20 @@ inline void TypeCheck::NoteCalleeEnvReads(FnSpec *callee) {
 // or not as it was, a slot a reference has been made to or not
 // (StoreIntoSlot), and for a `let`, which is assigned only where it cannot
 // be already (§4.4), maybe assigned or not as it was.
-inline bool TypeCheck::EnvIs(const VarDef *vd, const EnvRead &r) {
+inline bool TypeCheck::SameEnvFacts(const VarDef *vd, const EnvRead &r) {
     return vd->assigned == r.assigned &&
            (vd->isvar || vd->maybeassigned == r.maybeassigned) &&
            vd->refrootknown == r.refrootknown &&
            vd->ref == r.ref && vd->contents == r.contents &&
            vd->contentbyteview == r.contentbyteview && vd->slotref == r.slotref &&
-           vd->elementlinks == r.elementlinks && vd->refplace == r.refplace;
+           vd->elementlinks == r.elementlinks;
 }
 
 // Whether each variable the body read outside its activation is as it was
 // then, so its check stands for a call now.
 inline bool TypeCheck::EnvUnchanged(const FnSpec *spec) {
-    for (auto &r : spec->envreads) if (!EnvIs(r.var, r)) return false;
+    for (auto &r : spec->envreads)
+        if (r.var->refplace != r.refplace || !SameEnvFacts(r.var, r)) return false;
     return true;
 }
 
@@ -2029,7 +2030,11 @@ inline bool TypeCheck::EnvUnchanged(const FnSpec *spec) {
 // once it has settled (ShareCycleEnvReads) are left as they were found.
 inline void TypeCheck::RecordEnvExits(FnSpec *spec) {
     spec->envexits.clear();
-    for (auto &r : spec->envreads) spec->envexits.push_back(EnvReadOf(r.var));
+    for (auto &r : spec->envreads) {
+        spec->envexits.push_back(EnvReadOf(r.var));
+        auto it = spec->record.reboundplaces.find(r.var);
+        if (it != spec->record.reboundplaces.end()) it->second.exit = r.var->refplace;
+    }
 }
 
 // A call reusing a body finds the variables outside its activation as its
@@ -2038,16 +2043,24 @@ inline void TypeCheck::RecordEnvExits(FnSpec *spec) {
 // already are where their declaration was checked again since -- in a
 // loop's next pass, a cycle's next round -- or where the flow of another
 // branch dropped an assignment.
-inline void TypeCheck::ReplayEnvExits(FnSpec *spec) {
+inline void TypeCheck::ReplayEnvExits(FnSpec *spec, span<const Val> args) {
+    if (spec->inprogress) {
+        // A back edge can have different incoming captures. Only the
+        // bindings the preceding round may have changed are its outputs.
+        if (auto rec = RecordOf(spec))
+            for (auto &[v, binding] : rec->reboundplaces)
+                if (!v->isglobal) v->refplace = BindingPlace(v, CallerPlace(binding.exit, spec, args));
+        return;
+    }
     for (auto &x : spec->envexits) {
         auto v = x.var;
         // Whether it is assigned is flow, which a loop's passes compare at
         // its head (SameFlow), not a fact fed back. A `var` is not keyed by
-        // whether it may be assigned (EnvIs), and stays so where it was.
+        // whether it may be assigned, and stays so where it was.
         v->assigned = x.assigned;
         v->maybeassigned = v->maybeassigned || x.maybeassigned;
-        v->refplace = x.refplace;
-        if (EnvIs(v, x)) continue;
+        v->refplace = BindingPlace(v, CallerPlace(x.refplace, spec, args));
+        if (SameEnvFacts(v, x)) continue;
         v->refrootknown = x.refrootknown;
         v->ref = x.ref;
         v->contents = x.contents;
@@ -2150,7 +2163,7 @@ inline void TypeCheck::ReplayOuterExit(int tf, FnSpec *spec, const FnRecord::Out
         }
         if (auto it = x.assigned.find(v); it != x.assigned.end()) {
             v->assigned = true;
-            v->refplace = it->second;
+            v->refplace = BindingPlace(v, CallerPlace(it->second, spec, args));
         }
         v->maybeassigned |= x.maybeassigned.count(v) != 0;
     }
@@ -2189,9 +2202,9 @@ inline void TypeCheck::ApplyCalleeRebinds(FnSpec *spec) {
     auto rec = RecordOf(spec);
     if (!rec) return;
     auto caller = CurRealFrame().spec;
-    for (auto v : rec->reboundoptionals) {
-        v->narrowed = nullptr;
-        if (caller && v->ownerspec != caller) caller->record.reboundoptionals.insert(v);
+    for (auto &[v, place] : rec->reboundplaces) {
+        if (IsOptional(v->type)) v->narrowed = nullptr;
+        if (caller && v->ownerspec != caller) caller->record.reboundplaces.try_emplace(v);
     }
 }
 
@@ -2266,6 +2279,19 @@ inline void TypeCheck::ValidateCycle(FnSpec *spec, Node *callnode) {
                                     "cycle and needs fully explicit parameter types"));
     }
     JoinCycle(spec, callnode);
+    // The next activation sees the captures as this call found them. A
+    // formal of an activation being reentered can take a different argument.
+    if (spec->prev && reachable && !cur.probingtypes) {
+        auto floor = frames[fi].scopebase;
+        for (auto &[v, binding] : spec->prev->reboundplaces) {
+            if (v->isglobal) continue;
+            auto place = v->refplace.InScope([&](VarDef *base) {
+                return Depth(base) <= floor && (!IsClassRoot(base) || ActivationFloor(base) < floor);
+            });
+            auto &entry = spec->record.reboundplaces[v].reentry;
+            entry = entry ? entry->Common(place, ast.places) : place;
+        }
+    }
     // A cycle function without an explicit return type is committed to
     // returning nothing at the back edge; a later `return v` then errors
     // with a mismatch (return-type inference cannot cross the back edge).
@@ -3053,7 +3079,15 @@ inline void TypeCheck::CheckSpecBody(FnSpec *spec, vector<Val> *argvals, Line ca
         ~RoundScope() { tc.cyclerounds.pop_back(); }
     } roundscope(*this);
     CheckSpecBodyOnce(spec, argvals, callline, call);
-    while (spec->incycle && CycleHead(spec) == spec) {
+    if (spec->incycle && CycleHead(spec) == spec) SettleCycle(spec, argvals, callline, call);
+}
+
+inline void TypeCheck::SettleCycle(FnSpec *spec, vector<Val> *argvals, Line callline, Call *call) {
+    // Recheck the first invocation with its original inputs. The last
+    // round's outputs belong to the caller after the call.
+    vector<pair<VarDef *, RefPlace>> entry;
+    for (auto &r : spec->envreads) entry.emplace_back(r.var, r.refplace);
+    for (;;) {
         // Bound cycles that do not settle. Completion proofs accumulate, but
         // pruning a newly unreachable continuation can remove other effects.
         if (spec->rounds >= 8)
@@ -3071,6 +3105,7 @@ inline void TypeCheck::CheckSpecBody(FnSpec *spec, vector<Val> *argvals, Line ca
             m->stale = m != spec;
         }
         cyclerounds.back().changed = false;
+        for (auto &[v, place] : entry) v->refplace = place;
         CheckSpecBodyOnce(spec, argvals, callline, call);
         for (auto &[cls, tc] : threadedclasses) broken -= tc.broken;
         auto outer = cyclerounds.back().changed;
@@ -3083,7 +3118,7 @@ inline void TypeCheck::CheckSpecBody(FnSpec *spec, vector<Val> *argvals, Line ca
         for (auto m : members) m->prev = nullptr;
         if (settled) break;
     }
-    if (spec->incycle && CycleHead(spec) == spec) ShareCycleEnvReads(spec);
+    ShareCycleEnvReads(spec);
 }
 
 inline bool TypeCheck::SameRecord(const FnRecord &a, const FnRecord &b, const FnSpec *spec) {
@@ -3148,7 +3183,7 @@ inline bool TypeCheck::SameRecord(const FnRecord &a, const FnRecord &b, const Fn
     };
     if (!samegrows(a.growexternals, b.growexternals) || !samegrows(a.growparams, b.growparams))
         return why("growths");
-    if (a.reboundoptionals != b.reboundoptionals) return why("rebinds");
+    if (a.reboundplaces != b.reboundplaces) return why("rebinds");
     auto samebounds = [&](const auto &x, const auto &y) {
         if (x.size() != y.size()) return false;
         for (size_t i = 0; i < x.size(); i++)
@@ -3253,6 +3288,15 @@ inline void TypeCheck::CheckSpecBodyOnce(FnSpec *spec, vector<Val> *argvals, Lin
     // and the call site replays this body's shrinks and growths against
     // the caller's statement and constructions from the summary.
     BodyScope bodyscope(*this);
+    // Recursive activations can enter with different bindings for captures
+    // the cycle rebinds. Keep the actual entry for cache matching, and infer
+    // the exit from the assignments that hold even on the recursive entry.
+    if (spec->prev) for (auto v : exits.vars) {
+        auto it = spec->prev->reboundplaces.find(v);
+        if (it == spec->prev->reboundplaces.end() || !it->second.reentry) continue;
+        NoteEnvRead(v);
+        v->refplace = v->refplace.Common(*it->second.reentry, ast.places);
+    }
     // main starts with the relative links left by global initialization.
     // Ordinary callees check incoming global links when their shrink
     // summary is applied, including later calls to the same specialization.
@@ -3645,6 +3689,9 @@ inline void TypeCheck::CheckSpecBodyOnce(FnSpec *spec, vector<Val> *argvals, Lin
                            [&](const EnvRead &r) { return r.var == entry.first; });
         });
     spec->inprogress = false;
+    // The summary stays in parameter coordinates. This caller receives the
+    // same effects as a later call that reuses the checked body.
+    ReplayEnvExits(spec, argvals ? span<const Val>(*argvals) : span<const Val>());
     spec->record.eventend = storeevents.size();
     spec->record.bodyevents.clear();
     for (auto i = spec->record.eventstart; i < storeevents.size(); i++) {
@@ -3757,14 +3804,7 @@ inline void TypeCheck::FinishReturn(int tf, const vector<Val> &vals, Node *at) {
                            r.refplace.location.param == v || r.refplace.regions.Find(v);
                 });
             };
-            if (!stable(place.location.param)) place.location.param = nullptr;
-            for (auto r : place.regions.All()) if (!stable(r.owner)) {
-                place.regions = {};
-                break;
-            }
-            if (!stable(place.base)) place = place.WithoutPath();
-            if (place.bound && !stable(place.bound->base)) place.ForgetBound();
-            rr.place = place;
+            rr.place = place.InScope(stable);
         }
         rr.heldparam = holder ? HeldParam(tspec, vals[i]) : -1;
         rr.alts = std::move(roots);
@@ -3825,7 +3865,7 @@ inline Val TypeCheck::RetAltVal(FnSpec *spec, const RootAlt &alt, vector<Val> &a
 
 // Roots can identify an owner shared by several arguments. A result's
 // field path is relative to the particular parameter the body returned.
-inline RefPlace TypeCheck::CallerPlace(RefPlace place, FnSpec *spec, const vector<Val> &args) {
+inline RefPlace TypeCheck::CallerPlace(RefPlace place, FnSpec *spec, span<const Val> args) {
     // Map each formal separately, even when two formals share a lifetime
     // class. Then join alternatives that land in the same caller-side owner.
     WriteRegions mapped;

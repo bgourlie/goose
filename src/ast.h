@@ -830,6 +830,20 @@ struct RefPlace {
         return part;
     }
 
+    // Keep only the names still meaningful in the frame or scope receiving
+    // this place. Region alternatives prove a fact only as a complete set.
+    template<typename F> RefPlace InScope(F keep) const {
+        auto part = *this;
+        if (location.param && !keep(location.param)) part.location.param = nullptr;
+        for (auto r : regions.All()) if (!keep(r.owner)) {
+            part.regions = {};
+            break;
+        }
+        if (base && !keep(base)) part = part.WithoutPath();
+        if (part.bound && !keep(part.bound->base)) part.ForgetBound();
+        return part;
+    }
+
     RefPlace Common(const RefPlace &other, PlacePool &pool) const {
         if (nullonly) return other;
         if (other.nullonly) return *this;
@@ -2744,8 +2758,15 @@ struct FnRecord {
     // normally to propagate that exit. Unknown recursive calls may return.
     bool mayreturn = true;
     vector<RetRoot> retroots;      // Per ret: the checked returns' roots and the prediction.
-    // External optional bindings this body (or a callee) may rebind.
-    set<VarDef *> reboundoptionals;
+    // Captures this body or a callee may rebind. Normal exits give their
+    // common places in this body's coordinates, also read at recursive calls.
+    // A global optional records only that a call can invalidate its narrowing.
+    struct CaptureBinding {
+        RefPlace exit;
+        std::optional<RefPlace> reentry; // Places observed at calls back into this activation.
+        bool operator==(const CaptureBinding &) const = default;
+    };
+    map<VarDef *, CaptureBinding> reboundplaces;
     // Arrays the body may shrink, itself or through its callees (§5.1,
     // §5.2): global/captured roots, and indices of parameters whose pointee
     // shrinks, each with how every shrink of it leaves it.

@@ -3445,9 +3445,6 @@ inline void TypeCheck::CheckRebind(Assign *a, LVal &lv) {
         // Rebinding an optional settles its nullness — narrowed only when
         // the new value is provably non-null (a plain reference).
         if (target->ref->optional) {
-            auto spec = CurRealFrame().spec;
-            if (spec && lv.var->ownerspec != spec)
-                spec->record.reboundoptionals.insert(lv.var);
             if (!v.isnull && wasplain) {
                 SetNarrowed(lv.var, NarrowedRef(target, a->line));
             } else {
@@ -3506,7 +3503,7 @@ inline void TypeCheck::PointeeAssign(Assign *a, LVal &lv, const LVal &at) {
 // each such one a reference has been made to (VarDef::slotref) is re-bound
 // here, but for what was loaded through the class, which the slot held
 // already. A body naming one is checked again for a call after a reference
-// to it is made (EnvIs). A global's binding matters only to the judgement of
+// to it is made (EnvUnchanged). A global's binding matters only to the judgement of
 // the globals, which the calls' re-bindings reach. Returns whether a binding
 // changed.
 inline bool TypeCheck::StoreIntoSlot(Node *at, VarDef *r, bool bound, TypeExpr *slice,

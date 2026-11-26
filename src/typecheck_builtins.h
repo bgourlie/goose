@@ -2354,6 +2354,9 @@ inline void TypeCheck::AddStoreEvent(const StoreEvent &e) {
 inline void TypeCheck::NoteRefPlace(VarDef *vd, const Val &v) {
     // A mutable reference's current binding is flow state. Its lifetime
     // commitment still includes every binding at the committed depth.
+    auto spec = CurRealFrame().spec;
+    if (spec && vd->ownerspec != spec && (!vd->isglobal || IsOptional(vd->type)))
+        spec->record.reboundplaces.try_emplace(vd);
     if (vd->isvar && vd->isglobal) return;
     RefPlace place;
     if (vd->type->kind == TY_SLICE && !vd->isglobal) place = v.sliceplace;
@@ -2370,22 +2373,22 @@ inline void TypeCheck::NoteRefPlace(VarDef *vd, const Val &v) {
             }
         }
     } else return;
-    // A captured binding can be initialized in a shorter-lived scope. Keep
-    // facts expressed in bindings that will still exist wherever it is read.
-    if (place.location.param && Depth(place.location.param) > Depth(vd)) place.location.param = nullptr;
-    for (auto r : place.regions.All()) if (vd->isglobal || Depth(r.owner) > Depth(vd)) {
-        place.regions = {};
-        break;
-    }
-    if (place.base && (vd->isglobal || Depth(place.base) > Depth(vd)))
-        place = place.WithoutPath();
-    if (place.bound && (vd->isglobal || Depth(place.bound->base) > Depth(vd))) place.ForgetBound();
-    vd->refplace = place;
+    vd->refplace = BindingPlace(vd, place);
+}
+
+// An immutable reference or slice parameter names its argument throughout
+// the call. CallerPlace substitutes that argument before the capture leaves
+// the activation. Other shorter-lived bindings cannot name the capture's place.
+inline RefPlace TypeCheck::BindingPlace(const VarDef *vd, RefPlace place) {
+    return place.InScope([&](const VarDef *base) {
+        return !vd->isglobal && (Depth(base) <= Depth(vd) ||
+               (base->isparam && !base->isvar && (IsAddressRef(base->type) || base->type->kind == TY_SLICE)));
+    });
 }
 
 // Map a parameter's pointee (or viewed elements) to the storage passed at
 // this particular call. An implicit whole-array view covers its elements.
-inline RefPlace TypeCheck::ArgumentPlace(FnSpec *spec, VarDef *param, const vector<Val> &args) {
+inline RefPlace TypeCheck::ArgumentPlace(FnSpec *spec, VarDef *param, span<const Val> args) {
     auto it = find(spec->params.begin(), spec->params.end(), param);
     auto index = (size_t)(it - spec->params.begin());
     if (it == spec->params.end() || index >= args.size()) return {};
