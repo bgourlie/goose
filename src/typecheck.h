@@ -2108,10 +2108,11 @@ struct TypeCheck {
         return src;
     }
     bool ShrinkMayFree(VarDef *root, TypeExpr *bound, bool growonly, TypeExpr *of,
-                       bool byteview);
+                       bool byteview, TypeExpr *receiver = nullptr, const RefPlace *place = nullptr);
     bool ShrinkMayMove(VarDef *root, TypeExpr *bound, TypeExpr *t);
     void CheckHeldShrinks(Node *at, const string &op, VarDef *root,
-                          const string &what, bool growonly, TypeExpr *bound = nullptr);
+                          const string &what, bool growonly, TypeExpr *bound = nullptr,
+                          TypeExpr *receiver = nullptr);
 
     // ------------------------------------------------------------------
     // Values: the per-node dispatch plus the implicit-conversion rules.

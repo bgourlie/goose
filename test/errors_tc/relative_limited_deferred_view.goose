@@ -7,6 +7,6 @@ fn main() {
     x.slots[0].link .= x.values[0];
     let saved .= x.slots[0];
     defer { print(saved.link); }
-    x.slots = [];
+    x.slots.clear();
     x.values.clear();
 }

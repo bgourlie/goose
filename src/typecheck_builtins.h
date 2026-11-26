@@ -489,7 +489,8 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
                                    "the elements, which constructs each in place"));
         }
         int64_t lo, hi;
-        if (ak == A_GROW && reachable && IntConsts(length, lo, hi) && lo == 0 && hi == 0) {
+        if ((ak == A_GROW || ak == A_LIMITED) && reachable &&
+            IntConsts(length, lo, hi) && lo == 0 && hi == 0) {
             empties = !length.constfrom;
             // The fill has run. A local whose previous links are all dead
             // needs no promise about the value of the named initializer.
@@ -691,6 +692,12 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
     }
     // Ordinary builtin stores follow evaluation of all their operands.
     if (d.flags & BF_WRITE) NoteStorageWrite(rv, recvarr, rv.refplace, reachable || writesduringargs);
+    // Emptying a limited array unpublishes its whole live prefix, just as
+    // assigning [] does. Existing slot views keep their storage (§5.3).
+    if (empties && ak == A_LIMITED) {
+        if (HasRelRefT(elem)) NoteOverwrite(args[0], rv, storeevents.size(), recvarr, &rv.refplace);
+        if (HoldsPlainRef(elem)) NoteOverwrite(args[0], rv, storeevents.size(), recvarr, nullptr);
+    }
     // A grow-only array shrinks only where nothing can still be rooted in
     // it (§5.1); pop, pop_n and resize also need an element the shrink can
     // find, which a sequential array has not got.
@@ -1457,7 +1464,15 @@ inline ValueLinks TypeCheck::LiveElementLinks(VarDef *owner, TypeExpr *target, T
 // at root frees: the resizable part of root's storage, or for a bound, an
 // array of that type.
 inline bool TypeCheck::ShrinkMayFree(VarDef *root, TypeExpr *bound, bool growonly,
-                                     TypeExpr *of, bool byteview) {
+                                     TypeExpr *of, bool byteview, TypeExpr *receiver, const RefPlace *place) {
+    // Shrinking an array releases elements of its tail. An inline field of
+    // the same owner outside that tail retains its own storage.
+    if (receiver && receiver->kind == TY_ARRAY && place && place->base == root &&
+        !place->path.empty() && !place->location.intail) {
+        auto field = FieldPathType(root, place->path);
+        if (field && of && !IsRefOrSlice(field) && ClassOf(field) != SC_RESIZABLE && CanContain(field, of))
+            return false;
+    }
     if (byteview) return bound ? Viewable(bound) : MayBeViewed(root);
     if (bound) return !of || (growonly ? CanContain(bound, of) : GrowShrinkContains(bound, of));
     if (growonly) {
@@ -1481,7 +1496,7 @@ inline bool TypeCheck::ShrinkMayMove(VarDef *root, TypeExpr *bound, TypeExpr *t)
 // just like named references: the values the statement evaluated before the
 // shrink and uses after it (HeldOperands).
 inline void TypeCheck::CheckHeldShrinks(Node *at, const string &op, VarDef *root,
-                                        const string &what, bool growonly, TypeExpr *bound) {
+                                        const string &what, bool growonly, TypeExpr *bound, TypeExpr *receiver) {
     HeldOperands([&](const Held &h) {
         auto &[node, v, location, render, elems, loop, reread, inplace] = h;
         // A variable of the loop's body is made after its sequence and gone
@@ -1494,7 +1509,8 @@ inline void TypeCheck::CheckHeldShrinks(Node *at, const string &op, VarDef *root
                     ClassOf(v.type->ref->sub) == SC_RESIZABLE;
         auto mayfree = inplace
                            ? ShrinkMayMove(root, bound, v.type->ref->sub)
-                           : ShrinkMayFree(root, bound, growonly, PointeeOf(v.type), v.byteview);
+                           : ShrinkMayFree(root, bound, growonly, PointeeOf(v.type), v.byteview, receiver,
+                                           v.type->kind == TY_SLICE ? &v.sliceplace : &v.refplace);
         auto held = !path && mayfree &&
                     v.Any([&](const RootAlt &a) {
                         // A slot read never points into a grow-shrink array
@@ -1695,10 +1711,22 @@ inline bool TypeCheck::MayViewLimitedSlot(const Kill &part, TypeExpr *array, Nod
     auto owner = part.container;
     if (!owner || owner->isglobal || !owner->type || owner->ownerspec != CurRealFrame().spec)
         return true;  // The caller may hold such a view.
+    // A view of a flat field cannot expose links in its siblings. A byte
+    // view of the element image can still observe the stored representation.
+    auto exposes = [&](TypeExpr *pointee) {
+        return (IsU8(pointee) && Viewable(array)) ||
+               (LinkMayReachElements(array, pointee) &&
+                (HasRelRefT(pointee) || HoldsPlainRef(pointee)));
+    };
+    auto holderview = [&](TypeExpr *type) {
+        vector<TypeExpr *> reached;
+        ReachedThroughRefs(type, reached);
+        return any_of(reached.begin(), reached.end(), exposes);
+    };
     // Old links inside this array cannot make their own removed slots
     // reachable. Newly constructed links and links in siblings can.
     for (auto &[slot, write] : cur.links.live) {
-        if (slot.owner != owner || !LinkMayReachElements(array, slot.link.pointee)) continue;
+        if (slot.owner != owner || !exposes(slot.link.pointee)) continue;
         if (slot.field.Within(part.base, part.path) &&
             (write.at < part.at || write.suffix == part.path)) continue;
         return true;
@@ -1709,14 +1737,14 @@ inline bool TypeCheck::MayViewLimitedSlot(const Kill &part, TypeExpr *array, Nod
         });
     };
     auto direct = [&](const Roots &roots, const RefPlace &place, TypeExpr *pointee) {
-        if (place.nullonly || !LinkMayReachElements(array, pointee)) return false;
+        if (place.nullonly || !exposes(pointee)) return false;
         if (place.base && place.base == part.base && !FieldPathWithin(place.path, part.path) &&
             !FieldPathWithin(part.path, place.path)) return false;
         return aliases(OwnersAtPlace(roots, place));
     };
     auto through = [&](VarDef *v, const Prov &p, TypeExpr *t) {
         auto sub = PointeeOf(t);
-        return HoldsPlainRef(sub) && HeldRefsMayPointInto(v, p, t, owner, array, true);
+        return HoldsPlainRef(sub) && holderview(sub) && HeldRefsMayPointInto(v, p, t, owner, array, true);
     };
     auto stillused = [&](VarDef *v) {
         if (!shrink || UsedAfter(v)) return true;
@@ -1737,7 +1765,7 @@ inline bool TypeCheck::MayViewLimitedSlot(const Kill &part, TypeExpr *array, Nod
             auto place = t->kind == TY_REF ? v->PointeePlace() : v->SlicePlace();
             auto binding = RefProvOf(v);
             viewed = direct(binding, place, PointeeOf(t)) || through(v, binding, t);
-        } else if (CanHoldViewInto(t, array)) {
+        } else if (holderview(t)) {
             Line where;
             viewed = HolderMayPointInto(v, owner, array, LiveEventBase(v), &where);
         }
@@ -1752,7 +1780,7 @@ inline bool TypeCheck::MayViewLimitedSlot(const Kill &part, TypeExpr *array, Nod
         } else {
             viewed = (h.location && direct(h.v, h.v.refplace, t)) ||
                      (h.elems && t->kind == TY_ARRAY && direct(h.v, h.v.refplace, t->arr->sub)) ||
-                     CanHoldViewInto(t, array);
+                     holderview(t);
         }
     });
     return viewed;
@@ -1760,6 +1788,13 @@ inline bool TypeCheck::MayViewLimitedSlot(const Kill &part, TypeExpr *array, Nod
 
 inline bool TypeCheck::MayKeepLimitedSlots(TypeExpr *t, const Kill &part, Node *value) {
     if (!t || !(part.relative ? HasRelRefT(t) : HoldsPlainRef(t))) return false;
+    // Every completing arm delivers into the same destination. A block
+    // without a tail cannot supply a value (§6.4).
+    auto keeps = [&](Node *v) { return MayKeepLimitedSlots(t, part, v); };
+    if (auto b = Is<Block>(value)) return b->tail && keeps(b->tail);
+    if (auto b = Is<IfExpr>(value)) return keeps(b->thenb) || keeps(b->elseb);
+    if (auto m = Is<MatchExpr>(value))
+        return any_of(m->arms.begin(), m->arms.end(), [&](const MatchArm &arm) { return keeps(arm.body); });
     if (t->kind == TY_ARRAY) {
         if (ClassOf(t) == SC_RESIZABLE) return false;  // The old element storage is released.
         auto lit = Is<ArrayLit>(value);
@@ -2010,7 +2045,7 @@ inline void TypeCheck::GrowOnlyShrinkAt(Node *c, const string &op, VarDef *vd,
     auto arrtype = ShrunkType(vd, bound);
     CheckLinkShrink({ c, cat("cannot ", op, " ", what), vd, bound, arr ? arr : arrtype,
                       effect, viaclass });
-    CheckHeldShrinks(c, op, vd, what, true, bound);
+    CheckHeldShrinks(c, op, vd, what, true, bound, arr);
     ShrinkScanVars([&](VarDef *v) {
         // The array's own holder is scanned as any other where the fields
         // before its tail may hold references, which may point into the tail.
@@ -2028,7 +2063,9 @@ inline void TypeCheck::GrowOnlyShrinkAt(Node *c, const string &op, VarDef *vd,
             // A bytes_of view is over the element region itself, so it
             // survives this filter however unrelated its pointee looks.
             auto path = t->kind == TY_REF && ClassOf(t->ref->sub) == SC_RESIZABLE;
-            auto into = !path && ShrinkMayFree(vd, bound, true, PointeeOf(t), v->ref.byteview) &&
+            auto place = t->kind == TY_REF ? v->PointeePlace() : v->SlicePlace();
+            auto into = !path && ShrinkMayFree(vd, bound, true, PointeeOf(t), v->ref.byteview,
+                                               arr, v->isvar ? nullptr : &place) &&
                         RefMayPointInto(v, vd, true, bound);
             // A reference to a slice or to a value holding references, the
             // path to an array included, also reaches what those point at,

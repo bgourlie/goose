@@ -135,6 +135,42 @@ fn released_slot_view() {
     x.values.clear();
 }
 
+fn empty_limited_slots() {
+    var x = Saved { values: [42] };
+    x.slots[0].link .= x.values[0];
+    x.slots.clear();
+    x.values.clear();
+    x.values.push(43);
+    x.slots.push(Entry {});
+    x.slots[0].link .= x.values[0];
+    x.slots.resize(0);
+    x.values.clear();
+}
+
+fn flat_slot_view() {
+    var x = Saved { values: [42] };
+    x.slots[0].link .= x.values[0];
+    let flag .= x.slots[0].flag;
+    x.slots = [];
+    x.values.clear();
+    assert(!flag);
+}
+
+fn replace_in_branches(choice: i64) {
+    var x = Saved { values: [42] };
+    x.slots[1].link .= x.values[0];
+    x.first .= x.slots[1];
+    x = if choice == 0 { Saved { values: [43] } } else { Saved { values: [44] } };
+    assert(x.slots[1].link == null);
+    x.first .= x.slots[1];
+    x.slots[1].link .= x.values[0];
+    x = match choice {
+        0 => Saved { values: [45] },
+        _ => Saved { values: [46] }
+    };
+    assert(x.slots[1].link == null);
+}
+
 fn main() {
     nested_arrays();
     indexed_field(1);
@@ -145,5 +181,9 @@ fn main() {
     sibling_field_view();
     replace_all_slots();
     released_slot_view();
+    empty_limited_slots();
+    flat_slot_view();
+    replace_in_branches(0);
+    replace_in_branches(1);
     print("ok");
 }
