@@ -113,20 +113,23 @@ inline TypeCheck::LVal TypeCheck::CheckLValue(Node *n) {
 // which ends with the comparison, so it may view any temporary.
 inline TypeCheck::LVal TypeCheck::LValueBase(Node *n, bool cmpview) {
     DestScope ds(*this, Dest {});
-    if (Is<Ident>(n) || Is<Dot>(n) || Is<Index>(n)) return CheckLValue(n);
+    if (!cmpview && (Is<Ident>(n) || Is<Dot>(n) || Is<Index>(n))) return CheckLValue(n);
     auto v = CheckV(n, nullptr);
-    NoUntypedEmptyArray(v, n, "an index, slice or field of it");
     if (!cmpview) NoTemporaryLiteral(n, v.type);
+    return ValueBase(n, v);
+}
+
+inline TypeCheck::LVal TypeCheck::ValueBase(Node *n, const Val &v) {
+    NoUntypedEmptyArray(v, n, "an index, slice or field of it");
     n->exprtype = v.type;
     LVal lv;
     lv.type = v.type;
     lv.SetProv(v);
-    if (v.type->kind == TY_REF) lv.place = v.refplace;
-    if (v.type->kind == TY_SLICE) lv.place = v.sliceplace;
+    lv.place = v.type->kind == TY_SLICE ? v.sliceplace : v.refplace;
     // A value result is materialized in its own temporary storage. References
     // and slices instead retain the (possibly inexact) owner they borrow.
     lv.intemp = TempContents(v, lv.contents);
-    if (lv.intemp) lv.Set(v.Root(), true);
+    if (lv.intemp && !v.lvalue && !v.pointee) lv.Set(v.Root(), true);
     return lv;
 }
 
@@ -186,6 +189,9 @@ inline void TypeCheck::DerefLValue(LVal &lv, Node *at) {
 // identifier at `at` names it.
 inline void TypeCheck::RequireAssigned(VarDef *vd, Node *at, string_view use) {
     if (vd->assigned) return;
+    // An uninitialized local has a declared type. A probe can use it to
+    // choose an overload; the selected evaluation checks each actual read.
+    if (cur.probingtypes && !vd->isglobal && vd->type) return;
     // Its initializer's check failed and reported why: a use is no error
     // of its own.
     if (failedglobals.count(vd)) throw Abandoned {};
@@ -1004,10 +1010,14 @@ inline Val TypeCheck::CheckInferredResult(Node *&n, FnSpec *tspec) {
 
 // The whole of array-valued n as a slice: `n[..]`, synthesized for an
 // equality between array kinds (§4.5).
-inline Node *TypeCheck::WholeSlice(Node *n) {
+inline Val TypeCheck::WholeSlice(Node *&n, const Val &array) {
     auto se = ast.New<SliceExpr>(n->line, n);
     se->cmpview = true;
-    return se;
+    auto v = CheckSlice(se, ValueBase(n, array));
+    se->exprtype = v.type;
+    RecordVal(se, v);
+    n = se;
+    return v;
 }
 
 // A value meeting a destination of type `expected` (null or void: none).
@@ -1087,7 +1097,11 @@ inline Val TypeCheck::CheckValueAt(Node *&n, TypeExpr *expected, Dest d, bool ca
 // An operand of an operator: always the pointee.
 inline Val TypeCheck::Operand(Node *n) {
     DestScope ds(*this, Dest {});
-    auto v = DecayRef(CheckV(n, nullptr));
+    return LoadOperand(n, CheckV(n, nullptr));
+}
+
+inline Val TypeCheck::LoadOperand(Node *n, const Val &raw) {
+    auto v = DecayRef(raw);
     n->exprtype = v.type;
     // An operator computes with the number an index type holds (§3.11), so
     // nothing it computes is one. The operand keeps its type for the
@@ -1956,34 +1970,39 @@ inline Val TypeCheck::CheckLogical(Binary *b) {
 }
 
 // Heterogeneous array comparisons borrow each array as a slice (§4.5).
-// Determine which operands need a view before checking them in order: the
-// left view is then live during the right operand, and neither runs twice.
+// Only a left array needs the right type in advance: when the types differ
+// its view must already be live while the right operand is evaluated.
 inline Val TypeCheck::CheckEquality(Binary *b) {
     auto element = [](TypeExpr *t) -> TypeExpr * {
         return t->kind == TY_ARRAY ? t->arr->sub : t->kind == TY_SLICE ? t->sub : nullptr;
     };
-    if (!cur.probingtypes) {
+    DestScope ds(*this, Dest {});
+    auto left = CheckV(b->left, nullptr);
+    auto lv = LoadOperand(b->left, left);
+    auto lt = LoadType(lv.type);
+    if (!cur.probingtypes && lt->kind == TY_ARRAY) {
         auto entry = SaveFlow();
-        OperandTypeProbe probe(*this, entry);
-        auto lt = LoadType(Operand(b->left).type);
-        if (auto elem = element(lt)) {
-            auto rt = LoadType(Operand(b->right).type);
-            auto other = element(rt);
-            if (other && !TypeEq(lt, rt) && TypeEq(elem, other)) {
-                if (lt->kind != TY_SLICE) b->left = WholeSlice(b->left);
-                if (rt->kind != TY_SLICE) b->right = WholeSlice(b->right);
-            }
+        TypeExpr *rt;
+        {
+            OperandTypeProbe probe(*this, entry);
+            rt = LoadType(Operand(b->right).type);
         }
+        auto re = element(rt);
+        if (re && !TypeEq(lt, rt) && TypeEq(lt->arr->sub, re))
+            lv = WholeSlice(b->left, left);
     }
-    auto lv = Operand(b->left);
-    auto rv = Operand(b->right);
-    if (cur.probingtypes) {
-        auto le = element(LoadType(lv.type)), re = element(LoadType(rv.type));
-        if (le && re && TypeEq(le, re)) {
+    auto right = CheckV(b->right, nullptr);
+    auto rv = LoadOperand(b->right, right);
+    auto rt = LoadType(rv.type);
+    auto le = element(lv.type), re = element(rt);
+    if (le && re && TypeEq(le, re)) {
+        if (cur.probingtypes) {
             Val v;
             v.type = ast.booltype;
             return v;
         }
+        if (lv.type->kind == TY_SLICE && rt->kind == TY_ARRAY)
+            rv = WholeSlice(b->right, right);
     }
     return CheckBinaryResult(b, lv, rv);
 }

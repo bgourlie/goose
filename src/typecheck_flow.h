@@ -3092,17 +3092,13 @@ inline void TypeCheck::AssignableClassCheck(TypeExpr *t, Node *at) {
 // being built (rebuilding, ExposedLater).
 inline Val TypeCheck::CheckAssignedValue(Assign *a, TypeExpr *target, TypeExpr *arr,
                                          const LVal &built, Dest dest) {
-    // A resizable assignment clears before evaluating its RHS. Fixed
-    // aggregates can also receive an in-place initializer or call result.
+    // A resizable assignment clears before evaluating its RHS. A fixed
+    // result starts writing early only if it needs its destination's address.
     // A runtime-capacity limited array copies the completed source (§4.4).
-    Construction construction {};
+    Construction construction { true };
     if (hasdefers && IsAggregate(target)) {
-        auto cls = ClassOf(target);
-        if (cls == SC_RESIZABLE) NoteStorageWrite(built, target, built.place);
-        if (cls == SC_FIXED) {
-            construction.literal = BuiltInPlace(target);
-            dest.construction = &construction;
-        }
+        if (ClassOf(target) == SC_RESIZABLE) NoteStorageWrite(built, target, built.place);
+        else if (FixedPlacedResult(target)) dest.construction = &construction;
     }
     if (arr) {
         {

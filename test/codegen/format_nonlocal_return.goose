@@ -39,11 +39,14 @@ fn format(out: u8[>..]&, s: MaybeStop) {
 // An overload of the shortened call. Rechecking the named builtin must
 // still resolve it using all four original arguments.
 fn format(out: u8[>..]&, n: i64, s: Stop) { abort("wrong overload"); }
+fn format(out: u8[>..]&, s: Stop, other: MaybeStop) { abort("wrong overload"); }
 fn number(n: i64) -> i64 { n }
 fn stop_index() -> i64 { print(Stop {}); return 0; }
 
 fn choose(mode: i64, flag: bool) -> i64 {
     var out: u8[>..] = [];
+    var later: i64;
+    fn read_later() -> i64 { later }
     if mode == 0 { print(Stop {}, if flag { 1 } else { 2 }); }
     if mode == 1 {
         let text = Stop {}.str(if flag { 1 } else { 2 });
@@ -61,12 +64,28 @@ fn choose(mode: i64, flag: bool) -> i64 {
         var buffers: u8[..8][1] = [""];
         buffers[stop_index()].format(if flag { 1 } else { 2 });
     }
+    // The third argument's type rules out the overload. The builtin exits
+    // while rendering Stop, so it never needs the argument's value.
+    if mode == 6 {
+        if flag { out.format(Stop {}, later); } else { format(out, Stop {}, later); }
+    }
+    // No overload takes four arguments. The last call is never reached.
+    if mode == 7 { format(out, 1, Stop {}, read_later()); }
     let text = str(MaybeStop { stop: flag }, if flag { 1 } else { 2 });
     assert(text == "x2");
     return 42;
 }
 
+fn check_format_overload() {
+    fn format<F>(n: i64 = 40) -> i64 { F(n) }
+    fn add_two(n: i64) -> i64 { n + 2 }
+    assert(format(add_two) == 42);
+    assert(format(40, add_two) == 42);
+    assert(format(40) { n => n + 2 } == 42);
+}
+
 fn main() {
+    check_format_overload();
     assert(render(true) == 5 && order == 13);
     order = 0;
     assert(render(false) == 7 && order == 123);
@@ -74,5 +93,6 @@ fn main() {
     for mode in 5 { assert(choose(mode, false) == 7); }
     assert(choose(3, true) == 8);
     assert(choose(5, true) == 7 && choose(5, false) == 42);
+    assert(choose(6, true) == 7 && choose(6, false) == 7 && choose(7, false) == 7);
     print("ok");
 }

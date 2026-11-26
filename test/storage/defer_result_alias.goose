@@ -194,6 +194,14 @@ fn stopped_aggregate(flag: bool) -> Small[] {
     let first .= result[0];
     defer { if flag { first = make(stop()); } }
     defer { if flag { first = stopped_small(); } }
+    defer {
+        if flag {
+            first = block {
+                defer { abort("stop"); }
+                Small { value: 7 }
+            };
+        }
+    }
     return result;
 }
 

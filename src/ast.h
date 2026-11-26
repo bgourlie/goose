@@ -1717,6 +1717,12 @@ struct SFunction {
     bool brokensig = false;
     vector<FnSpec *> specs;     // Specializations (typecheck), owned by Ast.
 
+    size_t RequiredParams() const {
+        size_t n = 0;
+        while (n < params.size() && !params[n].defaultval) n++;
+        return n;
+    }
+
     // Checked once per distinct argument types (§7.7): a function with type
     // parameters or an untyped parameter.
     bool IsGeneric() const {

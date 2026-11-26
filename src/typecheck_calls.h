@@ -113,8 +113,16 @@ inline Val TypeCheck::CheckNamedCall(Call *c, Ident *id, TypeExpr *expected) {
         // A user function set sharing a builtin's name (a `format`
         // overload, §3.7) takes the calls it matches; the builtin the rest.
         auto entry = SaveFlow();
-        bool user = true;
-        if (bd && !cur.probingtypes) {
+        // Beyond its value parameters a function can take one function value
+        // per remaining generic (§7.6), including a trailing block. If no
+        // signature has room, the builtin alone decides which arguments run.
+        auto canmatch = [&](SFunction *sf) {
+            auto bound = c->tyargs.size() + (c->trailing ? 1 : 0);
+            return c->args.size() >= sf->RequiredParams() && bound <= sf->generics.size() &&
+                   c->args.size() <= sf->params.size() + sf->generics.size() - bound;
+        };
+        bool user = !bd || any_of(cands.begin(), cands.end(), canmatch);
+        if (user && bd && !cur.probingtypes) {
             // A builtin can render each argument before evaluating the next.
             // Select the spelling's meaning before checking either order.
             OperandTypeProbe probe(*this, entry);
@@ -815,9 +823,7 @@ inline bool TypeCheck::TryMatch(SFunction *sf, Call *c, vector<Val> &argvals, Ma
                                 string &why, bool defaults) {
     auto P = sf->params.size();
     auto N = argvals.size();
-    auto R = P;   // The parameters without a default, which every call gives.
-    if (defaults)
-        for (R = 0; R < P && !sf->params[R].defaultval;) R++;
+    auto R = defaults ? sf->RequiredParams() : P;
     // The arguments bind the parameters in order, and any function values
     // for the leftover generics come after them (§7.6), which leaves the
     // parameters from there on to their defaults.

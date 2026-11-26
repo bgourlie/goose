@@ -512,11 +512,8 @@ inline Val Dot::Check(TypeCheck &tc, TypeExpr *) {
         if (t->kind == TY_ARRAY || t->kind == TY_SLICE)
             tc.Error(this, cat(".", name, " is not available on ", tc.TypeStr(t)));
     }
-    TypeCheck::LVal lv;
+    auto lv = tc.ValueBase(obj, ov);
     lv.type = t;
-    lv.SetProv(ov);
-    lv.place = ov.refplace;
-    lv.intemp = tc.TempContents(ov, lv.contents);
     tc.ResolveMemberLValue(lv, this);
     if (lv.intemp) tc.NoRelRefTempRead(obj, t, lv.type);
     return tc.ContainerRead(lv);
@@ -544,29 +541,30 @@ inline Val Index::Check(TypeCheck &tc, TypeExpr *) {
 
 inline Val SliceExpr::Check(TypeCheck &tc, TypeExpr *) {
     TypeCheck::DestScope ds(tc, TypeCheck::Dest {});
-    auto lv = tc.LValueBase(obj, cmpview);
-    tc.DerefLValue(lv, obj);
-    tc.SliceProvenance(lv, obj);
+    return tc.CheckSlice(this, tc.LValueBase(obj, cmpview));
+}
+
+inline Val TypeCheck::CheckSlice(SliceExpr *se, LVal lv) {
+    DerefLValue(lv, se->obj);
+    SliceProvenance(lv, se->obj);
     TypeExpr *elem;
     if (lv.type->kind == TY_SLICE) {
         elem = lv.type->sub;
-        if (tc.ClassOf(elem) != SC_FIXED && (lo || hi))
-            tc.Error(this, "slices of variable-size elements can only be re-sliced "
-                           "whole ([..])");
+        if (ClassOf(elem) != SC_FIXED && (se->lo || se->hi))
+            Error(se, "slices of variable-size elements can only be re-sliced whole ([..])");
     } else if (lv.type->kind == TY_ARRAY) {
         elem = lv.type->arr->sub;
-        if (tc.ClassOf(elem) != SC_FIXED && (lo || hi))
-            tc.Error(this, "arrays of variable-size elements can only be sliced "
-                           "whole ([..])");
+        if (ClassOf(elem) != SC_FIXED && (se->lo || se->hi))
+            Error(se, "arrays of variable-size elements can only be sliced whole ([..])");
     } else {
-        tc.Error(this, cat("cannot slice a value of type ", tc.TypeStr(lv.type)));
+        Error(se, cat("cannot slice a value of type ", TypeStr(lv.type)));
     }
     // A comparison's view reads no link out of what it compares (§4.5).
-    if (lv.intemp && !cmpview) tc.NoRelRefTempRead(obj, lv.type, elem);
-    if (lo) tc.CheckIntAny(lo);
-    if (hi) tc.CheckIntAny(hi);
+    if (lv.intemp && !se->cmpview) NoRelRefTempRead(se->obj, lv.type, elem);
+    if (se->lo) CheckIntAny(se->lo);
+    if (se->hi) CheckIntAny(se->hi);
     Val v;
-    v.type = tc.ast.SliceOf(elem, line);
+    v.type = ast.SliceOf(elem, se->line);
     v.sliceplace = lv.place.Inside(IsArrayKind(lv.type, A_GROW));
     v.SetProv(lv);
     v.reusable = false;   // A view of a pool is not the pool.

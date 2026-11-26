@@ -18,6 +18,8 @@ fn owned_copies() {
 }
 
 fn make() -> i64[2] { return [1, 2]; }
+struct Pair { items: i64[2] }
+fn make_pair() -> Pair { Pair { items: [1, 2] } }
 fn fresh_receivers() {
     var indices: i64[>..<] = [0];
     print(make()[indices.pop()]);
@@ -27,6 +29,10 @@ fn fresh_receivers() {
     var other: i64[2] = [1, 2];
     fn replace() -> i64[:] { xs.pop(); return other[..]; }
     print(make() == replace());
+    xs.push(0);
+    assert(make_pair().items == replace());
+    fn borrow() -> i64[2]& { return other; }
+    assert(other[..] == borrow() && borrow() == other[..]);
     // A resizable receiver's header remains alive while its contents change.
     var items: i64[>..<] = [3, 4];
     items.push(items.pop());

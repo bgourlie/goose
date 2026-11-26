@@ -1964,6 +1964,8 @@ struct TypeCheck {
 
     LVal CheckLValue(Node *n);
     LVal LValueBase(Node *n, bool cmpview = false);
+    LVal ValueBase(Node *n, const Val &v);
+    Val CheckSlice(SliceExpr *se, LVal lv);
     void NoTemporaryLiteral(Node *n, TypeExpr *t);
     [[noreturn]] void OptionalDerefError(Node *receiver, Node *at);
     void DerefLValue(LVal &lv, Node *at);
@@ -2221,6 +2223,7 @@ struct TypeCheck {
 
     Val CheckValueAt(Node *&n, TypeExpr *expected, Dest d, bool callsite = false);
     Val Operand(Node *n);
+    Val LoadOperand(Node *n, const Val &raw);
 
     string fitfail;  // A specific reason from the last failing FitsAt, if any.
 
@@ -2402,7 +2405,7 @@ struct TypeCheck {
     }
     void CheckBranchRoot(const Val &v, int depth, Node *at, const char *construct);
     Val TempCopy(Val v);
-    Node *WholeSlice(Node *n);
+    Val WholeSlice(Node *&n, const Val &array);
     Val CheckIf(IfExpr *x, TypeExpr *expected, bool wantvalue);
     Val CheckBlockVal(Block *b, TypeExpr *expected, bool wantvalue);
     Val CheckMatch(MatchExpr *m, TypeExpr *expected, bool wantvalue);
