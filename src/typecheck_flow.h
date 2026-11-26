@@ -3264,7 +3264,7 @@ inline void TypeCheck::CheckAssign(Assign *a) {
     }
     auto killat = storeevents.size();
     auto v = CheckAssignedValue(a, target, arr, lv, AssignmentDest(lv, target));
-    NoteKill(a->lval, lv, target, v, killat);
+    NoteKill(a, lv, target, v, killat);
     if (lv.var) {
         NoLetReassign(a, lv.var, "assign to", "assigned");
         // Slice variables carry their value's provenance (refs use .=).
@@ -3342,7 +3342,7 @@ inline void TypeCheck::CheckRebind(Assign *a, LVal &lv) {
         // The slot a field path names, rebound to null, holds nothing; a
         // variable rebound holds its binding, which is its provenance.
         // The null store takes place after any writes in its operand.
-        NoteKill(a->lval, lv, target, v, v.isnull || v.refplace.nullonly ? storeevents.size() : killat);
+        NoteKill(a, lv, target, v, v.isnull || v.refplace.nullonly ? storeevents.size() : killat);
     }
 }
 
@@ -3376,8 +3376,8 @@ inline void TypeCheck::PointeeAssign(Assign *a, LVal &lv, const LVal &at) {
     // A reference variable can name its whole pointee. For a reference
     // loaded out of a field, only an exact location identifies what was
     // replaced; the field path itself names the reference slot.
-    if (Is<Ident>(a->lval)) NoteKill(a->lval, at, pt, v, killat);
-    else if (arr && HasRelRefT(pt)) NoteOverwrite(a->lval, at, killat, pt, &at.place);
+    if (Is<Ident>(a->lval)) NoteKill(a, at, pt, v, killat);
+    else if (arr && HasRelRefT(pt)) NoteOverwrite(a->lval, at, killat, pt, &at.place, a->rhs);
 }
 
 // A slice v stored into the slot a reference to a slice names, which lies in

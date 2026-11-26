@@ -69,10 +69,33 @@ fn retained_limited_slot() {
     x.values.clear();
 }
 
+struct PlainEntry { link: i64&? }
+fn overwrite_plain_slots() {
+    var values: i64[>..] = [42];
+    var slots: PlainEntry[..2] = [PlainEntry {}, PlainEntry {}];
+    slots[1].link .= values[0];
+    let saved .= slots[1];
+    slots = [PlainEntry {}, PlainEntry {}];
+    values.clear();
+    assert(saved.link == null);
+}
+
+fn unrelated_view() {
+    var x = Saved { slots: [Entry {}], values: [42] };
+    var independent = Entry {};
+    let other .= independent;
+    x.slots[0].link .= x.values[0];
+    x.slots = [];
+    x.values.clear();
+    assert(other.link == null);
+}
+
 fn main() {
     nested_arrays();
     indexed_field(1);
     root_component();
     retained_limited_slot();
+    overwrite_plain_slots();
+    unrelated_view();
     print("ok");
 }

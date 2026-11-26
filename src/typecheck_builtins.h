@@ -1666,21 +1666,21 @@ inline std::optional<TypeCheck::Kill> TypeCheck::MapParamPart(FnSpec *spec, cons
 // here on, which the stores into it before event `at`, the one at which the
 // value began to be checked, then did not put there. Only the part of
 // storage one known container holds is so emptied.
-inline void TypeCheck::NoteKill(Node *lval, const LVal &loc, TypeExpr *target, const Val &v,
+inline void TypeCheck::NoteKill(Assign *assign, const LVal &loc, TypeExpr *target, const Val &v,
                                 size_t at) {
     if (!target) return;
-    if (HasRelRefT(target)) NoteOverwrite(lval, loc, at, target, &loc.place);
+    if (HasRelRefT(target)) NoteOverwrite(assign->lval, loc, at, target, &loc.place, assign->rhs);
     if (!HoldsPlainRef(target)) return;
     auto held = ContentsOf(v);
-    if (held.OnlyStatic() && !held.unknown) NoteOverwrite(lval, loc, at, target);
+    if (held.OnlyStatic() && !held.unknown) NoteOverwrite(assign->lval, loc, at, target, nullptr, assign->rhs);
 }
 
 inline void TypeCheck::NoteOverwrite(Node *lval, const Roots &loc, size_t at, TypeExpr *target,
-                                     const RefPlace *place) {
+                                     const RefPlace *place, Node *value) {
     if (!reachable) return;
     auto kill = OverwrittenPart(lval, loc, target, at, place);
     if (!kill || (!kill->relative && (kill->container->isglobal || kill->base->isglobal))) return;
-    NoteOverwrite(std::move(*kill), target);
+    NoteOverwrite(std::move(*kill), target, value);
 }
 
 // A limited array keeps its capacity slots across assignment (§5.3). Once
@@ -1695,15 +1695,45 @@ inline bool TypeCheck::MayViewLimitedSlot(const Kill &part, TypeExpr *array) {
     for (auto &[slot, at] : cur.links.live)
         if (slot.owner == owner && !(at < part.at && slot.field.Within(part.base, part.path)) &&
             LinkMayReachElements(array, slot.link.pointee)) return true;
+    auto aliases = [&](const Roots &roots) {
+        return roots.Unknown() || roots.Any([&](const RootAlt &a) {
+            return a.root == owner || (!a.exact && Depth(a.root) >= Depth(owner));
+        });
+    };
+    auto direct = [&](const Roots &roots, const RefPlace &place, TypeExpr *pointee) {
+        if (place.nullonly || !LinkMayReachElements(array, pointee)) return false;
+        if (place.base && place.base == part.base && !FieldPathWithin(place.path, part.path) &&
+            !FieldPathWithin(part.path, place.path)) return false;
+        return aliases(OwnersAtPlace(roots, place));
+    };
+    auto through = [&](VarDef *v, const Prov &p, TypeExpr *t) {
+        auto sub = PointeeOf(t);
+        return HoldsPlainRef(sub) && HeldRefsMayPointInto(v, p, t, owner, array, true);
+    };
     bool viewed = false;
     ShrinkScanVars([&](VarDef *v) {
-        if (!viewed && v->type && CanHoldViewInto(v->type, array)) viewed = true;
+        if (viewed || !v->type) return;
+        auto t = v->type;
+        if (IsRefOrSlice(t)) {
+            auto place = t->kind == TY_REF ? v->PointeePlace() : v->SlicePlace();
+            auto binding = RefProvOf(v);
+            viewed = direct(binding, place, PointeeOf(t)) || through(v, binding, t);
+        } else if (CanHoldViewInto(t, array)) {
+            Line where;
+            viewed = HolderMayPointInto(v, owner, array, LiveEventBase(v), &where);
+        }
     });
     HeldOperands([&](const Held &h) {
         auto t = h.v.type;
         if (viewed || !t) return;
-        viewed = CanHoldViewInto(t, array) || (h.location && LinkMayReachElements(array, t)) ||
-                 (h.elems && t->kind == TY_ARRAY && LinkMayReachElements(array, t->arr->sub));
+        if (IsRefOrSlice(t)) {
+            auto place = t->kind == TY_REF ? h.v.refplace : h.v.sliceplace;
+            viewed = direct(h.v, place, PointeeOf(t)) || through(nullptr, h.v, t);
+        } else {
+            viewed = (h.location && direct(h.v, h.v.refplace, t)) ||
+                     (h.elems && t->kind == TY_ARRAY && direct(h.v, h.v.refplace, t->arr->sub)) ||
+                     CanHoldViewInto(t, array);
+        }
     });
     return viewed;
 }
