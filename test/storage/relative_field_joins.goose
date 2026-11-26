@@ -24,6 +24,24 @@ fn returned_fields() {
         b.link .= null;
     }
     list.nodes.clear();
+
+    list.nodes.push(Node { value: 3 });
+    list.header.left.link .= list.nodes[0];
+    fn captured_slot() -> Slot& { list.header.left }
+    fn forwarded_slot() -> Slot& { captured_slot() }
+    forwarded_slot().link .= null;
+    assert(list.header.left.link == null);
+    list.nodes.clear();
+
+    list.nodes.push(Node { value: 4 });
+    var current .= list.header.left;
+    fn current_slot() -> Slot& { current }
+    list.header.left.link .= list.nodes[0];
+    current_slot().link .= null;
+    current .= list.spare;
+    list.spare.link .= list.nodes[0];
+    current_slot().link .= null;
+    list.nodes.clear();
 }
 
 fn reset(list: List&, whole: bool) {

@@ -706,6 +706,8 @@ inline void TypeCheck::ProjectField(Prov &storage, RefPlace &place, TypeExpr *ow
     } else if (owner->kind != TY_STRUCT) {
         place = place.Inside();
     } else if (place.base && !place.enclosing) {
+        if (hasdefers && GetStructInst(owner)->frameobj && ClassOf((*fields.ftypes)[i]) == SC_FIXED)
+            place.prefix = place.base;
         // A defer can hold a reference to a sibling of the field being
         // rebuilt. Retain those paths even when the fields have no links.
         if (hasdefers || HasRelRefT((*fields.ftypes)[i]))
@@ -1067,11 +1069,15 @@ inline Val TypeCheck::CheckValue(Node *&n, TypeExpr *expected, bool callsite, bo
             construction->started = true;
     }
     if (delivery && reachable && v.HasResultType()) NoteOverwrite(std::move(*delivery));
-    // Branches forward the destination to their values, and an in-place
-    // array literal records its count and each element as it builds them.
-    // Other values write the slot on delivery, before the scope's defers.
-    if (construction && v.HasResultType() && reachable && !branch && !((literal || run) && Is<ArrayLit>(orig)))
-        construction->started = true;
+    if (construction && v.HasResultType() && reachable && !branch) {
+        // In-place literals and calls delivering the array in its own
+        // representation already recorded the count and element writes.
+        auto call = Is<Call>(orig);
+        auto arraycall = call && (call->spec || !call->dispatch.empty()) &&
+                         v.type->kind == TY_ARRAY && BuiltInPlace(v.type) &&
+                         ResultLayoutFits(v.type, expected);
+        if (!arraycall && !((literal || run) && Is<ArrayLit>(orig))) construction->started = true;
+    }
     // An argument's casts are its call's to judge (JudgeCallCasts).
     if (!callsite) JudgeCastAt(orig, expected && expected->kind != TY_VOID ? expected : nullptr, v);
     // A nominal default is an ordinary construction at this destination,

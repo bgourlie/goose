@@ -91,6 +91,9 @@ fn moved_slice(in_helper: bool) -> i64[] {
 fn stop() -> i64 { abort("stop"); }
 fn stopped_array() -> i64[] { abort("stop"); }
 fn stopped_empty() -> i64[] { defer { abort("stop"); } return []; }
+fn empty_array() -> i64[] { [] }
+fn forward_empty() -> i64[] { empty_array() }
+fn stopped_forwarded_empty() -> i64[] { defer { abort("stop"); } return forward_empty(); }
 fn stopped_empty_branches(flag: bool) -> i64[] {
     defer { abort("stop"); }
     return if flag { block { [] } } else { loop { break []; } };
@@ -149,6 +152,7 @@ fn stopped_builtin(flag: bool) -> i64[>..] {
     defer { if flag { alias.append(numbers(stop())); } }
     defer { if flag { alias.append(stopped_array()); } }
     defer { if flag { alias.append(stopped_empty()); } }
+    defer { if flag { alias.append(stopped_forwarded_empty()); } }
     defer { if flag { alias.append(stopped_empty_branches(flag)); } }
     defer { if flag { alias.append(forward_stopped()); } }
     defer { if flag { alias.append(stopped_local(7)); } }
@@ -197,17 +201,23 @@ struct Envelope { serial: i64, bag: Bag }
 
 fn update_bag(bag: Bag&) { increment(bag.count); }
 fn update_envelope(box: Envelope&) { update_bag(box.bag); }
+fn select_field(flag: bool, a: i64&, b: i64&) -> i64& { if flag { a } else { b } }
 
-fn copied_fields() -> Envelope {
+fn copied_fields(flag: bool) -> Envelope {
     var box = Envelope { serial: 5, bag: Bag { count: 7, items: [42] } };
     let serial .= box.serial;
     let count .= box.bag.count;
     let alias .= box;
+    let selected: i64& = if flag { box.serial } else { box.bag.count };
+    let other .= select_field(flag, box.bag.count, box.serial);
     defer {
         serial++;
         increment(count);
         update_envelope(alias);
         assert(serial == 6 && count == 9);
+        selected++;
+        increment(other);
+        assert(serial == 7 && count == 10);
     }
     return box;
 }
@@ -272,8 +282,10 @@ fn main() {
     assert(copied_source()[0] == 41);
     let copied: i64[>..<] = copied_growable();
     assert(copied[0] == 41);
-    let box = copied_fields();
-    assert(box.serial == 5 && box.bag.count == 7 && box.bag.items[0] == 42);
+    for flag in [false, true] {
+        let box = copied_fields(flag);
+        assert(box.serial == 5 && box.bag.count == 7 && box.bag.items[0] == 42);
+    }
     assert(stopped_aggregate(false)[0].value == 42);
     slot = read_before_store();
     assert(slot == 42);

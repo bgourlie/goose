@@ -3329,6 +3329,8 @@ inline void TypeCheck::CheckSpecBodyOnce(FnSpec *spec, vector<Val> *argvals, Lin
                 // that storage. Whether it is the array some *other* class names is a
                 // different question, and only ra.exact answers it.
                 vd->ref.Set(classroots[ra.cls], true, nullptr, ra.slotread);
+                if (hasdefers && vd->refplace.location.param)
+                    vd->refplace.prefix = classroots[ra.cls];
                 classroots[ra.cls]->contentbyteview |= ra.byteview;
             }
             vd->refrootknown = true;
@@ -3738,14 +3740,21 @@ inline void TypeCheck::FinishReturn(int tf, const vector<Val> &vals, Node *at) {
 
         if (isrs) {
             auto place = rt->kind == TY_SLICE ? vals[i].sliceplace : vals[i].refplace;
-            // Only the callee's actual parameters and global storage name
-            // the same places when another call reuses this specialization.
-            auto parameter = [&](VarDef *v) {
-                return v && v->isparam && v->ownerspec == tspec;
+            // Captures and their incoming bindings are part of the
+            // specialization's environment, checked on reuse by EnvUnchanged.
+            auto stable = [&](VarDef *v) {
+                if (!v || v->isglobal) return true;
+                if (v->ownerspec == tspec) return v->isparam;
+                return any_of(tspec->envreads.begin(), tspec->envreads.end(), [&](const EnvRead &r) {
+                    return r.var == v || r.refplace.base == v || r.refplace.location.param == v ||
+                           r.refplace.prefix == v;
+                });
             };
-            if (!parameter(place.location.param)) place.location.param = nullptr;
-            if (place.base && !place.base->isglobal && !parameter(place.base))
-                place = { place.location, nullptr, {}, place.nullonly };
+            if (!stable(place.location.param)) place.location.param = nullptr;
+            if (!stable(place.prefix) &&
+                find(tspec->classroots.begin(), tspec->classroots.end(), place.prefix) == tspec->classroots.end())
+                place.prefix = nullptr;
+            if (!stable(place.base)) place = place.WithoutPath();
             rr.place = place;
         }
         rr.heldparam = holder ? HeldParam(tspec, vals[i]) : -1;
@@ -3808,17 +3817,43 @@ inline Val TypeCheck::RetAltVal(FnSpec *spec, const RootAlt &alt, vector<Val> &a
 // Roots can identify an owner shared by several arguments. A result's
 // field path is relative to the particular parameter the body returned.
 inline RefPlace TypeCheck::CallerPlace(RefPlace place, FnSpec *spec, const vector<Val> &args) {
+    auto prefix = place.prefix;
+    if (prefix && prefix->ownerspec == spec) {
+        // The callee selected a fixed field of a frame-object parameter.
+        auto actual = ArgumentPlace(spec, prefix, args);
+        prefix = actual.base && !actual.enclosing ? actual.base : actual.prefix;
+    } else if (prefix && IsClassRoot(prefix) &&
+               find(spec->classroots.begin(), spec->classroots.end(), prefix) != spec->classroots.end()) {
+        // Joining different parameters can lose the field path while
+        // retaining their common class. Every possible argument must agree.
+        bool first = true;
+        prefix = nullptr;
+        for (size_t i = 0; i < spec->params.size() && i < args.size(); i++) {
+            auto cls = spec->roots[i].cls;
+            if (!IsRefOrSlice(spec->argtypes[i]) || !cls || spec->classroots[cls] != place.prefix ||
+                (place.location.param && place.location.param != spec->params[i])) continue;
+            auto actual = (spec->argtypes[i]->kind == TY_SLICE ? args[i].ElementPlace() : args[i].refplace).prefix;
+            if (first) prefix = actual;
+            else if (prefix != actual) prefix = nullptr;
+            first = false;
+        }
+    }
+    place.prefix = prefix;
     if (auto p = place.location.param; p && p->ownerspec == spec) {
         auto loc = ArgumentPlace(spec, p, args).location;
         place.location = { place.location.intail || loc.intail, loc.param };
     }
     if (place.base && place.base->ownerspec == spec) {
         auto actual = ArgumentPlace(spec, place.base, args);
-        if (!actual.base) return { place.location, nullptr, {}, actual.nullonly };
+        if (!actual.base) {
+            place.nullonly = actual.nullonly;
+            return place.WithoutPath();
+        }
         if (!actual.enclosing && !place.path.empty())
             actual.path = ast.Intern(cat(actual.path, place.path));
         actual.enclosing |= place.enclosing;
         actual.location = place.location;
+        actual.prefix = prefix;
         return actual;
     }
     return place;
@@ -4349,10 +4384,12 @@ inline void TypeCheck::NoteCallConstruction(const vector<TypeExpr *> &results, c
         auto dest = CallResultDest(i);
         auto t = results[i];
         if (!dest || !dest->construction || !IsAggregate(t) || !BuiltInPlace(t)) continue;
-        if (auto rec = callee ? RecordOf(callee) : nullptr; rec && !rec->mayreturn) {
+        if (auto rec = callee ? RecordOf(callee) : nullptr) {
             auto write = rec->resultwrites.find((int)i);
-            if (write == rec->resultwrites.end()) continue;
-            if (write->second == FnRecord::ResultWrite::Count &&
+            if (write == rec->resultwrites.end() && !rec->mayreturn) continue;
+            // A completing call may still have written only its count.
+            // In value layout that count is part of the destination bytes.
+            if (write != rec->resultwrites.end() && write->second == FnRecord::ResultWrite::Count &&
                 (ClassOf(t) == SC_RESIZABLE ||
                  (!dispatch && callee->HasElementRun(callee->receivesouterreturn)))) {
                 dest->construction->WriteCount(dest->countdest);

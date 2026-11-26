@@ -2606,14 +2606,8 @@ inline void TypeCheck::RecordStorageWrite(FnRecord::StorageWrite write, Defer *e
     if (!cur.deferring && write.root->ownerspec == spec) {
         if (!executing) return;
         // A named frame object's fixed prefix is copied before defers run.
-        // A path into its elements ends at the resizable array, even when
-        // the particular element being written is itself fixed-size.
         auto t = write.root->type;
-        if (write.place.base == write.root && !write.place.path.empty() &&
-            t && t->kind == TY_STRUCT && GetStructInst(t)->frameobj) {
-            auto field = FieldPathType(write.root, write.place.path);
-            if (field && ClassOf(field) == SC_FIXED) return;
-        }
+        if (write.place.prefix == write.root && t && t->kind == TY_STRUCT && GetStructInst(t)->frameobj) return;
         deferwrites[executing].insert(write.root);
         return;
     }

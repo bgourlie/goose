@@ -1600,7 +1600,7 @@ inline RefPlace TypeCheck::StoragePlace(const Roots &roots, TypeExpr *target, Re
                 return place;
         }
     }
-    return { place.location, nullptr, {}, place.nullonly };
+    return place.WithoutPath();
 }
 
 inline std::optional<TypeCheck::Kill> TypeCheck::OverwrittenPart(Node *n, const Roots &loc,
@@ -2098,15 +2098,19 @@ inline void TypeCheck::NoteRefPlace(VarDef *vd, const Val &v) {
         place = StoragePlace(owners, vd->type->ref->sub, v.refplace);
         if (!place.base && owners.Exact()) {
             auto owner = owners.Root();
-            if (owner && owner->type && !IsRefOrSlice(owner->type) && !IsTemp(owner))
-                place = RefPlace { place.location, owner }.Inside();
+            if (owner && owner->type && !IsRefOrSlice(owner->type) && !IsTemp(owner)) {
+                place.base = owner;
+                place.nullonly = false;
+                place = place.Inside();
+            }
         }
     } else return;
     // A captured binding can be initialized in a shorter-lived scope. Keep
     // facts expressed in bindings that will still exist wherever it is read.
     if (place.location.param && Depth(place.location.param) > Depth(vd)) place.location.param = nullptr;
+    if (place.prefix && (vd->isglobal || Depth(place.prefix) > Depth(vd))) place.prefix = nullptr;
     if (place.base && (vd->isglobal || Depth(place.base) > Depth(vd)))
-        place = { place.location, nullptr, {}, place.nullonly };
+        place = place.WithoutPath();
     vd->refplace = place;
 }
 

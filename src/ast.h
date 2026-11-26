@@ -717,7 +717,17 @@ struct RefPlace {
     string_view path;
     bool nullonly = false;  // No pointee on this path. The default is an unknown place.
     bool enclosing = false;
+    // All alternatives lie in the copied prefix of this frame object.
+    // A parameter class makes this conditional on the storage passed at the call.
+    VarDef *prefix = nullptr;
 
+    RefPlace WithoutPath() const {
+        auto part = *this;
+        part.base = nullptr;
+        part.path = {};
+        part.enclosing = false;
+        return part;
+    }
     RefPlace Inside(bool intail = false) const {
         auto part = *this;
         part.enclosing = base != nullptr;
@@ -731,6 +741,7 @@ struct RefPlace {
         RefPlace common;
         common.location.intail = location.intail && other.location.intail;
         if (location.param == other.location.param) common.location.param = location.param;
+        if (prefix == other.prefix) common.prefix = prefix;
         if (base && base == other.base) {
             common.base = base;
             common.path = path;
