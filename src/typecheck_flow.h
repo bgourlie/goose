@@ -2610,14 +2610,18 @@ inline Roots TypeCheck::OwnersAtPlace(const Roots &storage, const RefPlace &plac
 // ends the inline path: its slot and what the slot holds are separate.
 inline void TypeCheck::NoteStorageRead(Node *n) {
     if (!reachable || cur.probingtypes) return;
+    bool slotonly = false;
     if (cur.nodepath.size() > 1) {
         auto parent = cur.nodepath[cur.nodepath.size() - 2].node;
         if (auto d = Is<Dot>(parent); d && d->obj == n) return; // The complete path records the read.
-        if (auto a = Is<Assign>(parent); a && a->lval == n && Is<Ident>(n)) {
-            // Replacing a reference or slice binding does not read the storage it used to name.
-            if (a->op == T_DOTASSIGN || (a->op == T_ASSIGN && n->exprtype && n->exprtype->kind == TY_SLICE))
-                return;
+        if (auto a = Is<Assign>(parent); a && a->lval == n) {
+            slotonly = a->op == T_DOTASSIGN || (a->op == T_ASSIGN && n->exprtype && n->exprtype->kind == TY_SLICE);
+        } else if (auto b = Is<Binary>(parent)) {
+            auto other = b->left == n ? b->right : b->left;
+            slotonly = b->op == T_DOTEQ || b->op == T_DOTNEQ ||
+                       ((b->op == T_EQ || b->op == T_NEQ) && Is<NullLit>(other));
         }
+        if (slotonly && Is<Ident>(n) && n->exprtype && IsRefOrSlice(n->exprtype)) return;
     }
     auto base = n;
     while (auto d = Is<Dot>(base)) base = d->obj;
@@ -2633,8 +2637,19 @@ inline void TypeCheck::NoteStorageRead(Node *n) {
     Prov storage;
     storage.TakeAlts(ref ? OwnersAtPlace(RefRootsOf(v), place) : RootsOf(v));
     auto add = [&](const Prov &where, TypeExpr *type, TypeExpr *field, const RefPlace &selected) {
-        for (auto &owner : where.alts)
-            RecordStorageRead({ v, type, field, selected, owner, ref && v->ref.byteview, n });
+        auto observed = field ? field : type;
+        vector<TypeExpr *> targets;
+        if (!slotonly && HasRelRefT(observed)) SelfRelPointees(observed, targets);
+        for (auto &owner : where.alts) {
+            StorageRead read { v, type, field, selected, owner, ref && v->ref.byteview, n };
+            if (slotonly || IsSelfRelRef(observed)) read.use = StorageRead::Slot;
+            RecordStorageRead(read);
+            for (auto t : targets) {
+                read.use = StorageRead::RelativeTarget;
+                read.field = LinkPointee(t);
+                RecordStorageRead(read);
+            }
+        }
     };
 
     vector<Dot *> fields;
@@ -2661,17 +2676,79 @@ inline void TypeCheck::NoteStorageRead(Node *n) {
         ProjectField(storage, place, t, runs[0], i);
         field = (*runs[0].ftypes)[i];
         if (ClassOf(t) == SC_ROOT) holder = field;
-        if (IsRefOrSlice(field)) break;
+        if (IsRefOrSlice(field)) {
+            // A reference on the way to a destination must be followed to locate its final slot.
+            if (*it != n) slotonly = false;
+            break;
+        }
     }
     add(storage, holder, field, place);
+}
+
+// Substitute the link writes reaching this read. A helper or defer can
+// still observe its caller's incoming slot until a definite overwrite.
+inline void TypeCheck::CollectStorageRead(vector<StorageRead> &reads, const StorageRead &read) {
+    auto add = [&](const StorageRead &r) {
+        if (none_of(reads.begin(), reads.end(), [&](const StorageRead &old) { return SameStorageRead(old, r); }))
+            reads.push_back(r);
+    };
+    if (read.use != StorageRead::RelativeTarget) {
+        add(read);
+        return;
+    }
+    auto owner = read.owner.root;
+    // Reading the target may expose relative slots of its own. Only the
+    // field and pointee type change along a chain within this owner.
+    struct Lookup { RefPlace slot; TypeExpr *pointee; bool incoming; };
+    vector<Lookup> pending { { read.place, read.field, true } };
+    auto follow = [&](const RefPlace &slot, TypeExpr *type, bool incoming) {
+        if (!HasRelRefT(type)) return;
+        vector<TypeExpr *> types;
+        SelfRelPointees(type, types);
+        for (auto t : types) {
+            auto p = LinkPointee(t);
+            if (none_of(pending.begin(), pending.end(), [&](const Lookup &q) {
+                return q.slot == slot && q.pointee == p && q.incoming == incoming;
+            })) pending.push_back({ slot, p, incoming });
+        }
+    };
+    for (size_t i = 0; i < pending.size(); i++) {
+        auto [slot, pointee, incoming] = pending[i];
+        auto access = read;
+        access.field = pointee;
+        for (auto &[part, write] : cur.links.live) {
+            if (part.link.pointee != pointee || part.field.ApartFrom(slot.Base(), slot.Path()) ||
+                MayAliasRoots(owner, read.owner.exact, part.owner, !storeevents[write.at].bound) == AL_NO) continue;
+            access.use = StorageRead::Value;
+            access.place = {};
+            access.byteview = read.byteview || IsU8(pointee);
+            if (part.target.base)
+                access.place.fields = PlacePaths::Of({ part.target.base, ast.places.Path(part.target.path), true }, ast.places);
+            add(access);
+            follow(access.place, pointee, true);
+        }
+        if (!cur.deferring && owner && owner->ownerspec == CurRealFrame().spec && read.owner.exact) continue;
+        if (any_of(cur.kills.begin(), cur.kills.end(), [&](const Kill &k) {
+            return k.relative && !k.prefixonly && k.container == owner && k.base && k.base == slot.Base() &&
+                   FieldPathWithin(slot.Path(), k.path);
+        })) continue;
+        if (incoming) {
+            access.use = StorageRead::RelativeTarget;
+            access.place = slot;
+            access.byteview = read.byteview;
+            add(access);
+        }
+        // The caller resolves the incoming chain. Also account for stores
+        // made here in a target whose location only the caller knows.
+        if (!cur.links.live.empty()) follow({}, pointee, false);
+    }
 }
 
 inline void TypeCheck::RecordStorageRead(const StorageRead &read) {
     auto spec = CurRealFrame().spec;
     if (!spec || (!cur.deferring && !read.var->isglobal && read.var->ownerspec == spec)) return;
     auto &reads = cur.deferring ? cur.deferring->reads : spec->record.capturereads;
-    if (none_of(reads.begin(), reads.end(), [&](const StorageRead &r) { return SameStorageRead(r, read); }))
-        reads.push_back(read);
+    CollectStorageRead(reads, read);
 }
 
 // Arguments are observed by their own evaluation. The call additionally

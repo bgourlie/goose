@@ -5105,21 +5105,29 @@ inline TypeCheck::Alias TypeCheck::ReachesBuilt(VarDef *v, VarDef *built, bool e
 }
 
 inline void TypeCheck::CheckDeferredReads(const DeferEffects &effects, const FnRecord::InterruptedAssign &a) {
-    for (auto &read : effects.reads) {
+    vector<StorageRead> reads;
+    for (auto &read : effects.reads) CollectStorageRead(reads, read);
+    for (auto &read : reads) {
         Prov storage;
         storage.Add(read.owner);
         storage.byteview = read.byteview;
         auto type = read.field ? read.field : read.holder;
         vector<LiveView> views;
-        if (!read.place.fields.ApartFrom(a.place.fields)) views.push_back({ storage, type });
-        // The inline slot may be disjoint even when its contents lead back
-        // to the receiver. Consult the holder's stores on this exit.
-        // A relative field can lead to another part of the holder. Its
-        // own inline path does not select the ordinary reference slots there.
+        if (read.use == StorageRead::RelativeTarget) {
+            // An incoming link with no known target can reach anywhere its
+            // pointee fits. Further offsets inside it can reach the same owner.
+            storage.byteview |= IsU8(type);
+            views.push_back({ storage, HasRelRefT(type) ? nullptr : type });
+        } else if (!read.place.fields.ApartFrom(a.place.fields)) {
+            views.push_back({ storage, type });
+        }
+        // Ordinary references held in a selected value can also lead back
+        // to the receiver. Replacing its slot does not follow them.
         auto field = read.field && !IsRelRef(read.field) ? read.field : nullptr;
         auto held = field ? field : read.holder;
-        if (HoldsPlainRef(held)) {
-            HeldViews(storage, read.holder, false, views, field, field ? read.place : RefPlace {});
+        if (read.use != StorageRead::Slot && HoldsPlainRef(held)) {
+            HeldViews(storage, read.holder, false, views, field,
+                      field && read.use != StorageRead::RelativeTarget ? read.place : RefPlace {});
             auto globalowner = read.var->isglobal ? read.var : read.owner.root;
             if (globalowner && globalowner->isglobal) {
                 Prov global;

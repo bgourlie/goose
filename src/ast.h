@@ -2875,12 +2875,14 @@ struct FnRecord {
     // Storage observed by reading a capture. The place and owner are those
     // at the read, including when the body later restores the binding.
     struct StorageRead {
+        enum Use { Value, Slot, RelativeTarget };
         VarDef *var;
         TypeExpr *holder, *field; // Null field reads the whole holder.
         RefPlace place;
         RootAlt owner;
         bool byteview;
         Node *at;
+        Use use = Value; // RelativeTarget follows an incoming slot to a pointee of type field.
     };
     vector<StorageRead> capturereads;
     enum class ResultWrite { Count, Storage };

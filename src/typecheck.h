@@ -2760,10 +2760,11 @@ struct TypeCheck {
     using StorageWrite = FnRecord::StorageWrite;
     using StorageRead = FnRecord::StorageRead;
     bool SameStorageRead(const StorageRead &a, const StorageRead &b) {
-        return a.var == b.var && a.owner == b.owner && a.place == b.place && a.byteview == b.byteview &&
+        return a.use == b.use && a.var == b.var && a.owner == b.owner && a.place == b.place && a.byteview == b.byteview &&
                TypeEq(a.holder, b.holder) && !a.field == !b.field && (!a.field || TypeEq(a.field, b.field));
     }
     void NoteStorageRead(Node *n);
+    void CollectStorageRead(vector<StorageRead> &reads, const StorageRead &read);
     void RecordStorageRead(const StorageRead &read);
     void ApplyCalleeReads(FnSpec *spec, const vector<Val> &args);
     void CheckDeferredReads(const DeferEffects &effects, const FnRecord::InterruptedAssign &assignment);
