@@ -222,6 +222,41 @@ fn copied_fields(flag: bool) -> Envelope {
     return box;
 }
 
+fn increment_or_scratch(flag: bool, value: i64&) {
+    var scratch = 0;
+    let target: i64& = if flag { value } else { scratch };
+    target++;
+}
+
+fn mixed_owners(flag: bool) -> Bag {
+    var bag = Bag { count: 7, items: [42] };
+    var other = 5;
+    let header .= bag.count;
+    let direct: i64& = if flag { bag.count } else { other };
+    let through_call .= select_field(flag, other, bag.count);
+    defer {
+        direct++;
+        increment(through_call);
+        assert(header == 8 && other == 6);
+    }
+    return bag;
+}
+
+fn mixed_tail_owner(flag: bool) -> Bag {
+    var bag = Bag { count: 7, items: [42] };
+    var spare = Bag { count: 0, items: [10] };
+    let header .= bag.count;
+    var target .= bag.count;
+    if flag { target .= spare.items[0]; }
+    defer {
+        target++;
+        increment_or_scratch(flag, header);
+        assert(header == 8);
+        if flag { assert(spare.items[0] == 11); }
+    }
+    return bag;
+}
+
 struct Small { value: i64 }
 fn make(n: i64) -> Small { Small { value: n } }
 fn stopped_small() -> Small { abort("stop"); }
@@ -285,6 +320,9 @@ fn main() {
     for flag in [false, true] {
         let box = copied_fields(flag);
         assert(box.serial == 5 && box.bag.count == 7 && box.bag.items[0] == 42);
+        let bag = mixed_owners(flag);
+        assert(bag.count == 7 && bag.items[0] == 42);
+        assert(mixed_tail_owner(flag).count == 7);
     }
     assert(stopped_aggregate(false)[0].value == 42);
     slot = read_before_store();

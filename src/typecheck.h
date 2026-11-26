@@ -2680,6 +2680,12 @@ struct TypeCheck {
     bool hasdefers = false;
     unordered_map<Defer *, vector<VarDef *>> defermentions;
     unordered_map<Defer *, set<const VarDef *>> deferwrites;
+    RefPlace OwnedPlace(VarDef *owner, LinkLocation location = {}) {
+        RefPlace place { location, owner };
+        if (hasdefers && owner && owner->type && !IsRefOrSlice(owner->type))
+            place.regions = { { owner } };
+        return place;
+    }
     vector<EnvRead> DeferBindings(Defer *d);
     static void CalledSpecs(Node *n, vector<FnSpec *> &to);
     static Roots OwnersAtPlace(const Roots &storage, const RefPlace &place);

@@ -1592,8 +1592,11 @@ inline RefPlace TypeCheck::StoragePlace(const Roots &roots, TypeExpr *target, Re
         auto owner = roots.Root();
         if (owner && !IsTemp(owner)) {
             auto t = OwnerType(owner);
-            if (t && !IsRefOrSlice(t) && TopConstEq(t, target))
-                return { place.location, owner };
+            if (t && !IsRefOrSlice(t) && TopConstEq(t, target)) {
+                auto whole = OwnedPlace(owner, place.location);
+                if (IsClassRoot(owner)) whole.regions = place.regions;
+                return whole;
+            }
             auto base = place.base;
             if (base == owner || (base && base->type && IsAddressRef(base->type) && !base->isvar &&
                                   base->ref.Exact() && base->ref.Root() == owner))
@@ -2100,6 +2103,7 @@ inline void TypeCheck::NoteRefPlace(VarDef *vd, const Val &v) {
             auto owner = owners.Root();
             if (owner && owner->type && !IsRefOrSlice(owner->type) && !IsTemp(owner)) {
                 place.base = owner;
+                if (place.regions.All().empty()) place.regions = OwnedPlace(owner).regions;
                 place.nullonly = false;
                 place = place.Inside();
             }
@@ -2108,7 +2112,10 @@ inline void TypeCheck::NoteRefPlace(VarDef *vd, const Val &v) {
     // A captured binding can be initialized in a shorter-lived scope. Keep
     // facts expressed in bindings that will still exist wherever it is read.
     if (place.location.param && Depth(place.location.param) > Depth(vd)) place.location.param = nullptr;
-    if (place.prefix && (vd->isglobal || Depth(place.prefix) > Depth(vd))) place.prefix = nullptr;
+    for (auto r : place.regions.All()) if (vd->isglobal || Depth(r.owner) > Depth(vd)) {
+        place.regions = {};
+        break;
+    }
     if (place.base && (vd->isglobal || Depth(place.base) > Depth(vd)))
         place = place.WithoutPath();
     vd->refplace = place;

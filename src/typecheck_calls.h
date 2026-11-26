@@ -2072,7 +2072,7 @@ inline void TypeCheck::NoteExit(int tf, Node *at, const vector<RetRoot> &results
     if (!reachable || !e) return;
     auto merge = [&](vector<RetRoot> &to) {
         if (to.size() < results.size()) to.resize(results.size());
-        for (size_t i = 0; i < results.size(); i++) to[i].Include(results[i]);
+        for (size_t i = 0; i < results.size(); i++) to[i].Include(results[i], ast.writeregions);
     };
     auto target = frames[tf].spec;
     auto exitlinks = [&] {
@@ -2103,13 +2103,13 @@ inline void TypeCheck::NoteExit(int tf, Node *at, const vector<RetRoot> &results
                 auto p = x.assigned.find(it->first);
                 if (p == x.assigned.end()) it = o.assigned.erase(it);
                 else {
-                    it->second = it->second.Common(p->second);
+                    it->second = it->second.Common(p->second, ast.writeregions);
                     ++it;
                 }
             }
             o.maybeassigned.insert(x.maybeassigned.begin(), x.maybeassigned.end());
             o.links.Join(x.links);
-            for (auto &a : x.interrupted) a.AddTo(o.interrupted);
+            for (auto &a : x.interrupted) a.AddTo(o.interrupted, ast.writeregions);
             for (auto &link : x.partialresults) link.AddTo(o.partialresults);
             merge(o.results);
             return;
@@ -2120,7 +2120,7 @@ inline void TypeCheck::NoteExit(int tf, Node *at, const vector<RetRoot> &results
     }
     for (size_t i = 0; i < e->vars.size(); i++) {
         auto v = e->vars[i];
-        e->places[i] = e->reached ? e->places[i].Common(v->refplace) : v->refplace;
+        e->places[i] = e->reached ? e->places[i].Common(v->refplace, ast.writeregions) : v->refplace;
         e->assigned[i] = (!e->reached || e->assigned[i]) && v->assigned;
         e->maybeassigned[i] = (e->reached && e->maybeassigned[i]) || v->maybeassigned;
     }
@@ -3330,7 +3330,7 @@ inline void TypeCheck::CheckSpecBodyOnce(FnSpec *spec, vector<Val> *argvals, Lin
                 // different question, and only ra.exact answers it.
                 vd->ref.Set(classroots[ra.cls], true, nullptr, ra.slotread);
                 if (hasdefers && vd->refplace.location.param)
-                    vd->refplace.prefix = classroots[ra.cls];
+                    vd->refplace.regions = { { vd } };
                 classroots[ra.cls]->contentbyteview |= ra.byteview;
             }
             vd->refrootknown = true;
@@ -3747,13 +3747,14 @@ inline void TypeCheck::FinishReturn(int tf, const vector<Val> &vals, Node *at) {
                 if (v->ownerspec == tspec) return v->isparam;
                 return any_of(tspec->envreads.begin(), tspec->envreads.end(), [&](const EnvRead &r) {
                     return r.var == v || r.refplace.base == v || r.refplace.location.param == v ||
-                           r.refplace.prefix == v;
+                           r.refplace.regions.Find(v);
                 });
             };
             if (!stable(place.location.param)) place.location.param = nullptr;
-            if (!stable(place.prefix) &&
-                find(tspec->classroots.begin(), tspec->classroots.end(), place.prefix) == tspec->classroots.end())
-                place.prefix = nullptr;
+            for (auto r : place.regions.All()) if (!stable(r.owner)) {
+                place.regions = {};
+                break;
+            }
             if (!stable(place.base)) place = place.WithoutPath();
             rr.place = place;
         }
@@ -3817,28 +3818,25 @@ inline Val TypeCheck::RetAltVal(FnSpec *spec, const RootAlt &alt, vector<Val> &a
 // Roots can identify an owner shared by several arguments. A result's
 // field path is relative to the particular parameter the body returned.
 inline RefPlace TypeCheck::CallerPlace(RefPlace place, FnSpec *spec, const vector<Val> &args) {
-    auto prefix = place.prefix;
-    if (prefix && prefix->ownerspec == spec) {
-        // The callee selected a fixed field of a frame-object parameter.
-        auto actual = ArgumentPlace(spec, prefix, args);
-        prefix = actual.base && !actual.enclosing ? actual.base : actual.prefix;
-    } else if (prefix && IsClassRoot(prefix) &&
-               find(spec->classroots.begin(), spec->classroots.end(), prefix) != spec->classroots.end()) {
-        // Joining different parameters can lose the field path while
-        // retaining their common class. Every possible argument must agree.
-        bool first = true;
-        prefix = nullptr;
-        for (size_t i = 0; i < spec->params.size() && i < args.size(); i++) {
-            auto cls = spec->roots[i].cls;
-            if (!IsRefOrSlice(spec->argtypes[i]) || !cls || spec->classroots[cls] != place.prefix ||
-                (place.location.param && place.location.param != spec->params[i])) continue;
-            auto actual = (spec->argtypes[i]->kind == TY_SLICE ? args[i].ElementPlace() : args[i].refplace).prefix;
-            if (first) prefix = actual;
-            else if (prefix != actual) prefix = nullptr;
-            first = false;
+    // Map each formal separately, even when two formals share a lifetime
+    // class. Then join alternatives that land in the same caller-side owner.
+    WriteRegions mapped;
+    bool first = true;
+    for (auto r : place.regions.All()) {
+        WriteRegions part { r };
+        if (r.owner->ownerspec == spec) {
+            // A local or by-value parameter owns its storage for this call.
+            if (!r.owner->isparam || !IsRefOrSlice(r.owner->type)) continue;
+            auto actual = ArgumentPlace(spec, r.owner, args);
+            if (actual.nullonly) continue;
+            part = actual.regions;
+            if (r.copied) part = part.FixedField(ast.writeregions);
         }
+        mapped = first ? part : mapped.Join(part, ast.writeregions);
+        first = false;
+        if (mapped.All().empty()) break;
     }
-    place.prefix = prefix;
+    place.regions = mapped;
     if (auto p = place.location.param; p && p->ownerspec == spec) {
         auto loc = ArgumentPlace(spec, p, args).location;
         place.location = { place.location.intail || loc.intail, loc.param };
@@ -3853,7 +3851,7 @@ inline RefPlace TypeCheck::CallerPlace(RefPlace place, FnSpec *spec, const vecto
             actual.path = ast.Intern(cat(actual.path, place.path));
         actual.enclosing |= place.enclosing;
         actual.location = place.location;
-        actual.prefix = prefix;
+        actual.regions = mapped;
         return actual;
     }
     return place;

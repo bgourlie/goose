@@ -39,7 +39,7 @@ inline TypeCheck::LVal TypeCheck::CheckLValue(Node *n) {
         lv.type = vd->narrowed ? vd->narrowed : vd->type;
         lv.var = vd;
         lv.Set(vd, true);
-        if (!vd->istemp) lv.place.base = vd;
+        if (!vd->istemp) lv.place = OwnedPlace(vd);
         lv.byteview = vd->contentbyteview;
         // Contents are writable unless the type says const or the binding
         // is a copy (§9.5). Whether the variable itself is assigned is up
@@ -701,13 +701,13 @@ inline void TypeCheck::ProjectField(Prov &storage, RefPlace &place, TypeExpr *ow
                                     const FieldRun &fields, size_t i) {
     if (owner->kind == TY_STRUCT && owner->struc->st->isroot) {
         storage.TakeAlts(ProjectRoots(storage, owner, (int)i));
-        place = {};
-        place.base = ExactComponent(storage);
+        place = OwnedPlace(ExactComponent(storage));
     } else if (owner->kind != TY_STRUCT) {
         place = place.Inside();
-    } else if (place.base && !place.enclosing) {
-        if (hasdefers && GetStructInst(owner)->frameobj && ClassOf((*fields.ftypes)[i]) == SC_FIXED)
-            place.prefix = place.base;
+    } else {
+        if (!place.regions.All().empty() && GetStructInst(owner)->frameobj && ClassOf((*fields.ftypes)[i]) == SC_FIXED)
+            place.regions = place.regions.FixedField(ast.writeregions);
+        if (!place.base || place.enclosing) return;
         // A defer can hold a reference to a sibling of the field being
         // rebuilt. Retain those paths even when the fields have no links.
         if (hasdefers || HasRelRefT((*fields.ftypes)[i]))

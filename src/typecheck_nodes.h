@@ -108,7 +108,7 @@ inline Val Ident::Check(TypeCheck &tc, TypeExpr *) {
             v.unsizedparam = vd->unsizedorigin ? vd->unsizedorigin : vd;
         } else {
             v.Set(vd, true);
-            if (!vd->istemp) v.refplace.base = vd;
+            if (!vd->istemp) v.refplace = tc.OwnedPlace(vd);
             v.byteview = vd->contentbyteview;
             v.elementlinks = tc.LiveElementLinks(vd);
             v.writable = !vd->copybind && !(vd->type && vd->type->cq);

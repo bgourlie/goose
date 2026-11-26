@@ -4192,6 +4192,11 @@ For writes through aliases, the checker and code generator use the same
 result-placement rule. A local copied into a different return layout can
 still be updated through an alias after the copy. A growable array
 returned as a variable array shares its elements with the result.
+A named frame object's fixed fields are copied before its defers run.
+When a reference can reach several owners, the checker tracks for each owner
+whether every path reaches a copied field. A write that can reach shared
+elements in the returned object's tail is rejected even if another path
+reaches a different owner.
 Assignments and mutating builtins record their receiving
 storage when the write can begin. A scalar push writes after its operand
 returns. A call constructing an aggregate can begin writing its destination

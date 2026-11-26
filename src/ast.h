@@ -709,6 +709,55 @@ inline bool FieldPathWithin(string_view path, string_view enclosing) {
            (path.size() == enclosing.size() || path[enclosing.size()] == '.');
 }
 
+// Where a deferred write can land. A parameter stands for its argument's
+// storage until the call is mapped. For each owner, copied is true only if
+// every alternative for that owner lies in its frame object's fixed prefix.
+struct WriteRegion {
+    VarDef *owner = nullptr;
+    bool copied = false;
+    auto operator<=>(const WriteRegion &) const = default;
+};
+using WriteRegionPool = set<vector<WriteRegion>>;
+
+struct WriteRegions {
+    // Flow snapshots copy places by value. Keep a single owner inline and
+    // share immutable, canonical sets when paths with different owners join.
+    WriteRegion one;
+    const vector<WriteRegion> *many = nullptr;
+
+    span<const WriteRegion> All() const {
+        if (many) return *many;
+        return { &one, size_t(one.owner != nullptr) }; // Empty means unknown.
+    }
+    const WriteRegion *Find(VarDef *owner) const {
+        for (auto &r : All()) if (r.owner == owner) return &r;
+        return nullptr;
+    }
+    bool operator==(const WriteRegions &) const = default;
+
+    WriteRegions Join(const WriteRegions &other, WriteRegionPool &pool) const {
+        if (*this == other) return *this;
+        if (All().empty() || other.All().empty()) return {};
+        if (!many && !other.many && one.owner == other.one.owner)
+            return { { one.owner, one.copied && other.one.copied } };
+        map<VarDef *, bool> byowner;
+        for (auto r : All()) byowner.emplace(r.owner, r.copied);
+        for (auto r : other.All()) {
+            auto [it, added] = byowner.emplace(r.owner, r.copied);
+            if (!added) it->second &= r.copied;
+        }
+        vector<WriteRegion> joined;
+        for (auto [owner, copied] : byowner) joined.push_back({ owner, copied });
+        return { {}, &*pool.insert(std::move(joined)).first };
+    }
+    WriteRegions FixedField(WriteRegionPool &pool) const {
+        if (!many) return one.owner ? WriteRegions { { one.owner, true } } : WriteRegions {};
+        auto fields = *many;
+        for (auto &r : fields) r.copied = true;
+        return { {}, &*pool.insert(std::move(fields)).first };
+    }
+};
+
 // A storage location. A field path can name the slot itself or a field
 // containing it, e.g. the array when the slot is one of its elements.
 struct RefPlace {
@@ -717,9 +766,7 @@ struct RefPlace {
     string_view path;
     bool nullonly = false;  // No pointee on this path. The default is an unknown place.
     bool enclosing = false;
-    // All alternatives lie in the copied prefix of this frame object.
-    // A parameter class makes this conditional on the storage passed at the call.
-    VarDef *prefix = nullptr;
+    WriteRegions regions;
 
     RefPlace WithoutPath() const {
         auto part = *this;
@@ -735,13 +782,13 @@ struct RefPlace {
         return part;
     }
 
-    RefPlace Common(const RefPlace &other) const {
+    RefPlace Common(const RefPlace &other, WriteRegionPool &pool) const {
         if (nullonly) return other;
         if (other.nullonly) return *this;
         RefPlace common;
         common.location.intail = location.intail && other.location.intail;
         if (location.param == other.location.param) common.location.param = location.param;
-        if (prefix == other.prefix) common.prefix = prefix;
+        common.regions = regions.Join(other.regions, pool);
         if (base && base == other.base) {
             common.base = base;
             common.path = path;
@@ -2531,12 +2578,12 @@ struct RetRoot {
                RelativeStore::SameSet(resultlinks, other.resultlinks, how);
     }
 
-    void Include(const RetRoot &other) {
+    void Include(const RetRoot &other, WriteRegionPool &pool) {
         elementlinks.Include(other.elementlinks);
         for (auto &link : other.resultlinks) link.AddTo(resultlinks);
         if (!other.set) return;
         alts.Add(other.alts);
-        place = set ? place.Common(other.place) : other.place;
+        place = set ? place.Common(other.place, pool) : other.place;
         heldparam = !set || heldparam == other.heldparam ? other.heldparam : -1;
         writable &= other.writable;
         byteview |= other.byteview;
@@ -2687,10 +2734,10 @@ struct FnRecord {
         TypeExpr *type;
         Roots owners;
         RefPlace place;
-        void AddTo(vector<InterruptedAssign> &all) const {
+        void AddTo(vector<InterruptedAssign> &all, WriteRegionPool &pool) const {
             for (auto &a : all) if (a.lval == lval) {
                 a.owners.Add(owners);
-                a.place = a.place.Common(place);
+                a.place = a.place.Common(place, pool);
                 return;
             }
             all.push_back(*this);
@@ -3068,6 +3115,7 @@ struct Ast {
     // interned here: the lexer delivers their parts as separate tokens.
     map<string_view, Namespace> namespaces;
     deque<string> interned;
+    WriteRegionPool writeregions;
 
     // Shared instances of the primitive types.
     TypeExpr *inttypes[IS_VARINT + 1];

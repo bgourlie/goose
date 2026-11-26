@@ -1002,7 +1002,7 @@ inline TypeCheck::FlowState TypeCheck::JoinFlow(const FlowState &a, const FlowSt
                     (a.reachable && aa.maybeassigned) || (b.reachable && bb.maybeassigned),
                     narrow(aa.narrowed, bb.narrowed),
                     !a.reachable ? bb.refplace : !b.reachable ? aa.refplace
-                                                              : aa.refplace.Common(bb.refplace) };
+                                                              : aa.refplace.Common(bb.refplace, ast.writeregions) };
     }
     // A global stays narrowed where every reachable side narrowed it.
     if (!a.reachable) joined.globals = b.globals;
@@ -1191,8 +1191,8 @@ inline Val TypeCheck::MergeVals(const Val &a, bool areach, const Val &b, bool br
         v.contents = ContentsOf(a);
         v.contents.Add(ContentsOf(b));
     }
-    if (v.type && v.type->kind == TY_REF) v.refplace = a.refplace.Common(b.refplace);
-    if (v.type && v.type->kind == TY_SLICE) v.sliceplace = a.sliceplace.Common(b.sliceplace);
+    if (v.type && v.type->kind == TY_REF) v.refplace = a.refplace.Common(b.refplace, ast.writeregions);
+    if (v.type && v.type->kind == TY_SLICE) v.sliceplace = a.sliceplace.Common(b.sliceplace, ast.writeregions);
     v.elementlinks = a.elementlinks;
     v.elementlinks.Include(b.elementlinks);
     v.TakeAlts(a);
@@ -2534,7 +2534,7 @@ inline vector<FnRecord::InterruptedAssign> TypeCheck::CheckExitScopes(
     if (!reachable) return {};
     for (auto r = cur.rebuild; r && first < r->depth; r = r->outer) {
         auto place = StoragePlace(r->receiver, r->type, r->receiver.place);
-        FnRecord::InterruptedAssign { r->lval, r->type, r->receiver, place }.AddTo(interrupted);
+        FnRecord::InterruptedAssign { r->lval, r->type, r->receiver, place }.AddTo(interrupted, ast.writeregions);
     }
     RunExitDefers(first, interrupted);
     if (!reachable) return {};
@@ -2607,7 +2607,8 @@ inline void TypeCheck::RecordStorageWrite(FnRecord::StorageWrite write, Defer *e
         if (!executing) return;
         // A named frame object's fixed prefix is copied before defers run.
         auto t = write.root->type;
-        if (write.place.prefix == write.root && t && t->kind == TY_STRUCT && GetStructInst(t)->frameobj) return;
+        auto region = write.place.regions.Find(write.root);
+        if (region && region->copied && t && t->kind == TY_STRUCT && GetStructInst(t)->frameobj) return;
         deferwrites[executing].insert(write.root);
         return;
     }
