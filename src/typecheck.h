@@ -2683,6 +2683,10 @@ struct TypeCheck {
     vector<EnvRead> DeferBindings(Defer *d);
     static void CalledSpecs(Node *n, vector<FnSpec *> &to);
     static Roots OwnersAtPlace(const Roots &storage, const RefPlace &place);
+    bool SameStorageWrite(const FnRecord::StorageWrite &a, const FnRecord::StorageWrite &b) {
+        return a.root == b.root && a.exact == b.exact && a.indirect == b.indirect &&
+               a.place == b.place && TypeEq(a.type, b.type);
+    }
     void RecordStorageWrite(FnRecord::StorageWrite write, Defer *executing = nullptr);
     void NoteStorageWrite(const Roots &storage, TypeExpr *type, const RefPlace &place, bool canwrite);
     void NoteStorageWrite(const Roots &storage, TypeExpr *type, const RefPlace &place = {}) {
@@ -2810,7 +2814,8 @@ struct TypeCheck {
                        const RefPlace *place = nullptr);
     bool KilledFor(VarDef *c, VarDef *base, TypeExpr *t, TypeExpr *arr, size_t &since,
                    bool relative = false, TypeExpr *replaced = nullptr);
-    TypeExpr *KillPartType(const Kill &k);
+    TypeExpr *FieldPathType(VarDef *base, string_view path);
+    TypeExpr *KillPartType(const Kill &k) { return FieldPathType(k.base, k.path); }
     void ApplyLinkKill(const Kill &k);
     bool KillNamesType(const Kill &k, TypeExpr *target) {
         auto part = KillPartType(k);

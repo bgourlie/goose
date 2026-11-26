@@ -1043,14 +1043,15 @@ inline Val TypeCheck::CheckValue(Node *&n, TypeExpr *expected, bool callsite, bo
     // materialized separately reaches the destination only on completion.
     auto literal = construction && construction->literal && (Is<StructLit>(n) || Is<ArrayLit>(n)) &&
                    (!expected || expected->kind == TY_VOID || BuiltInPlace(expected));
-    auto forwards = construction && (literal || run || IsBranchConstruct(n) || Is<Call>(n));
+    auto branch = IsBranchConstruct(n);
+    auto forwards = construction && (literal || run || branch || Is<Call>(n));
     Saved writing(curdst.construction, forwards ? construction : nullptr);
     // Each branch delivers the whole value on its own path. For a leaf,
     // keep stores from the start of its construction; a call refines that
     // boundary after its arguments. Never pass a whole overwrite to a field.
     std::optional<Kill> delivery;
     auto replacement = cur.probingtypes ? nullptr : curdst.replacement;
-    if (replacement && !IsBranchConstruct(n)) {
+    if (replacement && !branch) {
         delivery = *replacement;
         delivery->at = storeevents.size();
         replacement = Is<Call>(n) ? &*delivery : nullptr;
@@ -1066,10 +1067,10 @@ inline Val TypeCheck::CheckValue(Node *&n, TypeExpr *expected, bool callsite, bo
             construction->started = true;
     }
     if (delivery && reachable && v.HasResultType()) NoteOverwrite(std::move(*delivery));
-    // A branch delivers its value before its scope's defers run. An array
-    // literal built here has already recorded its count and each element;
-    // an empty run writes only the count.
-    if (construction && v.HasResultType() && reachable && !((literal || run) && Is<ArrayLit>(orig)))
+    // Branches forward the destination to their values, and an in-place
+    // array literal records its count and each element as it builds them.
+    // Other values write the slot on delivery, before the scope's defers.
+    if (construction && v.HasResultType() && reachable && !branch && !((literal || run) && Is<ArrayLit>(orig)))
         construction->started = true;
     // An argument's casts are its call's to judge (JudgeCallCasts).
     if (!callsite) JudgeCastAt(orig, expected && expected->kind != TY_VOID ? expected : nullptr, v);

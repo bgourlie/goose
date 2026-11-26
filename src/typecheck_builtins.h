@@ -1767,17 +1767,17 @@ inline bool TypeCheck::KilledFor(VarDef *c, VarDef *base, TypeExpr *t, TypeExpr 
     return emptied(t, "") && since != SIZE_MAX;
 }
 
-// The type of the part kill k emptied, null where its path names no field.
-inline TypeExpr *TypeCheck::KillPartType(const Kill &k) {
-    auto t = OwnerType(k.base);
+// The type of an inline field path, null where it names no such field.
+inline TypeExpr *TypeCheck::FieldPathType(VarDef *base, string_view path) {
+    auto t = OwnerType(base);
     if (!t) return nullptr;
     if (t->kind == TY_REF) t = t->ref->sub;
     t = LoadType(t);
     size_t at = 0;
-    while (at < k.path.size()) {
-        auto end = k.path.find('.', at + 1);
-        if (end == string::npos) end = k.path.size();
-        auto name = string_view(k.path).substr(at + 1, end - at - 1);
+    while (at < path.size()) {
+        auto end = path.find('.', at + 1);
+        if (end == string_view::npos) end = path.size();
+        auto name = path.substr(at + 1, end - at - 1);
         at = end;
         if (t->kind != TY_STRUCT) return nullptr;
         auto inst = GetStructInst(t);

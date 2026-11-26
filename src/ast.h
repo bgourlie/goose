@@ -2577,6 +2577,7 @@ struct FnRecord {
         VarDef *root;
         TypeExpr *type;
         bool exact, indirect;
+        RefPlace place;  // A field of the owner or of a particular argument.
     };
     vector<StorageWrite> storagewrites;
     enum class ResultWrite { Count, Storage };

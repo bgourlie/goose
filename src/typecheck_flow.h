@@ -2604,13 +2604,22 @@ inline void TypeCheck::RecordStorageWrite(FnRecord::StorageWrite write, Defer *e
     auto spec = CurRealFrame().spec;
     if (!spec || !write.root || write.root->isglobal || IsTemp(write.root)) return;
     if (!cur.deferring && write.root->ownerspec == spec) {
-        if (executing) deferwrites[executing].insert(write.root);
+        if (!executing) return;
+        // A named frame object's fixed prefix is copied before defers run.
+        // A path into its elements ends at the resizable array, even when
+        // the particular element being written is itself fixed-size.
+        auto t = write.root->type;
+        if (write.place.base == write.root && !write.place.path.empty() &&
+            t && t->kind == TY_STRUCT && GetStructInst(t)->frameobj) {
+            auto field = FieldPathType(write.root, write.place.path);
+            if (field && ClassOf(field) == SC_FIXED) return;
+        }
+        deferwrites[executing].insert(write.root);
         return;
     }
     auto &writes = cur.deferring ? cur.deferring->writes : spec->record.storagewrites;
     for (auto &w : writes)
-        if (w.root == write.root && w.exact == write.exact && w.indirect == write.indirect &&
-            TypeEq(w.type, write.type)) return;
+        if (SameStorageWrite(w, write)) return;
     writes.push_back(write);
 }
 
@@ -2620,11 +2629,11 @@ inline void TypeCheck::NoteStorageWrite(const Roots &storage, TypeExpr *type, co
     for (auto &a : OwnersAtPlace(storage, place).alts) {
         if (!a.root || a.root->isglobal) continue; // No global can point into the local result.
         if (a.exact || IsClassRoot(a.root)) {
-            RecordStorageWrite({ a.root, type, a.exact, !a.exact && a.from == a.root });
+            RecordStorageWrite({ a.root, type, a.exact, !a.exact && a.from == a.root, place });
         } else {
             // A lifetime bound can cover more than one storage owner.
             auto candidates = RootCandidates(type, Depth(a.root), false, true, true);
-            for (auto &c : candidates.alts) RecordStorageWrite({ c.root, type, c.exact, false });
+            for (auto &c : candidates.alts) RecordStorageWrite({ c.root, type, c.exact, false, {} });
         }
     }
 }
@@ -2667,7 +2676,10 @@ inline void TypeCheck::ApplyCalleeWrites(FnSpec *spec, const vector<Val> &args) 
                     for (auto &a : roots.alts) a.from = a.root;
             }
         }
-        NoteStorageWrite(roots, w.type);
+        // A write through a stored reference follows its pointee. The
+        // caller's field holding that reference does not locate the write.
+        auto place = w.indirect ? RefPlace {} : CallerPlace(w.place, spec, args);
+        NoteStorageWrite(roots, w.type, place);
     }
 }
 

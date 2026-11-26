@@ -91,6 +91,10 @@ fn moved_slice(in_helper: bool) -> i64[] {
 fn stop() -> i64 { abort("stop"); }
 fn stopped_array() -> i64[] { abort("stop"); }
 fn stopped_empty() -> i64[] { defer { abort("stop"); } return []; }
+fn stopped_empty_branches(flag: bool) -> i64[] {
+    defer { abort("stop"); }
+    return if flag { block { [] } } else { loop { break []; } };
+}
 fn stopped_first() -> i64[] { [stop()] }
 fn forward_stopped() -> i64[] { stopped_first() }
 fn stopped_local(n: i64) -> i64[] {
@@ -145,6 +149,7 @@ fn stopped_builtin(flag: bool) -> i64[>..] {
     defer { if flag { alias.append(numbers(stop())); } }
     defer { if flag { alias.append(stopped_array()); } }
     defer { if flag { alias.append(stopped_empty()); } }
+    defer { if flag { alias.append(stopped_empty_branches(flag)); } }
     defer { if flag { alias.append(forward_stopped()); } }
     defer { if flag { alias.append(stopped_local(7)); } }
     defer { if flag { alias.append(if flag { numbers(stop()) } else { numbers() }); } }
@@ -185,6 +190,26 @@ inline fn copied_growable() -> i64[>..<] {
     let first .= source[0];
     defer { first++; }
     return source;
+}
+
+struct Bag { count: i64, items: i64[>..] }
+struct Envelope { serial: i64, bag: Bag }
+
+fn update_bag(bag: Bag&) { increment(bag.count); }
+fn update_envelope(box: Envelope&) { update_bag(box.bag); }
+
+fn copied_fields() -> Envelope {
+    var box = Envelope { serial: 5, bag: Bag { count: 7, items: [42] } };
+    let serial .= box.serial;
+    let count .= box.bag.count;
+    let alias .= box;
+    defer {
+        serial++;
+        increment(count);
+        update_envelope(alias);
+        assert(serial == 6 && count == 9);
+    }
+    return box;
 }
 
 struct Small { value: i64 }
@@ -247,6 +272,8 @@ fn main() {
     assert(copied_source()[0] == 41);
     let copied: i64[>..<] = copied_growable();
     assert(copied[0] == 41);
+    let box = copied_fields();
+    assert(box.serial == 5 && box.bag.count == 7 && box.bag.items[0] == 42);
     assert(stopped_aggregate(false)[0].value == 42);
     slot = read_before_store();
     assert(slot == 42);

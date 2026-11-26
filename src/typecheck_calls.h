@@ -3099,8 +3099,7 @@ inline bool TypeCheck::SameRecord(const FnRecord &a, const FnRecord &b, const Fn
     if (a.storagewrites.size() != b.storagewrites.size() ||
         !is_permutation(a.storagewrites.begin(), a.storagewrites.end(), b.storagewrites.begin(),
             [&](const auto &p, const auto &q) {
-                return p.root == q.root && p.exact == q.exact && p.indirect == q.indirect &&
-                       sametype(p.type, q.type);
+                return SameStorageWrite(p, q);
             })) return why("storage writes");
     if (!RelativeStore::SameSet(a.relativestores, b.relativestores, Roots::Compare::Cycle))
         return why("relative destinations");
