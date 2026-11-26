@@ -880,11 +880,12 @@ struct Val : Prov {
     RefPlace sliceplace; // Storage containing the viewed elements, independent of the slice slot.
     TypeExpr *type = nullptr;
     ConstKind ck = CK_NONE;
-    int64_t ival = 0;
     bool uns = false;            // CK_INT: ival's bits are a u64 above i64.max.
-    double fval = 0;
     bool strlit = false;         // String literal: adaptable to u8 array types.
     bool emptyarr = false;       // [] with as yet unknown element type.
+    bool intactprefix = false;   // Every previously addressable slot is still live (§5.3).
+    int64_t ival = 0;
+    double fval = 0;
     // Where a value holds self-relative links and which targets may survive
     // a shrink or a change of layout (§3.9, §5.1).
     ValueLinks elementlinks;
@@ -1014,6 +1015,7 @@ struct Val : Prov {
         if (from.type && from.type->kind == TY_REF) refplace = from.refplace;
         if (from.type && from.type->kind == TY_SLICE) sliceplace = from.sliceplace;
         elementlinks = from.elementlinks;
+        intactprefix = from.intactprefix;
         contents = from.contents;
         holderset = from.holderset;
         holderfrom = from.holderfrom;
@@ -2124,6 +2126,7 @@ struct VarDef {
     bool assigned = false;
     bool maybeassigned = false;
     TypeExpr *narrowed = nullptr;  // T? narrowed to T& in the current region.
+    bool intactprefix = false;      // No previously addressable limited-array slot has been dropped.
     bool captured = false;         // Accessed from a nested fn / function value.
     // The first comparison relying on the variable being non-negative
     // (§6.1), and the first writable reference bound to it (§4.4), whichever
@@ -2594,6 +2597,7 @@ struct RetRoot {
     bool writable = true;      // Writable only where every return is (§9.5).
     bool byteview = false;
     bool freshview = false;    // Prov::freshview.
+    std::optional<bool> intactprefix; // Whether all completing limited-array results preserve their slots.
     ValueLinks elementlinks; // Any return may give an array with Val::elementlinks.
     vector<RelativeStore> resultlinks; // Links written into a result that reaches its caller.
     bool set = false;          // A return supplied provenance, including a known null.
@@ -2608,11 +2612,13 @@ struct RetRoot {
                writable == other.writable && byteview == other.byteview &&
                freshview == other.freshview &&
                heldparam == other.heldparam && elementlinks == other.elementlinks &&
+               intactprefix == other.intactprefix &&
                RelativeStore::SameSet(resultlinks, other.resultlinks, how);
     }
 
     void Include(const RetRoot &other, WriteRegionPool &pool) {
         elementlinks.Include(other.elementlinks);
+        if (other.intactprefix) intactprefix = intactprefix.value_or(true) && *other.intactprefix;
         for (auto &link : other.resultlinks) link.AddTo(resultlinks);
         if (!other.set) return;
         alts.Add(other.alts);
@@ -2665,10 +2671,15 @@ struct FnRecord {
     // Storage a write through a parameter or capture may change (§6.6).
     // An indirect write follows a stored reference out of the argument.
     struct StorageWrite {
+        // PrefixOnly invalidates the prefix proof before an in-place
+        // replacement can start. Deferred-write diagnostics need a write
+        // that was actually reached.
+        enum Effect { Storage, MayDropSlots, PrefixOnly };
         VarDef *root;
         TypeExpr *type;
         bool exact, indirect;
         RefPlace place;  // A field of the owner or of a particular argument.
+        Effect effect;
     };
     vector<StorageWrite> storagewrites;
     enum class ResultWrite { Count, Storage };

@@ -276,6 +276,7 @@ struct TypeCheck {
         bool maybeassigned = false;
         TypeExpr *narrowed = nullptr;
         RefPlace refplace;
+        bool intactprefix = false;
         bool operator==(const VarFlow &) const = default;
     };
     struct FlowEntry {
@@ -2729,10 +2730,12 @@ struct TypeCheck {
     static Roots OwnersAtPlace(const Roots &storage, const RefPlace &place);
     bool SameStorageWrite(const FnRecord::StorageWrite &a, const FnRecord::StorageWrite &b) {
         return a.root == b.root && a.exact == b.exact && a.indirect == b.indirect &&
-               a.place == b.place && TypeEq(a.type, b.type);
+               a.place == b.place && a.effect == b.effect && TypeEq(a.type, b.type);
     }
     void RecordStorageWrite(FnRecord::StorageWrite write, Defer *executing = nullptr);
-    void NoteStorageWrite(const Roots &storage, TypeExpr *type, const RefPlace &place, bool canwrite);
+    using StorageWrite = FnRecord::StorageWrite;
+    void NoteStorageWrite(const Roots &storage, TypeExpr *type, const RefPlace &place, bool canwrite,
+                          StorageWrite::Effect effect = StorageWrite::MayDropSlots);
     void NoteStorageWrite(const Roots &storage, TypeExpr *type, const RefPlace &place = {}) {
         NoteStorageWrite(storage, type, place, reachable);
     }

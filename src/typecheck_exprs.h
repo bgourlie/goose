@@ -1440,7 +1440,7 @@ inline bool TypeCheck::FitsAt(Val &v, TypeExpr *dt, bool delivered) {
                               "reference still names (§5.2)");
                 return false;
             }
-            if (IsArrayKind(t, A_LIMITED) && v.elementlinks.MayPointForward()) {
+            if (IsArrayKind(t, A_LIMITED) && !v.intactprefix && v.elementlinks.MayPointForward()) {
                 fitfail = cat("cannot construct ", TypeStr(dt), " from ", TypeStr(t),
                               ": a self-relative link may name a slot beyond the live length "
                               "that the conversion would discard (§5.3)");
@@ -1454,6 +1454,7 @@ inline bool TypeCheck::FitsAt(Val &v, TypeExpr *dt, bool delivered) {
                 links.Include(link, path, target);
             }
             v.elementlinks = std::move(links);
+            v.intactprefix = false;
             v.type = dt;
             return true;
         }

@@ -111,6 +111,7 @@ inline Val Ident::Check(TypeCheck &tc, TypeExpr *) {
             if (!vd->istemp) v.refplace = tc.OwnedPlace(vd);
             v.byteview = vd->contentbyteview;
             v.elementlinks = tc.LiveElementLinks(vd);
+            v.intactprefix = vd->intactprefix && vd->ownerspec && vd->ownerspec == tc.CurRealFrame().spec;
             v.writable = !vd->copybind && !(vd->type && vd->type->cq);
             v.reusable = vd->reusable;
             v.nonneg = vd->nonneg;
@@ -194,6 +195,7 @@ inline Val ArrayLit::Check(TypeCheck &tc, TypeExpr *expected) {
                            "capacity; it needs a T[..] destination");
         if (tc.curdst.construction && tc.reachable) tc.curdst.construction->started = true;
         v.type = expected;
+        v.intactprefix = true; // Reserved slots have never been addressable.
         return v;
     }
     // Whether each element adapts as a literal would (Val::litelems).
@@ -281,6 +283,7 @@ inline Val ArrayLit::Check(TypeCheck &tc, TypeExpr *expected) {
             tc.Error(this, cat("fill count ", cnt, " exceeds the capacity of ",
                                tc.TypeStr(expected)));
         v.type = expected && expected->kind == TY_ARRAY ? expected : natural(cnt);
+        v.intactprefix = IsArrayKind(v.type, A_LIMITED);
         if (atslice) tc.NoTemporaryLiteral(this, v.type);
         v.Set(tc.TempRoot(), false);
         tc.HolderFromLit(v, deep);
@@ -314,6 +317,7 @@ inline Val ArrayLit::Check(TypeCheck &tc, TypeExpr *expected) {
                            tc.TypeStr(expected)));
     v.type = expected && expected->kind == TY_ARRAY ? expected
                                                     : natural((int64_t)elems.size());
+    v.intactprefix = IsArrayKind(v.type, A_LIMITED);
     if (atslice) {
         // A literal in slice position materializes a temporary fixed array.
         tc.NoTemporaryLiteral(this, v.type);

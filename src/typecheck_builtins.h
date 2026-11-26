@@ -692,7 +692,8 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
         }
     }
     // Ordinary builtin stores follow evaluation of all their operands.
-    if (d.flags & BF_WRITE) NoteStorageWrite(rv, recvarr, rv.refplace, reachable || writesduringargs);
+    if (d.flags & BF_WRITE) NoteStorageWrite(rv, recvarr, rv.refplace, reachable || writesduringargs,
+                                             d.flags & BF_SHRINKS ? StorageWrite::MayDropSlots : StorageWrite::Storage);
     // Popping the current length empties either kind of array. Both
     // receiver expressions must name the same stable storage.
     if (d.kind == B_POP_N) {

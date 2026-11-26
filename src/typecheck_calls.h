@@ -3704,6 +3704,7 @@ inline void TypeCheck::FinishReturn(int tf, const vector<Val> &vals, Node *at) {
         auto rt = tspec->rets[i];
         auto &rr = results[i];
         rr.elementlinks = vals[i].elementlinks;
+        if (IsArrayKind(rt, A_LIMITED)) rr.intactprefix = vals[i].intactprefix;
         auto isrs = IsRefOrSlice(rt);
         auto holder = !isrs && HoldsPlainRef(rt);
         if (!isrs && !holder) continue;
@@ -3954,6 +3955,7 @@ inline Val TypeCheck::CallResult(Call *c, FnSpec *spec, vector<Val> &argvals) {
             v.writable = false;
         }
         v.elementlinks = ri.elementlinks;
+        v.intactprefix = ri.intactprefix.value_or(false) && !spec->inprogress;
         lastcallrets.push_back(v);
     }
     if (spec->rets.empty()) return VoidVal();
