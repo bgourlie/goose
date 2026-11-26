@@ -404,7 +404,7 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
             Error(c, cat(".move_from takes a slice of ", TypeStr(elem), ", got ", TypeStr(sv.type)));
         if (HasRelRefT(elem))
             Error(c, ".move_from cannot copy elements containing self-relative references");
-        NoteStorageWrite(rv, elem, rv.refplace);
+        NoteStorageWrite(rv, elem, rv.ElementPlace());
         AppendedCopies(args[1], sv, elem, rv);
         return VoidVal();
     }
@@ -471,8 +471,7 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
         for (size_t i = 1; i < args.size(); i++) CheckPrintable(c, d.name, args, i, &rv);
         return VoidVal();
     }
-    auto elementplace = recvarr ? rv.refplace.Inside(ak == A_GROW)
-                                : rv.type && rv.type->kind == TY_SLICE ? rv.sliceplace : RefPlace {};
+    auto elementplace = rv.ElementPlace();
     auto elementdest = [&] {
         Dest dest(rv, elementplace);
         dest.fill = d.kind == B_RESIZE;
@@ -2093,11 +2092,7 @@ inline RefPlace TypeCheck::ArgumentPlace(FnSpec *spec, VarDef *param, const vect
     if (it == spec->params.end() || index >= args.size()) return {};
     auto &arg = args[index];
     auto pt = param->type;
-    if (pt->kind == TY_SLICE) {
-        auto t = IsPlainRef(arg.type) ? arg.type->ref->sub : arg.type;
-        if (t->kind == TY_ARRAY) return arg.refplace.Inside(IsArrayKind(t, A_GROW));
-        return arg.type->kind == TY_SLICE ? arg.sliceplace : RefPlace {};
-    }
+    if (pt->kind == TY_SLICE) return arg.ElementPlace();
     return IsAddressRef(pt) ? StoragePlace(arg, pt->ref->sub, arg.refplace) : RefPlace {};
 }
 

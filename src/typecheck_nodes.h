@@ -529,6 +529,7 @@ inline Val Call::Check(TypeCheck &tc, TypeExpr *expected) {
     // result in this activation already. Builtins describe it by result kind.
     if (spec || !dispatch.empty() || fvbody) return v;
     if (builtin < 0 || BuiltinByKind(builtin).rets[0] != 'r') v.refplace = {};
+    if (builtin == B_DEFAULT && IsOptional(v.type)) v.refplace.nullonly = true;
     if (builtin < 0 || BuiltinByKind(builtin).rets[0] != 's') v.sliceplace = {};
     for (auto &r : tc.lastcallrets) {
         r.refplace = {};

@@ -2121,9 +2121,7 @@ inline void TypeCheck::CheckFor(ForLoop *x) {
             // An element that is itself a reference binds as the one it holds
             // either way, there being no references to references (§3.8).
             if (byref && elem->kind != TY_REF) {
-                if (t->kind == TY_ARRAY) {
-                    elementplace = iv.refplace.Inside(IsArrayKind(t, A_GROW));
-                } else if (iv.type->kind == TY_SLICE) elementplace = iv.sliceplace;
+                elementplace = iv.ElementPlace();
                 bindtype = ast.RefTo(elem, x->line);
             } else {
                 // An element that *is* a relative reference loads as a
@@ -2622,10 +2620,13 @@ inline void TypeCheck::NoteStorageWrite(const Roots &storage, TypeExpr *type, co
 
 inline void TypeCheck::ApplyCalleeWrites(FnSpec *spec, const vector<Val> &args) {
     if (!hasdefers || !reachable) return;
+    auto writtenplace = [&](size_t p) {
+        return spec->argtypes[p]->kind == TY_SLICE ? args[p].ElementPlace() : args[p].refplace;
+    };
     if (spec->sf->isextern) {
         for (size_t p = 0; p < args.size() && p < spec->argtypes.size(); p++) {
             auto t = spec->argtypes[p];
-            if (IsRefOrSlice(t) && !t->cq) NoteStorageWrite(args[p], PointeeOf(t), args[p].refplace);
+            if (IsRefOrSlice(t) && !t->cq) NoteStorageWrite(args[p], PointeeOf(t), writtenplace(p));
         }
         return;
     }
@@ -2637,11 +2638,13 @@ inline void TypeCheck::ApplyCalleeWrites(FnSpec *spec, const vector<Val> &args) 
         // write to an argument where that formal alone names the class.
         bool view = false;
         auto p = ClassParam(spec, w.root, view);
-        if (!roots.Exact() && !view && p >= 0 && (size_t)p < args.size() && IsAddressRef(spec->argtypes[p]) &&
-            spec->params[p]->ref.Root() == w.root &&
-            count_if(spec->params.begin(), spec->params.end(),
-                     [&](VarDef *v) { return v->ref.Root() == w.root; }) == 1)
-            roots = OwnersAtPlace(roots, args[p].refplace);
+        if (!roots.Exact() && !view && p >= 0 && (size_t)p < args.size() && IsRefOrSlice(spec->argtypes[p]) &&
+            spec->params[p]->ref.Root() == w.root) {
+            auto sameclass = [&](const RootArg &r) { return r.cls == spec->roots[p].cls; };
+            if (count_if(spec->roots.begin(), spec->roots.end(), sameclass) == 1 &&
+                none_of(spec->views.begin(), spec->views.end(), sameclass))
+                roots = OwnersAtPlace(roots, writtenplace(p));
+        }
         if (!w.exact) {
             auto owner = HolderSource(roots);
             Roots contents;

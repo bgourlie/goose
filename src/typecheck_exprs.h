@@ -1444,7 +1444,12 @@ inline bool TypeCheck::FitsAt(Val &v, TypeExpr *dt, bool delivered) {
                            (v.writable || !StaticCanContain(t->ref->sub));
                 };
                 Roots links;
-                for (auto &a : v.alts) if (!nullalt(a)) links.Add(a);
+                if (!v.refplace.nullonly) {
+                    for (auto &a : v.alts) if (!nullalt(a)) links.Add(a);
+                    // A rebind uses this same proof to clear writes made by
+                    // its operand. An unresolved root is still provisional.
+                    if (links.None() && !v.None() && !v.unknown) v.refplace.nullonly = true;
+                }
                 // A reference that points nowhere yet (RefProvOf), or a
                 // location reached through one, is read again once it does.
                 if (!delivered || links.None() || (!dt->ref->pool && curdst.unknown)) {

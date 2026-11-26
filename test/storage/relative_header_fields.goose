@@ -10,6 +10,11 @@ fn reset(header: Header&) { header.first .= null; }
 fn linked(node: Node&) -> Header { Header { first: node } }
 fn forward(node: Node&) -> Header { linked(node) }
 
+fn reset_to_default(list: List&) -> Node&? {
+    list.header.first .= list.nodes[0];
+    return default<Node&?>();
+}
+
 var shared = List { header: Header {}, nodes: [] };
 export fn add_shared() {
     shared.nodes.push(Node { value: 5 });
@@ -25,6 +30,15 @@ fn main() {
     list.header.first .= list.nodes[0];
     list.header.first .= null;
     list.nodes.clear();
+    for indirect in [false, true] {
+        list.nodes.push(Node { value: 1 });
+        if indirect { list.header.first .= reset_to_default(list); }
+        else {
+            list.header.first .= block { list.header.first .= list.nodes[0]; default<Node&?>() };
+        }
+        assert(list.header.first == null);
+        list.nodes.clear();
+    }
     list.nodes.push(Node { value: 3 });
     list.header = Header { second: list.nodes[0] };
     list.header.second .= null;

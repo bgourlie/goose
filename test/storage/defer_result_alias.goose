@@ -2,6 +2,7 @@ struct Item { counter: i64& }
 
 fn observe(items: Item[]&) { assert(items.len == 1); }
 fn increment(counter: i64&) { counter++; }
+fn increment_first(view: i64[:]) { view[0]++; }
 fn update(items: Item[]&) { increment(items[0].counter); }
 
 fn build(counter: i64&) -> Item[] {
@@ -76,10 +77,14 @@ fn moved_on_nonlocal_exit() -> i64[] {
 fn moved_slice(in_helper: bool) -> i64[] {
     var out: i64[] = [42];
     var spare: i64[] = [0];
+    let input: i64[1] = [10];
     var view: i64[:] = out[..];
     fn move() { view = spare[..]; }
     if in_helper { move(); } else { view = spare[..]; }
+    defer { assert(spare[0] == 12); }
+    defer increment_first(view);
     defer { view[0]++; }
+    defer { view.move_from(input[..]); }
     return out;
 }
 

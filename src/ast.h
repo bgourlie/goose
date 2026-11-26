@@ -930,6 +930,15 @@ struct Val : Prov {
 
     bool HasResultType() const { return type && type->kind != TY_VOID; }
 
+    // A whole array used as a slice views the elements inside that array.
+    // A reference to a slice slot alone says nothing about its elements.
+    RefPlace ElementPlace() const {
+        if (!type) return {};
+        auto t = IsPlainRef(type) ? type->ref->sub : type;
+        if (t->kind == TY_ARRAY) return refplace.Inside(IsArrayKind(t, A_GROW));
+        return type->kind == TY_SLICE ? sliceplace : RefPlace {};
+    }
+
     // The value delivered by one exit keeps its pointee or viewed elements,
     // and any links or references inside it. Its own storage is a new slot.
     void TakeResultProvenance(const Val &from) {
