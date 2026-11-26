@@ -56,6 +56,7 @@ inline Val SelfRef::Check(TypeCheck &tc, TypeExpr *) {
 inline Val StrLit::Check(TypeCheck &tc, TypeExpr *expected) {
     Val v;
     v.strlit = true;
+    v.extent.length = (int64_t)val.size();
     v.Set(nullptr, true);   // Static data owns what it holds.
     v.writable = false;
     if (expected) {
@@ -71,6 +72,7 @@ inline Val StrLit::Check(TypeCheck &tc, TypeExpr *expected) {
                 tc.Error(this, cat("string literal of length ", (int64_t)val.size(),
                                    " exceeds the capacity of ", tc.TypeStr(expected)));
             v.type = expected;
+            v.extent = tc.ConstructedExtent(expected, v.extent.length);
             return v;
         }
         if (expected->kind == TY_SLICE && IsU8(expected->sub)) {
@@ -188,7 +190,7 @@ inline Val ArrayLit::Check(TypeCheck &tc, TypeExpr *expected) {
     TypeCheck::LitDeep deep;
     if (capexpr) {
         // [..cap]: an empty limited array with a runtime capacity (§5.3).
-        tc.CheckIntAny(capexpr);
+        auto cap = tc.CheckIntAny(capexpr);
         if (!expected || expected->kind != TY_ARRAY ||
             expected->arr->akind != A_LIMITED || expected->arr->sizeexpr)
             tc.Error(this, "[..cap] constructs a limited array of construction-time "
@@ -196,6 +198,8 @@ inline Val ArrayLit::Check(TypeCheck &tc, TypeExpr *expected) {
         if (tc.curdst.construction && tc.reachable) tc.curdst.construction->started = true;
         v.type = expected;
         v.intactprefix = true; // Reserved slots have never been addressable.
+        v.extent.length = 0;
+        if (cap.ck == CK_INT && !cap.uns && !cap.constfrom) v.extent.capacity = cap.ival;
         return v;
     }
     // Whether each element adapts as a literal would (Val::litelems).
@@ -285,6 +289,7 @@ inline Val ArrayLit::Check(TypeCheck &tc, TypeExpr *expected) {
                                tc.TypeStr(expected)));
         v.type = expected && expected->kind == TY_ARRAY ? expected : natural(cnt);
         v.intactprefix = IsArrayKind(v.type, A_LIMITED);
+        v.extent = tc.ConstructedExtent(v.type, cnt);
         if (atslice) tc.NoTemporaryLiteral(this, v.type);
         v.Set(tc.TempRoot(), false);
         tc.HolderFromLit(v, deep);
@@ -295,6 +300,7 @@ inline Val ArrayLit::Check(TypeCheck &tc, TypeExpr *expected) {
         // [] adapts to any array type; callers re-check with an expected type
         // or report the missing context.
         v.emptyarr = true;
+        v.extent.length = 0;
         v.type = tc.ast.ArrayOf(tc.ast.voidtype, A_FIXED, line, 0);
         return v;
     }
@@ -319,6 +325,7 @@ inline Val ArrayLit::Check(TypeCheck &tc, TypeExpr *expected) {
     v.type = expected && expected->kind == TY_ARRAY ? expected
                                                     : natural((int64_t)elems.size());
     v.intactprefix = IsArrayKind(v.type, A_LIMITED);
+    v.extent = tc.ConstructedExtent(v.type, (int64_t)elems.size());
     if (atslice) {
         // A literal in slice position materializes a temporary fixed array.
         tc.NoTemporaryLiteral(this, v.type);

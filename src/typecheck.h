@@ -1101,6 +1101,13 @@ struct TypeCheck {
         return a->size;
     }
 
+    // A newly constructed limited array without an explicit reservation
+    // gets its capacity from its type or, for T[..], from its initial length.
+    ArrayExtent ConstructedExtent(TypeExpr *t, int64_t length) {
+        if (!IsArrayKind(t, A_LIMITED)) return { length };
+        return { length, t->arr->sizeexpr ? ArraySize(t->arr) : length };
+    }
+
     // What a type is that takes no bytes of a layout, though C has no empty
     // arrays or structs and gives it some (C.2): a fixed array, or a limited
     // one of static capacity, with no element slots, or a variant type with

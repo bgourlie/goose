@@ -1066,6 +1066,13 @@ struct ValueLinks {
 // literal fit and array sizes. Lives here because every node's Check
 // override returns one.
 enum ConstKind { CK_NONE, CK_INT, CK_FLT };
+// Counts known for an array expression on every path delivering its value.
+struct ArrayExtent {
+    int64_t length = -1, capacity = -1;
+    ArrayExtent Common(ArrayExtent other) const {
+        return { length == other.length ? length : -1, capacity == other.capacity ? capacity : -1 };
+    }
+};
 struct Val : Prov {
     // Storage denoted by an lvalue, or by a reference when non-null. A
     // copied value and a reference read back from a slot have no known place.
@@ -1077,6 +1084,7 @@ struct Val : Prov {
     bool strlit = false;         // String literal: adaptable to u8 array types.
     bool emptyarr = false;       // [] with as yet unknown element type.
     bool intactprefix = false;   // Every previously addressable slot is still live (§5.3).
+    ArrayExtent extent;
     int64_t ival = 0;
     double fval = 0;
     // Where a value holds self-relative links and which targets may survive
@@ -1209,6 +1217,7 @@ struct Val : Prov {
         if (from.type && from.type->kind == TY_SLICE) sliceplace = from.sliceplace;
         elementlinks = from.elementlinks;
         intactprefix = from.intactprefix;
+        extent = from.extent;
         contents = from.contents;
         holderset = from.holderset;
         holderfrom = from.holderfrom;
@@ -2326,7 +2335,8 @@ struct VarDef {
     bool assigned = false;
     bool maybeassigned = false;
     TypeExpr *narrowed = nullptr;  // T? narrowed to T& in the current region.
-    bool intactprefix = false;      // No previously addressable limited-array slot has been dropped.
+    bool intactprefix = false;      // Every previously addressable limited-array slot is currently live.
+    int64_t limitedcapacity = -1;   // Set at construction and independent of subsequent length changes.
     bool captured = false;         // Accessed from a nested fn / function value.
     // The first comparison relying on the variable being non-negative
     // (§6.1), and the first writable reference bound to it (§4.4), whichever

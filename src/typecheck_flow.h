@@ -1200,6 +1200,7 @@ inline Val TypeCheck::MergeVals(const Val &a, bool areach, const Val &b, bool br
     v.elementlinks = a.elementlinks;
     v.elementlinks.Include(b.elementlinks);
     v.intactprefix = a.intactprefix && b.intactprefix;
+    v.extent = a.extent.Common(b.extent);
     v.TakeAlts(a);
     v.Add(b);
     v.writable = a.writable && b.writable;
@@ -3037,6 +3038,7 @@ inline void TypeCheck::CheckVarDecl(VarDecl *vd, bool global) {
             Error(vd, "function values are compile-time only and cannot be stored (§7.6)");
         d->type = t;
         d->intactprefix = !global && IsArrayKind(t, A_LIMITED) && v && v->intactprefix;
+        if (IsArrayKind(t, A_LIMITED) && v) d->limitedcapacity = v->extent.capacity;
         if (global) CheckVarExtent(d, vd);
         if (v && IsRefOrSlice(t)) {
             BindRefProvenance(d, *v);
@@ -3335,7 +3337,19 @@ inline Val TypeCheck::CheckAssignedValue(Assign *a, TypeExpr *target, TypeExpr *
         Saved active(cur.rebuild, arr ? &r : cur.rebuild);
         v = CheckValueAt(a->rhs, target, dest);
     }
-    NoteStorageWrite(built, target, built.place, reachable || construction.started);
+    // Limited assignment keeps the destination's capacity. A complete
+    // replacement covering every slot establishes the live-prefix proof
+    // even if an earlier shrink lost it. An exit during the RHS cannot.
+    bool full = false;
+    if (reachable && IsArrayKind(target, A_LIMITED) && v.extent.length >= 0) {
+        auto owner = built.Exact() ? built.Root() : nullptr;
+        bool whole = owner && owner->type && TopConstEq(owner->type, target);
+        auto capacity = target->arr->sizeexpr ? ArraySize(target->arr) : whole ? owner->limitedcapacity : -1;
+        full = v.extent.length == capacity;
+        if (full && whole && owner->ownerspec == CurRealFrame().spec) owner->intactprefix = true;
+    }
+    NoteStorageWrite(built, target, built.place, reachable || construction.started,
+                     full ? StorageWrite::Storage : StorageWrite::MayDropSlots);
     if (arr && !built.None()) {
         CheckGrowsSince(base, built, cat("the value assigned to ", ExprStr(a->lval)), target);
         CheckBuiltUses(a->rhs, a->lval, target, built, arr);
