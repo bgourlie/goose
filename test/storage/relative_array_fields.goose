@@ -165,6 +165,13 @@ fn empty_limited_slots() {
     assert(x.slots.len == 0 && x.values.len == 0);
 }
 
+fn pop_all_nodes() {
+    var nodes: Node[>..] = [Node { refs: [] }, Node { refs: [] }];
+    nodes[0].refs.push(nodes[1]);
+    nodes.pop_n(nodes.len);
+    assert(nodes.len == 0);
+}
+
 fn flat_slot_view() {
     var x = Saved { values: [42] };
     x.slots[0].link .= x.values[0];
@@ -270,6 +277,7 @@ fn main() {
     replace_all_slots();
     released_slot_view();
     empty_limited_slots();
+    pop_all_nodes();
     flat_slot_view();
     replace_in_branches(0);
     replace_in_branches(1);
