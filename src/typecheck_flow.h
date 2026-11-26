@@ -2496,9 +2496,9 @@ inline void TypeCheck::ApplyLinkEffects(const LinkEffects &effects) {
     }
     // Timestamp surviving writes at execution. A subsequent assignment
     // must be able to discard them even on a second exit or loop pass.
-    for (auto &[part, at] : effects.writes.live) {
-        storeevents.push_back(storeevents[at]);
-        cur.links.Add(storeevents.back(), storeevents.size() - 1);
+    for (auto &[part, write] : effects.writes.live) {
+        storeevents.push_back(storeevents[write.at]);
+        cur.links.Add(storeevents.back(), storeevents.size() - 1, write.suffix);
     }
 }
 

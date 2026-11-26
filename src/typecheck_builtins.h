@@ -1410,7 +1410,7 @@ inline bool TypeCheck::RetainsRelativeSlot(TypeExpr *part, TypeExpr *array, Type
 // Consult only writes that reach this point. Captures and globals can
 // also carry links into a body from its caller, until a proven overwrite.
 inline ValueLinks TypeCheck::LiveElementLinks(VarDef *owner, TypeExpr *target, TypeExpr *replaced,
-                                              bool callerchecks) {
+                                              bool callerchecks, Node *shrink) {
     if (!owner->elementlinks) return {};
     auto storage = OwnerType(owner);
     auto t = storage ? LoadType(storage) : target;
@@ -1427,9 +1427,14 @@ inline ValueLinks TypeCheck::LiveElementLinks(VarDef *owner, TypeExpr *target, T
         auto named = !target && field.base == owner && !field.path.empty();
         links.Include(link, named ? ast.Intern(field.path) : string_view {});
     };
-    for (auto &[part, at] : cur.links.live) {
+    for (auto &[part, write] : cur.links.live) {
         if (part.owner != owner) continue;
-        if (storage && cleared && at < since) continue;
+        if (storage && cleared && write.at < since) continue;
+        if (shrink && write.suffix) {
+            Kill suffix { owner, part.field.base, string(*write.suffix), 0, true };
+            auto array = KillPartType(suffix);
+            if (array && !MayViewLimitedSlot(suffix, array, shrink)) continue;
+        }
         retain(part.link, part.field);
     }
     auto spec = CurRealFrame().spec;
@@ -1686,15 +1691,18 @@ inline void TypeCheck::NoteOverwrite(Node *lval, const Roots &loc, size_t at, Ty
 // A limited array keeps its capacity slots across assignment (§5.3). Once
 // the live count changes, the old suffix can only be observed through an
 // existing view of an element or one of its parts.
-inline bool TypeCheck::MayViewLimitedSlot(const Kill &part, TypeExpr *array) {
+inline bool TypeCheck::MayViewLimitedSlot(const Kill &part, TypeExpr *array, Node *shrink) {
     auto owner = part.container;
     if (!owner || owner->isglobal || !owner->type || owner->ownerspec != CurRealFrame().spec)
         return true;  // The caller may hold such a view.
     // Old links inside this array cannot make their own removed slots
     // reachable. Newly constructed links and links in siblings can.
-    for (auto &[slot, at] : cur.links.live)
-        if (slot.owner == owner && !(at < part.at && slot.field.Within(part.base, part.path)) &&
-            LinkMayReachElements(array, slot.link.pointee)) return true;
+    for (auto &[slot, write] : cur.links.live) {
+        if (slot.owner != owner || !LinkMayReachElements(array, slot.link.pointee)) continue;
+        if (slot.field.Within(part.base, part.path) &&
+            (write.at < part.at || write.suffix == part.path)) continue;
+        return true;
+    }
     auto aliases = [&](const Roots &roots) {
         return roots.Unknown() || roots.Any([&](const RootAlt &a) {
             return a.root == owner || (!a.exact && Depth(a.root) >= Depth(owner));
@@ -1710,6 +1718,17 @@ inline bool TypeCheck::MayViewLimitedSlot(const Kill &part, TypeExpr *array) {
         auto sub = PointeeOf(t);
         return HoldsPlainRef(sub) && HeldRefsMayPointInto(v, p, t, owner, array, true);
     };
+    auto stillused = [&](VarDef *v) {
+        if (!shrink || UsedAfter(v)) return true;
+        // The operation itself may pass the view to a callee. A registered
+        // defer can also read it after its last use in the enclosing block.
+        set<SFunction *> seen;
+        if (MentionsName(shrink, v->name, seen)) return true;
+        for (auto &scope : scopes) for (auto &d : scope.defers)
+            if (d.env && any_of(d.env->bindings.begin(), d.env->bindings.end(),
+                                [&](const EnvRead &r) { return r.var == v; })) return true;
+        return false;
+    };
     bool viewed = false;
     ShrinkScanVars([&](VarDef *v) {
         if (viewed || !v->type) return;
@@ -1722,6 +1741,7 @@ inline bool TypeCheck::MayViewLimitedSlot(const Kill &part, TypeExpr *array) {
             Line where;
             viewed = HolderMayPointInto(v, owner, array, LiveEventBase(v), &where);
         }
+        if (viewed) viewed = stillused(v);
     });
     HeldOperands([&](const Held &h) {
         auto t = h.v.type;
@@ -1772,7 +1792,12 @@ inline void TypeCheck::NoteOverwrite(Kill kill, TypeExpr *target, Node *value) {
     if (MayKeepLimitedSlots(target, kill, value)) {
         // Kills name fields, not individual indices. Publish the fully
         // overwritten siblings and retain the array's previous link facts.
-        if (target->kind == TY_STRUCT) {
+        if (kill.relative && IsArrayKind(target, A_LIMITED)) {
+            auto suffix = ast.Intern(kill.path);
+            for (auto &[part, write] : cur.links.live)
+                if (part.owner == kill.container && write.at < kill.at &&
+                    part.field.Within(kill.base, kill.path)) write.suffix = suffix;
+        } else if (target->kind == TY_STRUCT) {
             auto si = GetStructInst(target);
             auto lit = Is<StructLit>(value);
             for (size_t i = 0; i < si->ftypes.size(); i++) {
@@ -1812,7 +1837,8 @@ inline void TypeCheck::ApplyLinkKill(const Kill &k) {
     auto part = KillPartType(k);
     bool tail = part && ResizableArrayIn(part);
     erase_if(cur.links.live, [&](const auto &entry) {
-        auto &[place, at] = entry;
+        auto &[place, write] = entry;
+        auto at = write.at;
         if (place.owner != owner) return false;
         if (at < k.at && place.field.Within(k.base, k.path)) return true;
         if (tail && place.link.intail && at < k.at) return true;
@@ -2085,7 +2111,7 @@ inline void TypeCheck::CheckLinkShrink(const LinkShrink &s) {
         cur.deferring->shrinks.emplace_back(s, CurrentLinkEffects());
         return;
     }
-    if (LiveElementLinks(s.owner, s.array, s.effect.replaced, !s.viaclass).MayPointForward())
+    if (LiveElementLinks(s.owner, s.array, s.effect.replaced, !s.viaclass, s.at).MayPointForward())
         Error(s.at, cat(s.operation, ": retained storage may have a self-relative link "
                         "to a removed element (§5.1)"));
     if (s.viaclass) return;

@@ -50,7 +50,7 @@ fn root_component() {
 }
 
 struct Entry { link: i64&<u32>?, flag: bool = false }
-struct Saved { first: Entry&<u32>?, flag: bool = true, slots: Entry[..2], values: i64[>..] }
+struct Saved { first: Entry&<u32>?, flag: bool = true, slots: Entry[..2] = [Entry {}, Entry {}], values: i64[>..] }
 
 fn retained_limited_slot() {
     var x = Saved { slots: [Entry {}], values: [42] };
@@ -111,6 +111,28 @@ fn replace_all_slots() {
     x.slots[1].link .= x.values[0];
     x = Saved { null, true, [Entry {}; 2], [44] };
     assert(x.first == null && x.slots[1].link == null && x.values[0] == 44);
+    x.first .= x.slots[1];
+    x.slots[1].link .= x.values[0];
+    x = Saved { values: [45] };
+    assert(x.first == null && x.slots[1].link == null && x.values[0] == 45);
+}
+
+fn released_slot_view() {
+    var x = Saved { values: [42] };
+    x.slots[1].link .= x.values[0];
+    {
+        let saved .= x.slots[1];
+        x.slots = [];
+        assert(saved.link .== x.values[0]);
+    }
+    x.values.clear();
+    x.values.push(43);
+    x.slots = [Entry {}, Entry {}];
+    x.slots[1].link .= x.values[0];
+    let saved .= x.slots[1];
+    x.slots = [];
+    assert(saved.link .== x.values[0]);
+    x.values.clear();
 }
 
 fn main() {
@@ -122,5 +144,6 @@ fn main() {
     unrelated_view();
     sibling_field_view();
     replace_all_slots();
+    released_slot_view();
     print("ok");
 }

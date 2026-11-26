@@ -293,7 +293,18 @@ struct TypeCheck {
             auto operator<=>(const Part &) const = default;
             auto operator<=>(VarDef *v) const { return std::compare_three_way {}(owner, v); }
         };
-        map<Part, size_t, std::less<>> live;
+        struct Write {
+            size_t at;
+            // An old slot outside a limited array's new live prefix can be
+            // reached only through a view. The path is relative to field.base.
+            std::optional<string_view> suffix;
+
+            void Include(const Write &other) {
+                at = std::max(at, other.at);
+                if (suffix != other.suffix) suffix.reset();
+            }
+        };
+        map<Part, Write, std::less<>> live;
         vector<RelativeStore> resultlinks; // Writes into the result under construction on this path.
         // A repeated literal captures its operand before installing any
         // links. Only paths that finish the operand reach those stores.
@@ -310,15 +321,18 @@ struct TypeCheck {
             }
         };
         map<ArrayLit *, FillLinks> fills;
-        void Add(const StoreEvent &e, size_t index) {
-            live[{e.container, e.elementlink, e.storefield, e.linkclass}] = index;
+        void Add(const StoreEvent &e, size_t index, std::optional<string_view> suffix = {}) {
+            Part part { e.container, e.elementlink, e.storefield, e.linkclass };
+            Write write { index, suffix };
+            auto [it, added] = live.try_emplace(std::move(part), write);
+            if (!added) it->second.Include(write);
         }
         void Join(const LinkFlow &other) {
             for (auto &link : other.resultlinks) link.AddTo(resultlinks);
             for (auto &[fill, links] : other.fills) fills[fill].Join(links);
-            for (auto &[part, at] : other.live) {
-                auto &last = live[part];
-                last = std::max(last, at);
+            for (auto &[part, write] : other.live) {
+                auto [it, added] = live.try_emplace(part, write);
+                if (!added) it->second.Include(write);
             }
         }
         set<int> ClassStores() const {
@@ -331,7 +345,9 @@ struct TypeCheck {
             return fills == o.fills && RelativeStore::SameSet(resultlinks, o.resultlinks) &&
                    live.size() == o.live.size() &&
                    equal(live.begin(), live.end(), o.live.begin(),
-                         [](const auto &a, const auto &b) { return a.first == b.first; });
+                         [](const auto &a, const auto &b) {
+                             return a.first == b.first && a.second.suffix == b.second.suffix;
+                         });
         }
     };
     struct FlowState {
@@ -2793,7 +2809,7 @@ struct TypeCheck {
     bool RetainsRelativeSlot(TypeExpr *part, TypeExpr *array, TypeExpr *replaced);
     bool LinkMayReachElements(TypeExpr *array, TypeExpr *pointee);
     ValueLinks LiveElementLinks(VarDef *owner, TypeExpr *target = nullptr,
-                               TypeExpr *replaced = nullptr, bool callerchecks = false);
+                               TypeExpr *replaced = nullptr, bool callerchecks = false, Node *shrink = nullptr);
     // Whether a shrink whose receiver has these roots knows the arrays it
     // frees: none is static data or a temporary (§5.1).
     static bool ShrinkRootsKnown(const Roots &roots) {
@@ -2820,7 +2836,7 @@ struct TypeCheck {
     std::optional<Kill> MapParamPart(FnSpec *spec, const vector<Node *> &args, const vector<Val> &vals,
                                      size_t param, const string &path, bool relative, size_t at);
     void NoteKill(Assign *assign, const LVal &loc, TypeExpr *target, const Val &v, size_t at);
-    bool MayViewLimitedSlot(const Kill &part, TypeExpr *array);
+    bool MayViewLimitedSlot(const Kill &part, TypeExpr *array, Node *shrink = nullptr);
     bool MayKeepLimitedSlots(TypeExpr *t, const Kill &part, Node *value);
     void NoteOverwrite(Kill kill, TypeExpr *target, Node *value = nullptr);
     void NoteOverwrite(Node *path, const Roots &loc, size_t at, TypeExpr *target,
