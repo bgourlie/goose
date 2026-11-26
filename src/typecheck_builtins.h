@@ -433,7 +433,7 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
             Error(c, cat(".move_from takes a slice of ", TypeStr(elem), ", got ", TypeStr(sv.type)));
         if (HasRelRefT(elem))
             Error(c, ".move_from cannot copy elements containing self-relative references");
-        NoteStorageWrite(rv, elem, rv.ElementPlace());
+        NoteStorageWrite(rv, elem, rv.ElementPlace(ast.places));
         AppendedCopies(args[1], sv, elem, rv);
         return VoidVal();
     }
@@ -471,7 +471,7 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
             Val v;
             v.type = cu8slice;   // A read-only view, in its type too (§9.5).
             v.SetProv(rv);
-            v.sliceplace = rv.ElementPlace();
+            v.sliceplace = rv.ElementPlace(ast.places);
             // The bytes of a live structure: reading them is what they are
             // for, and writing them would forge the relative references the
             // checker otherwise proves (§3.9), so the view is never writable.
@@ -501,7 +501,7 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
         CheckRenderArgs(c, d, args, &rv);
         return VoidVal();
     }
-    auto elementplace = rv.ElementPlace();
+    auto elementplace = rv.ElementPlace(ast.places);
     auto elementdest = [&] {
         Dest dest(rv, elementplace);
         dest.fill = d.kind == B_RESIZE;
@@ -1095,7 +1095,7 @@ inline void TypeCheck::CheckRenderable(Call *c, const char *what, TypeExpr *t, N
     auto child = [&](TypeExpr *ft, bool throughref, const FieldRun *run = nullptr, size_t i = 0) {
         auto v = value;
         if (run) ProjectField(v, v.refplace, t, *run, i);
-        else if (t->kind == TY_ARRAY) v.refplace = value.refplace.Inside(IsArrayKind(t, A_GROW));
+        else if (t->kind == TY_ARRAY) v.refplace = value.refplace.Inside(ast.places, IsArrayKind(t, A_GROW));
         else if (t->kind == TY_SLICE) v.refplace = value.sliceplace;
         v.sliceplace = {};
         v.hasslot = ft->kind == TY_SLICE;
@@ -1517,7 +1517,7 @@ inline bool TypeCheck::ShrinkMayFree(VarDef *root, TypeExpr *bound, bool growonl
     // Shrinking an array releases elements of its tail. An inline field of
     // the same owner outside that tail retains its own storage.
     if (receiver && receiver->kind == TY_ARRAY && place && !place->location.intail &&
-        InRetainedField(root, of, place->base, place->Path())) return false;
+        InRetainedField(root, of, place->Base(), place->Path())) return false;
     if (byteview) return bound ? Viewable(bound) : MayBeViewed(root);
     if (bound) return !of || (growonly ? CanContain(bound, of) : GrowShrinkContains(bound, of));
     if (growonly) {
@@ -1634,8 +1634,8 @@ inline bool TypeCheck::KillPath(Node *n, VarDef *&base, string &path) {
         if (!vd || vd->istemp) return false;
         if (IsRefOrSlice(vd->type) && (vd->type->kind != TY_REF || vd->isvar)) return false;
         base = vd;
-        if (vd->refplace.base && !vd->refplace.enclosing) {
-            base = vd->refplace.base;
+        if (vd->refplace.Base() && !vd->refplace.Enclosing()) {
+            base = vd->refplace.Base();
             path = vd->refplace.Path();
         }
         return true;
@@ -1657,6 +1657,19 @@ inline bool TypeCheck::KillPath(Node *n, VarDef *&base, string &path) {
 // owner. Record that identity even if the reference used to reach it is
 // rebound later. For a subobject we still need a stable field path.
 inline RefPlace TypeCheck::StoragePlace(const Roots &roots, TypeExpr *target, RefPlace place) {
+    if (place.fields.Multiple())
+        return place.MapPaths(ast.places, [&](RefPlace part) {
+            // The roots cover every branch. This base can name its owner
+            // directly or through an immutable reference into that owner.
+            auto storage = OwnersAtPlace(roots, part);
+            auto base = part.Base();
+            if (!storage.Exact() && base && base->type && IsAddressRef(base->type) && !base->isvar &&
+                base->ref.Exact()) {
+                for (auto &a : storage.alts) if (a.root == base->ref.Root() && a.exact)
+                    return StoragePlace(base->ref, target, part);
+            }
+            return StoragePlace(storage, target, part);
+        });
     if (roots.Exact()) {
         auto owner = roots.Root();
         if (owner && !IsTemp(owner)) {
@@ -1666,7 +1679,7 @@ inline RefPlace TypeCheck::StoragePlace(const Roots &roots, TypeExpr *target, Re
                 if (IsClassRoot(owner)) whole.regions = place.regions;
                 return whole;
             }
-            auto base = place.base;
+            auto base = place.Base();
             if (base == owner || (base && base->type && IsAddressRef(base->type) && !base->isvar &&
                                   base->ref.Exact() && base->ref.Root() == owner))
                 return place;
@@ -1679,9 +1692,9 @@ inline std::optional<TypeCheck::Kill> TypeCheck::OverwrittenPart(Node *n, const 
                                         TypeExpr *target, size_t at, const RefPlace *place) {
     if (place) {
         auto part = StoragePlace(loc, target, *place);
-        if (!part.base || (part.enclosing && (!part.bound || part.boundenclosing))) return {};
-        Kill kill { loc.Root(), part.enclosing ? part.bound->base : part.base,
-                    part.enclosing ? part.bound->path : string(part.Path()), at, true };
+        if (!part.Base() || (part.Enclosing() && (!part.bound || part.boundenclosing))) return {};
+        Kill kill { loc.Root(), part.Enclosing() ? part.bound->base : part.Base(),
+                    part.Enclosing() ? part.bound->path : string(part.Path()), at, true };
         // A reference field names its slot. An overwrite through it affects its pointee.
         if (KillNamesType(kill, target)) return kill;
         return {};
@@ -1809,7 +1822,7 @@ inline bool TypeCheck::HasLimitedSlotView(VarDef *owner, const LinkField &part, 
     };
     auto direct = [&](const Roots &roots, const RefPlace &place, TypeExpr *pointee) {
         if (place.nullonly || !exposes(pointee)) return false;
-        if (part.ApartFrom(place.base, place.Path())) return false;
+        if (part.ApartFrom(place.Base(), place.Path())) return false;
         return aliases(OwnersAtPlace(roots, place));
     };
     auto through = [&](VarDef *v, const Prov &p, TypeExpr *t) {
@@ -1979,7 +1992,7 @@ inline bool TypeCheck::KilledFor(VarDef *c, VarDef *base, TypeExpr *t, TypeExpr 
     // A reference into c whose pointee is of c's own type points at the
     // whole of it: no value holds one of its own type by value.
     auto whole = [&](VarDef *b) {
-        if (relative && !c->type && !b->refplace.enclosing && b->type && IsAddressRef(b->type) && b->ref.Exact() &&
+        if (relative && !c->type && !b->refplace.Enclosing() && b->type && IsAddressRef(b->type) && b->ref.Exact() &&
             b->ref.Root() == c && TopConstEq(b->type->ref->sub, t)) return c;
         if (b == c || !b->type || b->type->kind != TY_REF || !c->type || IsRefOrSlice(c->type))
             return b;
@@ -2363,13 +2376,13 @@ inline void TypeCheck::NoteRefPlace(VarDef *vd, const Val &v) {
     else if (IsAddressRef(vd->type)) {
         auto owners = OwnersAtPlace(v, v.refplace);
         place = StoragePlace(owners, vd->type->ref->sub, v.refplace);
-        if (!place.base && owners.Exact()) {
+        if (!place.fields.Known() && owners.Exact()) {
             auto owner = owners.Root();
             if (owner && owner->type && !IsRefOrSlice(owner->type) && !IsTemp(owner)) {
-                place.base = owner;
+                place.fields = { owner };
                 if (place.regions.All().empty()) place.regions = OwnedPlace(owner).regions;
                 place.nullonly = false;
-                place = place.Inside();
+                place = place.Inside(ast.places);
             }
         }
     } else return;
@@ -2394,7 +2407,7 @@ inline RefPlace TypeCheck::ArgumentPlace(FnSpec *spec, VarDef *param, span<const
     if (it == spec->params.end() || index >= args.size()) return {};
     auto &arg = args[index];
     auto pt = param->type;
-    if (pt->kind == TY_SLICE) return arg.ElementPlace();
+    if (pt->kind == TY_SLICE) return arg.ElementPlace(ast.places);
     return IsAddressRef(pt) ? StoragePlace(arg, pt->ref->sub, arg.refplace) : RefPlace {};
 }
 
@@ -2409,8 +2422,8 @@ inline LinkField TypeCheck::MapStoreField(FnSpec *spec, const vector<Val> &args,
         if (bound && !*bound) *bound = part.boundenclosing ? part.bound : ast.places.Project(part.bound, field.path);
         // An indexed argument identifies the enclosing array. The callee's
         // remaining path is inside its element.
-        if (!part.base) return {};
-        field = { part.base, part.enclosing ? string(part.Path()) : cat(part.Path(), field.path) };
+        if (!part.Base()) return {};
+        field = { part.Base(), part.Enclosing() ? string(part.Path()) : cat(part.Path(), field.path) };
     }
     return field;
 }
@@ -4255,14 +4268,14 @@ template<typename F> void TypeCheck::EachHolderRoot(VarDef *holder, size_t from,
     set<tuple<VarDef *, VarDef *, string_view>> seen;
     auto walk = [&](auto &&self, VarDef *h, size_t start, const RefPlace &read) -> void {
         auto path = read.Path();
-        if (!seen.emplace(h, read.base, path).second) return;
+        if (!seen.emplace(h, read.Base(), path).second) return;
         if (h->type && ClassOf(h->type) == SC_ROOT)
             for (auto c : h->components) if (c) self(self, c, start, read);
         for (auto i = start; i < storeevents.size(); i++) {
             auto e = storeevents[i];
             if (e.container != h || StoredLater(i)) continue;
             auto &field = e.storefield;
-            if (read.base && read.base == field.base &&
+            if (read.Base() && read.Base() == field.base &&
                 !FieldPathWithin(path, field.path) && !FieldPathWithin(field.path, path)) continue;
             if (e.ReadsOwnContents()) {
                 self(self, h, 0, {});
@@ -4272,10 +4285,10 @@ template<typename F> void TypeCheck::EachHolderRoot(VarDef *holder, size_t from,
                 // Reading a copied struct field reads the same field of its
                 // source. An indirect source may have supplied any slot.
                 RefPlace source;
-                if (e.wholecopy && read.base && read.base == field.base &&
+                if (e.wholecopy && read.Base() && read.Base() == field.base &&
                     FieldPathWithin(path, field.path)) {
-                    source.base = e.src;
-                    source.path = ast.places.Path(string(path.substr(field.path.size())));
+                    auto suffix = ast.places.Path(string(path.substr(field.path.size())));
+                    source.fields = PlacePaths::Of({ e.src, suffix }, ast.places);
                 }
                 self(self, e.src, 0, source);
                 continue;
@@ -5098,7 +5111,7 @@ inline void TypeCheck::CheckDeferredReads(const DeferEffects &effects, const FnR
         storage.byteview = read.byteview;
         auto type = read.field ? read.field : read.holder;
         vector<LiveView> views;
-        auto apart = read.place.base && read.place.base == a.place.base &&
+        auto apart = read.place.Base() && read.place.Base() == a.place.Base() &&
                      !FieldPathWithin(read.place.Path(), a.place.Path()) &&
                      !FieldPathWithin(a.place.Path(), read.place.Path());
         if (!apart) views.push_back({ storage, type });

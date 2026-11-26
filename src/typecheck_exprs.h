@@ -92,7 +92,7 @@ inline TypeCheck::LVal TypeCheck::CheckLValue(Node *n, PathUse use) {
                          " of variable-size elements cannot be indexed, only iterated; for "
                          "random access, keep your own array of references to them (§3.3)"));
         if (lv.intemp) NoRelRefTempRead(ix->obj, lv.type, elem);
-        lv.place = lv.place.Inside(IsArrayKind(lv.type, A_GROW));
+        lv.place = lv.place.Inside(ast.places, IsArrayKind(lv.type, A_GROW));
         if (use != PathUse::Reread) CheckIntAny(ix->idx);
         if (lv.type->cq) lv.writable = false;   // An element of a const value.
         lv.letbound = false;
@@ -617,7 +617,7 @@ template<typename F> void TypeCheck::HeldOperands(F f) {
                     Val v;
                     v.TakeAlts(roots);
                     v.type = ast.RefTo(pointee, fill->line);
-                    if (target.base) v.refplace = { {}, target.base, ast.places.Path(target.path), false, true };
+                    if (target.base) v.refplace = { {}, PlacePaths::Of({ target.base, ast.places.Path(target.path), true }, ast.places) };
                     f(Held { nullptr, std::move(v) });
                 };
                 for (auto &[slot, roots] : pending->second.slots) hold(slot.link.pointee, roots, slot.target);
@@ -718,13 +718,13 @@ inline void TypeCheck::ProjectField(Prov &storage, RefPlace &place, TypeExpr *ow
         storage.TakeAlts(ProjectRoots(storage, owner, (int)i));
         place = OwnedPlace(ExactComponent(storage));
     } else if (owner->kind != TY_STRUCT) {
-        place = place.Inside();
+        place = place.Inside(ast.places);
     } else {
         if (!place.regions.All().empty() && GetStructInst(owner)->frameobj && ClassOf((*fields.ftypes)[i]) == SC_FIXED)
             place.regions = place.regions.FixedField(ast.places.regions);
         auto name = (*fields.fields)[i].name;
         if (!place.boundenclosing) place.bound = ast.places.Project(place.bound, name, ".");
-        if (place.base && !place.enclosing) place.path = ast.places.Path(cat(place.Path(), ".", name));
+        place.fields = place.fields.Project(ast.places, name, false, ".");
     }
 }
 
@@ -1236,7 +1236,7 @@ inline bool TypeCheck::FitsAt(Val &v, TypeExpr *dt, bool delivered) {
         auto at = IsPlainRef(t) && t->ref->sub->kind == TY_ARRAY ? t->ref->sub : t;
         if (at->kind == TY_ARRAY && TypeEq(at->arr->sub, dt->sub)) {
             if (at != t) v.ClearReads();   // As DerefLValue.
-            v.sliceplace = v.refplace.Inside(IsArrayKind(at, A_GROW));
+            v.sliceplace = v.refplace.Inside(ast.places, IsArrayKind(at, A_GROW));
             t = v.type = ast.SliceOf(at->arr->sub, dt->line);
             t->cq = !v.writable;
             v.lvalue = false;
@@ -1530,8 +1530,8 @@ inline bool TypeCheck::FitsAt(Val &v, TypeExpr *dt, bool delivered) {
                 if (recordingrelative && !dt->ref->pool) {
                     pointee = LinkPointee(pointee);
                     auto &place = v.refplace;
-                    auto part = place.base ? FieldPathType(place.base, place.Path()) : nullptr;
-                    if (CanContainLinkTarget(part, pointee)) target = { place.base, string(place.Path()) };
+                    auto part = place.Base() ? FieldPathType(place.Base(), place.Path()) : nullptr;
+                    if (CanContainLinkTarget(part, pointee)) target = { place.Base(), string(place.Path()) };
                 }
                 auto fits = dt->ref->pool ? want && links.Exact() && have == want
                     : RelativeDestination(links, curdst, pointee, fitnode, recordingrelative, target);

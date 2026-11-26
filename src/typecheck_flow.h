@@ -982,7 +982,7 @@ inline void TypeCheck::RestoreFlow(const FlowState &f) {
     reachable = f.reachable;
 }
 
-inline TypeCheck::FlowState TypeCheck::JoinFlow(const FlowState &a, const FlowState &b) {
+inline TypeCheck::FlowState TypeCheck::JoinFlow(const FlowState &a, const FlowState &b, bool backedge) {
     auto narrow = [&](TypeExpr *an, TypeExpr *bn) {
         return !a.reachable ? bn : !b.reachable ? an : an && bn ? an : nullptr;
     };
@@ -1003,7 +1003,7 @@ inline TypeCheck::FlowState TypeCheck::JoinFlow(const FlowState &a, const FlowSt
                     (a.reachable && aa.maybeassigned) || (b.reachable && bb.maybeassigned),
                     narrow(aa.narrowed, bb.narrowed),
                     !a.reachable ? bb.refplace : !b.reachable ? aa.refplace
-                                                              : aa.refplace.Common(bb.refplace, ast.places),
+                                                              : aa.refplace.Common(bb.refplace, ast.places, backedge),
                     (!a.reachable || aa.intactprefix) && (!b.reachable || bb.intactprefix) };
     }
     // A global stays narrowed where every reachable side narrowed it.
@@ -1681,7 +1681,7 @@ inline Val TypeCheck::CheckMatch(MatchExpr *m, TypeExpr *expected, bool wantvalu
                                             " ", arm.pat.binder));
                     binder->type = ast.RefTo(vt, m->line);
                     BindProv(binder, sv);
-                    binder->refplace = sv.refplace.Inside();
+                    binder->refplace = sv.refplace.Inside(ast.places);
                     ReadBack held;
                     if (TempContents(sv, held)) NoRelRefTempRead(m->scrutinee, enumtype, vt);
                 } else {
@@ -1933,7 +1933,7 @@ inline TypeCheck::Scope TypeCheck::CheckLoopPasses(Node *x, FlowState &head,
         PopScope();
         auto lp = cur.looppasses.back();
         cur.looppasses.pop_back();
-        auto next = sc.backedges ? JoinFlow(entry, sc.backedge) : entry;
+        auto next = sc.backedges ? JoinFlow(entry, sc.backedge, true) : entry;
         auto changed = lp.changed || !SameFlow(next, head);
         head = next;
         if (changed) continue;
@@ -2203,7 +2203,7 @@ inline void TypeCheck::CheckFor(ForLoop *x) {
         }
         if (IsRefOrSlice(bindtype)) {
             BindProv(vd, iterprov);
-            vd->refplace = readback ? RefPlace {} : sequence.ElementPlace();
+            vd->refplace = readback ? RefPlace {} : sequence.ElementPlace(ast.places);
         }
         x->vdef = vd;
         if (!x->idxvar.empty()) {
@@ -2595,9 +2595,9 @@ inline void TypeCheck::NoteDeferMention(VarDef *v) {
 // A binding can have several lifetime roots at this depth, while its
 // current field or element belongs to a single known owner on this path.
 inline Roots TypeCheck::OwnersAtPlace(const Roots &storage, const RefPlace &place) {
-    if (place.base && !storage.Exact())
+    if (place.Base() && !storage.Exact())
         for (auto &a : storage.alts)
-            if (a.root == place.base && a.exact) {
+            if (a.root == place.Base() && a.exact) {
                 Roots owner;
                 owner.Add(a);
                 return owner;
@@ -2625,7 +2625,7 @@ inline void TypeCheck::NoteStorageRead(Node *n) {
     auto ref = IsRefOrSlice(v->type);
     auto holder = ref ? PointeeOf(v->type) : v->type;
     auto place = ref ? (v->type->kind == TY_SLICE ? v->SlicePlace() : v->PointeePlace(ast.places))
-                     : RefPlace { {}, v };
+                     : RefPlace { {}, { v } };
     if (place.nullonly) return;
     Prov storage;
     storage.TakeAlts(ref ? OwnersAtPlace(RefRootsOf(v), place) : RootsOf(v));
@@ -2738,7 +2738,7 @@ inline void TypeCheck::NoteStorageWrite(const Roots &storage, TypeExpr *type, co
 inline void TypeCheck::ApplyCalleeWrites(FnSpec *spec, const vector<Val> &args) {
     if (!reachable) return;
     auto writtenplace = [&](size_t p) {
-        return spec->argtypes[p]->kind == TY_SLICE ? args[p].ElementPlace() : args[p].refplace;
+        return spec->argtypes[p]->kind == TY_SLICE ? args[p].ElementPlace(ast.places) : args[p].refplace;
     };
     if (spec->sf->isextern) {
         for (size_t p = 0; p < args.size() && p < spec->argtypes.size(); p++) {

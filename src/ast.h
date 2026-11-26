@@ -780,12 +780,35 @@ struct LinkField {
     auto operator<=>(const LinkField &) const = default;
 };
 
+// A field path relative to one named owner or reference parameter.
+struct PlacePath {
+    VarDef *base = nullptr;
+    const string *path = nullptr;
+    bool enclosing = false;
+    string_view Path() const { return path ? string_view(*path) : string_view {}; }
+    auto operator<=>(const PlacePath &) const = default;
+};
+
+struct PlacePathsLess {
+    using is_transparent = void;
+    bool operator()(span<const PlacePath> a, span<const PlacePath> b) const {
+        return std::lexicographical_compare(a.begin(), a.end(), b.begin(), b.end());
+    }
+};
+
 // Flow snapshots share field identities. Most places name a whole variable
 // and need neither an allocated path nor an element binding.
 struct PlacePool {
     WriteRegionPool regions;
     set<string> paths;
     set<LinkField> boundfields;
+    set<vector<PlacePath>, PlacePathsLess> pathsets;
+
+    const vector<PlacePath> *Paths(span<const PlacePath> paths) {
+        auto it = pathsets.lower_bound(paths);
+        if (it != pathsets.end() && !PlacePathsLess{}(paths, *it)) return &*it;
+        return &*pathsets.emplace_hint(it, paths.begin(), paths.end());
+    }
 
     const string *Path(string path) {
         return path.empty() ? nullptr : &*paths.insert(std::move(path)).first;
@@ -799,32 +822,97 @@ struct PlacePool {
     }
 };
 
+// Distinct formals can name the same caller field. Keep one enclosing path
+// per base until the call supplies its arguments. A missing base is unknown.
+struct PlacePaths {
+    VarDef *whole = nullptr;                  // A single whole variable needs no allocation.
+    const vector<PlacePath> *saved = nullptr; // Otherwise intern the projected or alternative paths.
+
+    static PlacePaths Of(PlacePath p, PlacePool &pool) {
+        if (!p.path && !p.enclosing) return { p.base };
+        return { nullptr, pool.Paths({ &p, 1 }) };
+    }
+    bool Known() const { return whole || saved; }
+    bool Multiple() const { return saved && saved->size() > 1; }
+    PlacePath Single() const { return saved && saved->size() == 1 ? saved->front() : PlacePath { whole }; }
+    template<typename F> void Each(F f) const {
+        if (saved) for (auto p : *saved) f(p);
+        else f(PlacePath { whole });
+    }
+    template<typename F> bool AnyBase(F f) const {
+        if (!saved) return whole && f(whole);
+        return any_of(saved->begin(), saved->end(), [&](auto p) { return f(p.base); });
+    }
+    bool operator==(const PlacePaths &) const = default;
+
+    PlacePaths Join(const PlacePaths &other, PlacePool &pool, bool backedge) const {
+        if (*this == other) return *this;
+        if (!Known() || !other.Known()) return {};
+        auto common = [&](PlacePath a, PlacePath b) {
+            a.enclosing |= b.enclosing || a.path != b.path;
+            if (a.path != b.path) {
+                auto prefix = a.Path();
+                while (!FieldPathWithin(b.Path(), prefix)) prefix = prefix.substr(0, prefix.rfind('.'));
+                a.path = prefix == b.Path() ? b.path : pool.Path(string(prefix));
+            }
+            return a;
+        };
+        auto left = Single(), right = other.Single();
+        if (left.base && left.base == right.base) return Of(common(left, right), pool);
+        auto paths = saved ? *saved : vector<PlacePath>{left};
+        other.Each([&](PlacePath p) {
+            auto it = lower_bound(paths.begin(), paths.end(), p, [](auto a, auto b) {
+                return std::less<VarDef *>{}(a.base, b.base);
+            });
+            if (it != paths.end() && it->base == p.base) *it = common(*it, p);
+            else paths.insert(it, p);
+        });
+        // Widen a growing set at a loop or recursive call. A finite branch
+        // join keeps all its bases for substitution, regardless of arm count.
+        constexpr size_t maxbackedgebases = 4;
+        if (backedge && paths.size() > maxbackedgebases) return {};
+        return { nullptr, pool.Paths(paths) };
+    }
+
+    PlacePaths Project(PlacePool &pool, string_view suffix, bool inside = false, string_view separator = {}) const {
+        auto project = [&](PlacePath p) {
+            if (p.base && !p.enclosing && !suffix.empty())
+                p.path = pool.Path(cat(p.Path(), separator, suffix));
+            p.enclosing |= p.base && inside;
+            return p;
+        };
+        if (!Known() || (suffix.empty() && !inside)) return *this;
+        if (!Multiple()) return Of(project(Single()), pool);
+        auto paths = *saved;
+        for (auto &p : paths) p = project(p);
+        return { nullptr, pool.Paths(paths) };
+    }
+};
+
 // A storage location. A field path can name the slot itself or a field
 // containing it, e.g. the array when the slot is one of its elements.
 struct RefPlace {
     LinkLocation location;
-    VarDef *base = nullptr;
-    const string *path = nullptr;
+    PlacePaths fields;
     bool nullonly = false;  // No pointee on this path. The default is an unknown place.
-    bool enclosing = false;
     bool boundenclosing = false;
     WriteRegions regions;
     const LinkField *bound = nullptr; // The same place or a containing field, relative to an immutable binding.
 
-    string_view Path() const { return path ? string_view(*path) : string_view {}; }
+    VarDef *Base() const { return fields.Single().base; }
+    string_view Path() const { return fields.Single().Path(); }
+    bool Enclosing() const { return fields.Single().enclosing; }
 
     void ForgetBound() { bound = nullptr; boundenclosing = false; }
     RefPlace WithoutPath() const {
         auto part = *this;
-        part.base = nullptr;
-        part.path = nullptr;
-        part.enclosing = false;
+        part.fields = {};
         part.ForgetBound();
         return part;
     }
-    RefPlace Inside(bool intail = false) const {
+    RefPlace Inside(PlacePool &pool, bool intail = false) const {
         auto part = *this;
-        part.enclosing = base != nullptr;
+        part.fields = fields.Project(pool, {}, true);
         part.boundenclosing = bound != nullptr;
         part.location.intail |= intail;
         return part;
@@ -839,12 +927,12 @@ struct RefPlace {
             part.regions = {};
             break;
         }
-        if (base && !keep(base)) part = part.WithoutPath();
+        if (fields.AnyBase([&](VarDef *base) { return !keep(base); })) part = part.WithoutPath();
         if (part.bound && !keep(part.bound->base)) part.ForgetBound();
         return part;
     }
 
-    RefPlace Common(const RefPlace &other, PlacePool &pool) const {
+    RefPlace Common(const RefPlace &other, PlacePool &pool, bool backedge = false) const {
         if (nullonly) return other;
         if (other.nullonly) return *this;
         RefPlace common;
@@ -855,17 +943,19 @@ struct RefPlace {
             common.bound = bound;
             common.boundenclosing = boundenclosing || other.boundenclosing;
         }
-        if (base && base == other.base) {
-            common.base = base;
-            common.path = path;
-            if (path != other.path) {
-                auto prefix = Path(), right = other.Path();
-                while (!FieldPathWithin(right, prefix)) prefix = prefix.substr(0, prefix.rfind('.'));
-                common.path = prefix == right ? other.path : pool.Path(string(prefix));
-            }
-            common.enclosing = enclosing || other.enclosing || path != other.path;
-        }
+        common.fields = fields.Join(other.fields, pool, backedge);
         return common;
+    }
+    // Resolve each possible base in its own coordinates before joining.
+    template<typename F> RefPlace MapPaths(PlacePool &pool, F resolve, bool backedge = false) const {
+        RefPlace result;
+        result.nullonly = true;
+        fields.Each([&](PlacePath p) {
+            auto part = *this;
+            part.fields = PlacePaths::Of(p, pool);
+            result = result.Common(resolve(part), pool, backedge);
+        });
+        return result;
     }
     bool operator==(const RefPlace &) const = default;
 };
@@ -1060,10 +1150,10 @@ struct Val : Prov {
 
     // A whole array used as a slice views the elements inside that array.
     // A reference to a slice slot alone says nothing about its elements.
-    RefPlace ElementPlace() const {
+    RefPlace ElementPlace(PlacePool &pool) const {
         if (!type) return {};
         auto t = IsPlainRef(type) ? type->ref->sub : type;
-        if (t->kind == TY_ARRAY) return refplace.Inside(IsArrayKind(t, A_GROW));
+        if (t->kind == TY_ARRAY) return refplace.Inside(pool, IsArrayKind(t, A_GROW));
         return type->kind == TY_SLICE ? sliceplace : RefPlace {};
     }
 
@@ -2071,10 +2161,10 @@ struct VarDef {
     RefPlace SlicePlace() const { return slotref ? RefPlace {} : refplace; }
     RefPlace PointeePlace(PlacePool &pool) {
         auto place = refplace;
-        if (!isvar && !istemp && !place.base && !place.nullonly) place.base = this;
+        if (!isvar && !istemp && !place.fields.Known() && !place.nullonly) place.fields = { this };
         // Indexing names only the enclosing array. A let also names its
         // particular pointee for as long as this binding is in scope.
-        if (place.enclosing && (!place.bound || place.boundenclosing) &&
+        if (place.Enclosing() && (!place.bound || place.boundenclosing) &&
             !isvar && !istemp && !isglobal && IsAddressRef(type) && ref.Exact()) {
             place.bound = pool.Bound(this);
             place.boundenclosing = false;

@@ -452,10 +452,10 @@ struct TypeCheck {
         Dest(const Prov &storage, const RefPlace &part)
             : Dest(storage, false, storage.reached) {
             place = part.location;
-            field = { part.base, string(part.Path()) };
+            field = { part.Base(), string(part.Path()) };
             boundfield = part.bound;
             boundsteps = !part.boundenclosing;
-            fieldsteps = !part.enclosing;
+            fieldsteps = !part.Enclosing();
         }
         // A variable's own storage.
         Dest(VarDef *vd, bool vb = false) : varbind(vb) {
@@ -1769,7 +1769,7 @@ struct TypeCheck {
     // the live checker state: a fact holds iff it
     // holds in every reachable one, and a variable may be assigned iff it
     // may be in any.
-    FlowState JoinFlow(const FlowState &a, const FlowState &b);
+    FlowState JoinFlow(const FlowState &a, const FlowState &b, bool backedge = false);
     bool SameFlow(const FlowState &a, const FlowState &b);
 
     void ApplyCalleeRebinds(FnSpec *spec);
@@ -2634,7 +2634,7 @@ struct TypeCheck {
             return nullptr;
         return spec->classroots[spec->views[p].cls];
     }
-    void ValidateCycle(FnSpec *spec, Node *callnode);
+    void ValidateCycle(FnSpec *spec, span<const Val> args, Node *callnode);
     static FnSpec *CycleHead(FnSpec *s);
     void JoinCycle(FnSpec *spec, Node *callnode);
     void NoInferredRefResult(FnSpec *spec, Line at);
@@ -2744,7 +2744,7 @@ struct TypeCheck {
     unordered_map<Defer *, vector<VarDef *>> defermentions;
     unordered_map<Defer *, set<const VarDef *>> deferwrites;
     RefPlace OwnedPlace(VarDef *owner, LinkLocation location = {}) {
-        RefPlace place { location, owner };
+        RefPlace place { location, { owner } };
         if (hasdefers && owner && owner->type && !IsRefOrSlice(owner->type))
             place.regions = { { owner } };
         return place;

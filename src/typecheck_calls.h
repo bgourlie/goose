@@ -1887,7 +1887,7 @@ inline FnSpec *TypeCheck::GetOrCreateSpec(MatchInfo &mi, vector<Val> &argvals, N
                 if (!v->narrowed)
                     Error(callnode, cat("recursive call requires optional ", v->name,
                                         " to remain narrowed (§3.8)"));
-            ValidateCycle(spec, callnode);
+            ValidateCycle(spec, argvals, callnode);
             ValidatePoolArgs(spec, argvals, callnode);
             ValidateThreadArgs(spec, argvals, callnode);
         } else if (CycleHead(spec)->inprogress) {
@@ -2265,7 +2265,7 @@ inline void TypeCheck::VerifyLiterals() {
     });
 }
 
-inline void TypeCheck::ValidateCycle(FnSpec *spec, Node *callnode) {
+inline void TypeCheck::ValidateCycle(FnSpec *spec, span<const Val> args, Node *callnode) {
     if (!spec->sf->isrec)
         Error(callnode, cat("recursive call cycle through ", spec->sf->name,
                             ", which is not declared `recursive fn` (§7.8)"));
@@ -2280,16 +2280,21 @@ inline void TypeCheck::ValidateCycle(FnSpec *spec, Node *callnode) {
     }
     JoinCycle(spec, callnode);
     // The next activation sees the captures as this call found them. A
-    // formal of an activation being reentered can take a different argument.
+    // formal can name storage across both activations if a direct recursive
+    // call forwards that same immutable reference to the same parameter.
     if (spec->prev && reachable && !cur.probingtypes) {
         auto floor = frames[fi].scopebase;
+        auto survives = [&](VarDef *base) {
+            if (Depth(base) <= floor && (!IsClassRoot(base) || ActivationFloor(base) < floor)) return true;
+            if (CurRealFrame().spec != spec || base->ownerspec != spec || !base->isparam ||
+                base->isvar || !IsAddressRef(base->type)) return false;
+            return ArgumentPlace(spec, base, args).fields.Single() == PlacePath { base };
+        };
         for (auto &[v, binding] : spec->prev->reboundplaces) {
             if (v->isglobal) continue;
-            auto place = v->refplace.InScope([&](VarDef *base) {
-                return Depth(base) <= floor && (!IsClassRoot(base) || ActivationFloor(base) < floor);
-            });
+            auto place = v->refplace.InScope(survives);
             auto &entry = spec->record.reboundplaces[v].reentry;
-            entry = entry ? entry->Common(place, ast.places) : place;
+            entry = entry ? entry->Common(place, ast.places, true) : place;
         }
     }
     // A cycle function without an explicit return type is committed to
@@ -3295,7 +3300,7 @@ inline void TypeCheck::CheckSpecBodyOnce(FnSpec *spec, vector<Val> *argvals, Lin
         auto it = spec->prev->reboundplaces.find(v);
         if (it == spec->prev->reboundplaces.end() || !it->second.reentry) continue;
         NoteEnvRead(v);
-        v->refplace = v->refplace.Common(*it->second.reentry, ast.places);
+        v->refplace = v->refplace.Common(*it->second.reentry, ast.places, true);
     }
     // main starts with the relative links left by global initialization.
     // Ordinary callees check incoming global links when their shrink
@@ -3333,8 +3338,7 @@ inline void TypeCheck::CheckSpecBodyOnce(FnSpec *spec, vector<Val> *argvals, Lin
         if (!vd->isvar && (IsAddressRef(pt) || pt->kind == TY_SLICE)) {
             vd->refplace.location.param = vd;
             if (pt->kind == TY_SLICE) {
-                vd->refplace.base = vd;
-                vd->refplace.enclosing = true;
+                vd->refplace.fields = PlacePaths::Of({ vd, nullptr, true }, ast.places);
             }
         }
         if (auto links = spec->roots[i].elementlinks)
@@ -3800,7 +3804,8 @@ inline void TypeCheck::FinishReturn(int tf, const vector<Val> &vals, Node *at) {
                 if (!v || v->isglobal) return true;
                 if (v->ownerspec == tspec) return v->isparam;
                 return any_of(tspec->envreads.begin(), tspec->envreads.end(), [&](const EnvRead &r) {
-                    return r.var == v || r.refplace.base == v || (r.refplace.bound && r.refplace.bound->base == v) ||
+                    return r.var == v || r.refplace.fields.AnyBase([&](VarDef *base) { return base == v; }) ||
+                           (r.refplace.bound && r.refplace.bound->base == v) ||
                            r.refplace.location.param == v || r.refplace.regions.Find(v);
                 });
             };
@@ -3866,6 +3871,9 @@ inline Val TypeCheck::RetAltVal(FnSpec *spec, const RootAlt &alt, vector<Val> &a
 // Roots can identify an owner shared by several arguments. A result's
 // field path is relative to the particular parameter the body returned.
 inline RefPlace TypeCheck::CallerPlace(RefPlace place, FnSpec *spec, span<const Val> args) {
+    if (place.fields.Multiple())
+        return place.MapPaths(ast.places, [&](RefPlace part) { return CallerPlace(part, spec, args); },
+                              spec->inprogress);
     // Map each formal separately, even when two formals share a lifetime
     // class. Then join alternatives that land in the same caller-side owner.
     WriteRegions mapped;
@@ -3890,17 +3898,15 @@ inline RefPlace TypeCheck::CallerPlace(RefPlace place, FnSpec *spec, span<const 
         auto loc = ArgumentPlace(spec, p, args).location;
         place.location = { place.location.intail || loc.intail, loc.param };
     }
-    if (place.base && place.base->ownerspec == spec) {
-        auto actual = ArgumentPlace(spec, place.base, args);
-        if (!actual.base) {
+    if (place.Base() && place.Base()->ownerspec == spec) {
+        auto actual = ArgumentPlace(spec, place.Base(), args);
+        if (!actual.fields.Known()) {
             place.nullonly = actual.nullonly;
             return place.WithoutPath();
         }
         if (!actual.boundenclosing) actual.bound = ast.places.Project(actual.bound, place.Path());
-        actual.boundenclosing |= actual.bound && place.enclosing;
-        if (!actual.enclosing && place.path)
-            actual.path = ast.places.Path(cat(actual.Path(), place.Path()));
-        actual.enclosing |= place.enclosing;
+        actual.boundenclosing |= actual.bound && place.Enclosing();
+        actual.fields = actual.fields.Project(ast.places, place.Path(), place.Enclosing());
         actual.location = place.location;
         actual.regions = mapped;
         return actual;

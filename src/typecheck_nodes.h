@@ -572,7 +572,7 @@ inline Val TypeCheck::CheckSlice(SliceExpr *se, LVal lv) {
     if (se->hi) CheckIntAny(se->hi);
     Val v;
     v.type = ast.SliceOf(elem, se->line);
-    v.sliceplace = lv.place.Inside(IsArrayKind(lv.type, A_GROW));
+    v.sliceplace = lv.place.Inside(ast.places, IsArrayKind(lv.type, A_GROW));
     v.SetProv(lv);
     v.reusable = false;   // A view of a pool is not the pool.
     if (lv.type->cq) v.writable = false;   // A const field's or element's, as a variable's.
