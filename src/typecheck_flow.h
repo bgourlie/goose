@@ -2613,8 +2613,11 @@ inline void TypeCheck::NoteStorageRead(Node *n) {
     if (cur.nodepath.size() > 1) {
         auto parent = cur.nodepath[cur.nodepath.size() - 2].node;
         if (auto d = Is<Dot>(parent); d && d->obj == n) return; // The complete path records the read.
-        if (auto a = Is<Assign>(parent); a && a->op == T_DOTASSIGN && a->lval == n && Is<Ident>(n))
-            return; // Rebinding the slot does not use its former pointee.
+        if (auto a = Is<Assign>(parent); a && a->lval == n && Is<Ident>(n)) {
+            // Replacing a reference or slice binding does not read the storage it used to name.
+            if (a->op == T_DOTASSIGN || (a->op == T_ASSIGN && n->exprtype && n->exprtype->kind == TY_SLICE))
+                return;
+        }
     }
     auto base = n;
     while (auto d = Is<Dot>(base)) base = d->obj;

@@ -1,5 +1,6 @@
 struct Bag { tag: i64, xs: i64[>..<] }
 struct State { tag: i64, bag: Bag }
+struct Buffer { header: i64[1], xs: i64[>..<] }
 
 fn sibling(stop: bool) {
     var bag = Bag { tag: 7, xs: [1] };
@@ -40,6 +41,17 @@ fn from_helper(stop: bool) {
     state.bag = Bag { tag: 8, xs: [2, if stop { return; } else { 3 }] };
 }
 
+fn replace_slice_binding(stop: bool) {
+    var buf = Buffer { header: [9], xs: [1] };
+    var spare: i64[1] = [7];
+    var view = buf.header[..];
+    defer {
+        view = spare[..];
+        assert(view[0] == 7);
+    }
+    buf = Buffer { header: [8], xs: [2, if stop { return; } else { 3 }] };
+}
+
 fn stopped(enter: bool) {
     var bag = Bag { tag: 7, xs: [1] };
     if enter {
@@ -60,6 +72,8 @@ fn main() {
     rebound(false, false);
     from_helper(true);
     from_helper(false);
+    replace_slice_binding(true);
+    replace_slice_binding(false);
     stopped(false);
     print("ok");
 }
