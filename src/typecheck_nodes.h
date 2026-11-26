@@ -546,7 +546,8 @@ inline Val Index::Check(TypeCheck &tc, TypeExpr *) {
 
 inline Val SliceExpr::Check(TypeCheck &tc, TypeExpr *) {
     TypeCheck::DestScope ds(tc, TypeCheck::Dest {});
-    return tc.CheckSlice(this, tc.LValueBase(obj, cmpview));
+    auto use = cmpview ? TypeCheck::PathUse::ComparisonView : TypeCheck::PathUse::Evaluate;
+    return tc.CheckSlice(this, tc.LValueBase(obj, use));
 }
 
 inline Val TypeCheck::CheckSlice(SliceExpr *se, LVal lv) {

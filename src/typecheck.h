@@ -2008,8 +2008,9 @@ struct TypeCheck {
     // ------------------------------------------------------------------
     // Lvalue paths: names, fields, elements, optionally through references.
 
-    LVal CheckLValue(Node *n);
-    LVal LValueBase(Node *n, bool cmpview = false);
+    enum class PathUse { Evaluate, ComparisonView, Reread };
+    LVal CheckLValue(Node *n, PathUse use = PathUse::Evaluate);
+    LVal LValueBase(Node *n, PathUse use = PathUse::Evaluate);
     LVal ValueBase(Node *n, const Val &v);
     Val CheckSlice(SliceExpr *se, LVal lv);
     void NoTemporaryLiteral(Node *n, TypeExpr *t);

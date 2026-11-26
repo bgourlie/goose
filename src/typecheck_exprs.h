@@ -10,7 +10,7 @@ namespace goose {
 // ------------------------------------------------------------------
 // Lvalue paths: names, fields, elements, optionally through references.
 
-inline TypeCheck::LVal TypeCheck::CheckLValue(Node *n) {
+inline TypeCheck::LVal TypeCheck::CheckLValue(Node *n, PathUse use) {
     DestScope ds(*this, Dest {});
     NodeScope ns(*this, n);
     // The value the path denotes, recorded as its Check would (Ident::Check,
@@ -62,7 +62,7 @@ inline TypeCheck::LVal TypeCheck::CheckLValue(Node *n) {
     }
     if (auto d = Is<Dot>(n)) {
         if (d->incomplete) IncompleteDot(d);
-        auto lv = LValueBase(d->obj);
+        auto lv = LValueBase(d->obj, use);
         auto base = lv.type;
         DerefLValue(lv, d->obj);
         CheckAccessorOwner(d, d->accessorowner, lv.type);
@@ -73,7 +73,7 @@ inline TypeCheck::LVal TypeCheck::CheckLValue(Node *n) {
         return lv;
     }
     if (auto ix = Is<Index>(n)) {
-        auto lv = LValueBase(ix->obj);
+        auto lv = LValueBase(ix->obj, use);
         DerefLValue(lv, ix->obj);
         SliceProvenance(lv, ix->obj);
         TypeExpr *elem;
@@ -91,7 +91,7 @@ inline TypeCheck::LVal TypeCheck::CheckLValue(Node *n) {
                          "random access, keep your own array of references to them (§3.3)"));
         if (lv.intemp) NoRelRefTempRead(ix->obj, lv.type, elem);
         lv.place = lv.place.Inside(IsArrayKind(lv.type, A_GROW));
-        CheckIntAny(ix->idx);
+        if (use != PathUse::Reread) CheckIntAny(ix->idx);
         if (lv.type->cq) lv.writable = false;   // An element of a const value.
         lv.letbound = false;
         lv.type = elem;
@@ -109,19 +109,31 @@ inline TypeCheck::LVal TypeCheck::CheckLValue(Node *n) {
 // The base of a path: itself a path, or any other expression (a call
 // result, a string literal, ...) whose value is then addressed. A null
 // root means static data; a temporary has a root of its own (TempRoot).
-// `cmpview`: the path is the slice `==` compares an operand as (§4.5),
+// ComparisonView: the path is the slice `==` compares an operand as (§4.5),
 // which ends with the comparison, so it may view any temporary.
-inline TypeCheck::LVal TypeCheck::LValueBase(Node *n, bool cmpview) {
+// Reread: a for loop follows its path again, but its computed base and
+// indices are evaluated only on entry (GenLoc, §6.5).
+inline TypeCheck::LVal TypeCheck::LValueBase(Node *n, PathUse use) {
     DestScope ds(*this, Dest {});
-    if (!cmpview && (Is<Ident>(n) || Is<Dot>(n) || Is<Index>(n))) return CheckLValue(n);
+    if (use == PathUse::Reread) {
+        n = AddressedPath(n);
+        if (Is<Ident>(n) || PathObject(n)) return CheckLValue(n, use);
+        auto saved = nodevals.find(n);
+        assert(saved);  // ValueBase recorded the materialized operand on entry.
+        return ValueBase(n, *saved);
+    }
+    if (use == PathUse::Evaluate && (Is<Ident>(n) || Is<Dot>(n) || Is<Index>(n))) return CheckLValue(n);
     auto v = CheckV(n, nullptr);
-    if (!cmpview) NoTemporaryLiteral(n, v.type);
+    if (use == PathUse::Evaluate) NoTemporaryLiteral(n, v.type);
     return ValueBase(n, v);
 }
 
 inline TypeCheck::LVal TypeCheck::ValueBase(Node *n, const Val &v) {
     NoUntypedEmptyArray(v, n, "an index, slice or field of it");
     n->exprtype = v.type;
+    // A loop may reread a path through this materialized value. Keep even
+    // a rootless value's writability and provenance from its evaluation.
+    if (v.None() && !v.holderset) nodevals[n] = v;
     LVal lv;
     lv.type = v.type;
     lv.SetProv(v);

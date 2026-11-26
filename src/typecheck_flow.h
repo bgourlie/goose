@@ -2009,10 +2009,7 @@ inline void TypeCheck::CheckFor(ForLoop *x) {
     auto byref = x->byref;
     TypeExpr *bindtype = nullptr;
     TypeExpr *elemtype = nullptr;   // The array's element type, where it has one.
-    Prov iterprov;   // What a reference binding points into.
-    RefPlace elementplace;
-    ReadBack contents;   // Where the elements point, when the array is a temporary.
-    auto intemp = false;
+    Val sequence;    // A computed sequence is materialized once (§6.5).
     // A binder's written integer type (§6.5).
     auto written = [&](TypeExpr *te, const char *what) -> TypeExpr * {
         if (!te) return nullptr;
@@ -2080,13 +2077,7 @@ inline void TypeCheck::CheckFor(ForLoop *x) {
         NoTemporaryLiteral(x->iter, iv.type);
         x->iter->exprtype = iv.type;
         auto t = iv.type;
-        iterprov = iv;
-        intemp = TempContents(iv, contents);
-        if (t->kind == TY_REF && !t->ref->optional) {
-            t = t->ref->sub;  // Iterate through refs.
-            iterprov.ClearReads();   // As DerefLValue.
-            if (t->kind == TY_SLICE) iterprov = SlotView(iv, t);
-        }
+        if (t->kind == TY_REF && !t->ref->optional) t = t->ref->sub;  // Iterate through refs.
         t = LoadType(t);
         RequireComplete(t, x->line);
         if (IsIntT(t)) {
@@ -2113,7 +2104,7 @@ inline void TypeCheck::CheckFor(ForLoop *x) {
                              "loop's binder is for an integer range or count"));
             auto elem = t->kind == TY_ARRAY ? t->arr->sub : t->sub;
             elemtype = elem;
-            if (intemp) NoRelRefTempRead(x->iter, t, elem);
+            if (IsTemp(iv.Root()) && !IsRefOrSlice(iv.type)) NoRelRefTempRead(x->iter, t, elem);
             x->iterkind = t->kind == TY_ARRAY ? IK_ARRAY : IK_SLICE;
             // Non-fixed elements bind by reference either way (§4.1).
             if (x->byref && ClassOf(elem) != SC_FIXED) {
@@ -2124,7 +2115,6 @@ inline void TypeCheck::CheckFor(ForLoop *x) {
             // An element that is itself a reference binds as the one it holds
             // either way, there being no references to references (§3.8).
             if (byref && elem->kind != TY_REF) {
-                elementplace = iv.ElementPlace();
                 bindtype = ast.RefTo(elem, x->line);
             } else {
                 // An element that *is* a relative reference loads as a
@@ -2136,6 +2126,7 @@ inline void TypeCheck::CheckFor(ForLoop *x) {
                              "&x binding form (copies are not supported)");
                 bindtype = LoadType(elem);
             }
+            sequence = std::move(iv);
         } else {
             Error(x, cat("cannot iterate a value of type ", TypeStr(t)));
         }
@@ -2164,20 +2155,29 @@ inline void TypeCheck::CheckFor(ForLoop *x) {
     // what a holder of the activation's holds is what the passes before
     // stored there too, which the elements later iterations read may be.
     auto readback = IsRefOrSlice(bindtype) && elemtype && (!byref || elemtype->kind == TY_REF);
-    if (readback) iterprov.writable = SlotLoadWritable(elemtype, iterprov.writable);
-    // GenLoc re-reads a sequence's lvalue path on each iteration. Once
-    // the body can repoint its base slice, the initial place no longer
-    // describes the elements a later iteration visits.
-    auto base = AddressedPath(x->iter);
-    while (auto obj = PathObject(base)) base = AddressedPath(obj);
-    auto id = Is<Ident>(base);
-    auto slice = id ? SliceVarOf(id->vdef) : nullptr;
-    auto seqprov = iterprov;
+    auto path = AddressedPath(x->iter);
     auto head = SaveFlow();
     auto sc = CheckLoopPasses(x, head, [&] {
+        // GenLoc follows a sequence's field and element path at each loop
+        // head. Read it in the joined state, before introducing the binders.
+        if (elemtype && Is<Ident>(path)) sequence = CheckV(path, nullptr);
+        else if (elemtype && PathObject(path)) {
+            sequence = ContainerRead(CheckLValue(path, PathUse::Reread));
+            RecordVal(path, sequence);
+        }
+        Prov iterprov = sequence;
+        if (sequence.type && sequence.type->kind == TY_REF) {
+            if (sequence.type->ref->optional) OptionalDerefError(x->iter, x);
+            iterprov.ClearReads();
+            auto t = sequence.type->ref->sub;
+            if (t->kind == TY_SLICE) iterprov = SlotView(sequence, t);
+        }
+        ReadBack contents;
+        auto intemp = elemtype && TempContents(sequence, contents);
         if (readback) {
+            iterprov.writable = SlotLoadWritable(elemtype, iterprov.writable);
             auto slotread = SlotReadable(elemtype);
-            auto rb = ReadBackRoot(elemtype, seqprov, seqprov.byteview,
+            auto rb = ReadBackRoot(elemtype, iterprov, iterprov.byteview,
                                    intemp ? &contents : nullptr, slotread, true);
             iterprov.TakeAlts(rb);
             for (auto &a : iterprov.alts) a.slotread = slotread;
@@ -2201,7 +2201,7 @@ inline void TypeCheck::CheckFor(ForLoop *x) {
         }
         if (IsRefOrSlice(bindtype)) {
             BindProv(vd, iterprov);
-            vd->refplace = slice && slice->slotref ? RefPlace {} : elementplace;
+            vd->refplace = readback ? RefPlace {} : sequence.ElementPlace();
         }
         x->vdef = vd;
         if (!x->idxvar.empty()) {
