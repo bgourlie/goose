@@ -189,12 +189,16 @@ inline void TypeCheck::DerefLValue(LVal &lv, Node *at) {
 // identifier at `at` names it.
 inline void TypeCheck::RequireAssigned(VarDef *vd, Node *at, string_view use) {
     if (vd->assigned) return;
-    // An uninitialized local has a declared type. A probe can use it to
-    // choose an overload; the selected evaluation checks each actual read.
-    if (!vd->isglobal && vd->type && (cur.probingtypes || ProbeReadsCapture(vd))) return;
     // Its initializer's check failed and reported why: a use is no error
     // of its own.
     if (failedglobals.count(vd)) throw Abandoned {};
+    // A probe may use a declared type before a local or global has a value.
+    // If a nested body depended on that read, check it again at an actual call.
+    if (vd->type && probebody >= 0 &&
+        (cur.probingtypes || vd->isglobal || vd->ownerspec != CurRealFrame().spec)) {
+        MarkProbeCallees();
+        return;
+    }
     auto order = vd->isglobal
                      ? cat(": globals initialize in declaration order, imported files first "
                            "(§11.1), so ", vd->name, " has no value until its initializer at ",
@@ -202,21 +206,6 @@ inline void TypeCheck::RequireAssigned(VarDef *vd, Node *at, string_view use) {
                      : string();
     if (!use.empty()) Error(at, cat(use, " reads ", vd->name, " before it is assigned", order));
     Error(at, cat("variable ", vd->name, " may be used before it is assigned", order));
-}
-
-// A probe sometimes needs the body (an inferred result or effects on the
-// next operand). A captured local's type is available independently of its
-// assignment at that call site. Recheck every body that depended on the
-// provisional read if execution later reaches it, including its callers.
-inline bool TypeCheck::ProbeReadsCapture(VarDef *vd) {
-    if (vd->ownerspec == CurRealFrame().spec) return false;
-    for (auto i = (int)outerbodies.size() - 1; i >= 0; i--) {
-        if (!outerbodies[i]->probingtypes) continue;
-        for (auto &frame : frames)
-            if (frame.bodyidx > i && frame.spec) provisionalcaptures.insert(frame.spec);
-        return true;
-    }
-    return false;
 }
 
 // A conversion into an index or bound type, and from_bytes' verification of
@@ -1067,10 +1056,21 @@ inline Val TypeCheck::CheckValue(Node *&n, TypeExpr *expected, bool callsite, bo
         replacement = Is<Call>(n) ? &*delivery : nullptr;
     }
     Saved replacing(curdst.replacement, replacement);
+    auto tagslot = construction && reachable && expected && expected->kind == TY_ENUM && Is<Call>(n);
     auto v = CheckV(n, expected);
+    // A variant built behind its tag writes the tag before the call runs
+    // (GenAdtAdapted), even if the payload never reaches the destination.
+    if (tagslot && Is<Call>(n)->builtin != B_COPY) {
+        auto from = IsPlainRef(v.type) ? v.type->ref->sub : v.type;
+        if (from->kind == TY_VARIANT && (expected->enu->varmode || FixedPlacedResult(from)))
+            construction->started = true;
+    }
     if (delivery && reachable && v.HasResultType()) NoteOverwrite(std::move(*delivery));
-    // A branch delivers its value before its scope's defers run.
-    if (construction && v.type->kind != TY_VOID && reachable) construction->started = true;
+    // A branch delivers its value before its scope's defers run. An array
+    // literal built here has already recorded its count and each element;
+    // an empty run writes only the count.
+    if (construction && v.HasResultType() && reachable && !((literal || run) && Is<ArrayLit>(orig)))
+        construction->started = true;
     // An argument's casts are its call's to judge (JudgeCallCasts).
     if (!callsite) JudgeCastAt(orig, expected && expected->kind != TY_VOID ? expected : nullptr, v);
     // A nominal default is an ordinary construction at this destination,
@@ -3276,11 +3276,13 @@ inline TypeCheck::LitDeep TypeCheck::CheckInits(StructLit *sl, vector<Field> &fi
         // A tag, an omitted optional, or leading padding emitted on the
         // stack can write before the first explicit field is evaluated.
         auto first = sl->fieldindices.empty() ? fields.size() : (size_t)sl->fieldindices.front();
+        auto stack = construction->stack || (curdst.result && ClassOf(selft) != SC_FIXED);
         construction->started |= selft->kind == TY_ENUM ||
             any_of(fields.begin(), fields.begin() + first, [&](const Field &f) {
-                return !f.ispad || (construction->stack && f.padsize > 0);
+                return !f.ispad || (stack && f.padsize > 0);
             });
     }
+    Saved fieldcounts(curdst.countdest, ArrayCountDest::Storage);
     for (size_t k = 0; k < sl->inits.size(); k++) {
         auto &fi = sl->inits[k];
         auto ft = ftypes[sl->fieldindices[k]];

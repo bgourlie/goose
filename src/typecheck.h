@@ -352,11 +352,17 @@ struct TypeCheck {
     };
     // A caller can decide whether the value lands in its storage after
     // learning its type. Track whether construction could already have written.
+    enum class ArrayCountDest { Storage, Result, Separate };
     struct Construction {
         bool literal;  // A literal starts building in the slot itself.
         ArrayLit *run = nullptr;  // An append builds only this literal's elements.
         bool stack = false;  // Stack construction also writes explicit layout padding.
         bool started = false;
+        bool wrotecount = false; // Only the outermost array's separately deliverable count.
+        void WriteCount(ArrayCountDest dest) {
+            if (dest == ArrayCountDest::Storage) started = true;
+            if (dest == ArrayCountDest::Result) wrotecount = true;
+        }
     };
     // The destination of the value under construction (for reference stores):
     // where the storage the value lands in may be (an lvalue's roots).
@@ -387,6 +393,7 @@ struct TypeCheck {
         bool fill = false;
         bool appended = false;       // New elements at the end of a grow-only array.
         Construction *construction = nullptr;
+        ArrayCountDest countdest = ArrayCountDest::Storage;
         Kill *replacement = nullptr; // Whole assigned value; its fields are separate destinations.
         Dest() {}
         Dest(const Roots &r, bool vb = false, TypeExpr *re = nullptr)
@@ -640,11 +647,15 @@ struct TypeCheck {
         d.resultindex = index;
         // The expression may start writing before its result type is inferred.
         // Keep that evidence if the resolved result needs its caller's location.
-        if (hasdefers && spec && spec == CurRealFrame().spec &&
-            ((size_t)index >= spec->rets.size() || FixedPlacedResult(spec->rets[index]))) {
-            auto &writing = cur.fixedresults[index];
+        if (hasdefers && spec &&
+            ((size_t)index >= spec->rets.size() || BuiltInPlace(spec->rets[index]))) {
+            // A nonlocal return constructs through the target's result channel.
+            auto &body = spec == CurRealFrame().spec ? cur : StateOf(FrameOfSpec(spec));
+            auto &writing = body.resultconstruction[index];
             writing.literal = true;
+            writing.stack = (size_t)index < spec->rets.size() && ClassOf(spec->rets[index]) != SC_FIXED;
             d.construction = &writing;
+            d.countdest = ArrayCountDest::Result;
         }
         return d;
     }
@@ -2677,7 +2688,8 @@ struct TypeCheck {
     void NoteStorageWrite(const Roots &storage, TypeExpr *type, const RefPlace &place = {}) {
         NoteStorageWrite(storage, type, place, reachable);
     }
-    void NoteCallConstruction(const vector<TypeExpr *> &results, const FnSpec *callee = nullptr);
+    void NoteCallConstruction(const vector<TypeExpr *> &results, const FnSpec *callee = nullptr,
+                              bool dispatch = false);
     void BeginCallResults();
     void ApplyCalleeWrites(FnSpec *spec, const vector<Val> &args);
     void CheckDefer(Defer *d);
@@ -3101,7 +3113,7 @@ struct TypeCheck {
         // call or initializer checks the storage effects in that order.
         // A newly specialized callee still checks and records its own body.
         std::optional<int> probingtypes; // Last scope serial before the innermost probe.
-        map<int, Construction> fixedresults;
+        map<int, Construction> resultconstruction;
         Rebuild *rebuild = nullptr;
         // The node being checked and every node it is nested in (PathEntry).
         vector<PathEntry> nodepath;
@@ -3145,20 +3157,32 @@ struct TypeCheck {
         vector<Kill> kills;
     };
     BodyState cur;
-    // Bodies that supplied a type during a probe using a capture that had
-    // no value yet. A call that executes must check its own specialization.
-    unordered_set<FnSpec *> provisionalcaptures;
-    bool ProbeReadsCapture(VarDef *vd);
-    bool JumpLeavesProbe(int target) const {
-        return cur.probingtypes && scopes[target].serial <= *cur.probingtypes;
+    // The innermost operand probe remains active while a callee checks its
+    // own body. An outward return or read of an uninitialized outer variable
+    // can supply a type there without committing that callee's specialization.
+    int probebody = -1;
+    unordered_set<FnSpec *> provisionalspecs;
+    void MarkProbeCallees() {
+        if (probebody == (int)outerbodies.size()) return;
+        for (auto &frame : frames)
+            if (frame.bodyidx > probebody && frame.spec) provisionalspecs.insert(frame.spec);
+    }
+    bool JumpLeavesProbe(int target) {
+        if (probebody < 0) return false;
+        auto &body = probebody == (int)outerbodies.size() ? cur : *outerbodies[probebody];
+        if (scopes[target].serial > *body.probingtypes) return false;
+        MarkProbeCallees();
+        return true;
     }
     struct OperandTypeProbe {
         TypeCheck &tc;
         const FlowState &entry;
+        Saved<int> body;
         Saved<std::optional<int>> probing;
         Saved<Construction *> writing;
         OperandTypeProbe(TypeCheck &t, const FlowState &flow)
-            : tc(t), entry(flow), probing(t.cur.probingtypes, t.scopeserial),
+            : tc(t), entry(flow), body(t.probebody, (int)t.outerbodies.size()),
+              probing(t.cur.probingtypes, t.scopeserial),
               writing(t.curdst.construction, nullptr) {}
         ~OperandTypeProbe() { tc.RestoreFlow(entry); }
     };
@@ -3418,6 +3442,9 @@ struct TypeCheck {
                 vd->line = g->line;
                 vd->isvar = g->isvar;
                 vd->isglobal = true;
+                // An explicit global type is known even before its value
+                // exists. Its initializer is still checked in source order.
+                vd->type = g->isconst && g->type ? ast.ConstOf(g->type) : g->type;
                 vd->globalindex = globalindex++;
                 vd->reusable = g->reusable;
                 g->defs.push_back(vd);

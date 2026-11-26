@@ -2579,7 +2579,10 @@ struct FnRecord {
         bool exact, indirect;
     };
     vector<StorageWrite> storagewrites;
-    set<int> writtenfixedresults; // Placed fixed results a return expression may have started.
+    enum class ResultWrite { Count, Storage };
+    // A variable array's count can be returned separately from its elements.
+    // Every other write here can change the receiving storage itself.
+    map<int, ResultWrite> resultwrites;
     // Whether this specialization can resume its immediate Goose caller.
     // A return-from to an outer body does not, although its C function returns
     // normally to propagate that exit. Unknown recursive calls may return.
@@ -2799,6 +2802,13 @@ struct FnSpec {
     // (TypeCheck::CheckNamedResultUses): the body is never inlined, where a
     // destination might not take it in place (Optimizer::Scan).
     bool relnamedresult = false;
+    // The checker considers every target discovered so far. Code generation
+    // knows exactly which targets remain in the optimized program.
+    bool receivesouterreturn = false;
+    bool HasElementRun(bool returntarget) const {
+        return rets.size() == 1 && IsArrayKind(rets[0], A_VAR) && body &&
+               !relnamedresult && !returntarget;
+    }
     int id = 0;                    // Unique, for diagnostics/codegen naming.
     // Filled by the optimizer (optimize.h):
     int uses = 0;                  // Call sites in live code (tag-dispatch entries included).

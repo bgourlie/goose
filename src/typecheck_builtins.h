@@ -652,6 +652,7 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
                     // without giving the source a new provenance.
                     auto forwards = hasdefers && (Is<Call>(an) || IsBranchConstruct(an));
                     Saved writing(curdst.construction, forwards ? &construction : nullptr);
+                    Saved count(curdst.countdest, ArrayCountDest::Separate);
                     av = CheckV(an, nullptr);
                 }
                 an->exprtype = av.type;

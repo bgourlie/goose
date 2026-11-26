@@ -3265,7 +3265,8 @@ inline void TypeCheck::CheckAssign(Assign *a) {
             else CheckRefRebindRoot(a, lv.var, v);
             NoteRefPlace(lv.var, v);
         }
-        lv.var->assigned = lv.var->maybeassigned = true;
+        // Only its declaration initializes a global, even inside a type probe.
+        if (!lv.var->isglobal) lv.var->assigned = lv.var->maybeassigned = true;
         KillNarrow(lv.var);
     }
 }
@@ -3316,7 +3317,7 @@ inline void TypeCheck::CheckRebind(Assign *a, LVal &lv) {
         if (!lv.var->refrootknown || lv.var->ref.Unknown()) BindRefProvenance(lv.var, v);
         else if (!v.isnull) CheckRefRebindRoot(a, lv.var, v);
         NoteRefPlace(lv.var, v);
-        lv.var->assigned = lv.var->maybeassigned = true;
+        if (!lv.var->isglobal) lv.var->assigned = lv.var->maybeassigned = true;
         // Rebinding an optional settles its nullness — narrowed only when
         // the new value is provably non-null (a plain reference).
         if (target->ref->optional) {

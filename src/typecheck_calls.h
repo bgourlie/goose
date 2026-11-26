@@ -1422,7 +1422,7 @@ inline Val TypeCheck::TryDispatch(Call *c, vector<SFunction *> &cands, FnSpec *e
             first = spec;
         }
         c->dispatch.push_back(spec);
-        NoteCallConstruction(spec->rets, spec);
+        NoteCallConstruction(spec->rets, spec, true);
         ApplyCalleeStorage(c, spec, armvals, name, argnodes, true);
         CheckCalleeRelative(c, spec, argvals);
         auto rec = RecordOf(spec);
@@ -1795,7 +1795,7 @@ inline FnSpec *TypeCheck::GetOrCreateSpec(MatchInfo &mi, vector<Val> &argvals, N
         }
     }
     for (auto spec : sf->specs) {
-        if (!spec->inprogress && provisionalcaptures.count(spec) &&
+        if (!spec->inprogress && provisionalspecs.count(spec) &&
             !(spec->incycle && CycleHead(spec)->inprogress)) continue;
         // A reuse would merge an exemplar's call into what the real calls
         // agreed on (CheckExemplars).
@@ -2796,6 +2796,7 @@ inline void TypeCheck::ValidateNeeds(FnSpec *spec, Node *callnode) {
 // target's specialization, which the return lands in.
 inline void TypeCheck::AddNeed(FnSpec *s, FnSpec *t) {
     if (!s || s == t || !s->needs.insert(t).second) return;
+    t->receivesouterreturn = true;
     for (auto &e : s->neededges)
         NeedOnPath(s, t, e.first, (int)e.second.size(), [&](int i) { return e.second[i]; });
 }
@@ -3104,7 +3105,7 @@ inline bool TypeCheck::SameRecord(const FnRecord &a, const FnRecord &b, const Fn
     if (!RelativeStore::SameSet(a.relativestores, b.relativestores, Roots::Compare::Cycle))
         return why("relative destinations");
     if (a.mayreturn != b.mayreturn) return why("normal completion");
-    if (a.writtenfixedresults != b.writtenfixedresults) return why("placed result writes");
+    if (a.resultwrites != b.resultwrites) return why("result writes");
     if (a.exitlinks != b.exitlinks) return why("link effects on return");
     auto sameresults = [](const vector<RetRoot> &x, const vector<RetRoot> &y) {
         return equal(x.begin(), x.end(), y.begin(), y.end(),
@@ -3621,9 +3622,11 @@ inline void TypeCheck::CheckSpecBodyOnce(FnSpec *spec, vector<Val> *argvals, Lin
             exits.vars[i]->maybeassigned = exits.maybeassigned[i];
         }
     }
-    for (auto &[index, writing] : cur.fixedresults)
-        if (writing.started && (size_t)index < spec->rets.size() && FixedPlacedResult(spec->rets[index]))
-            spec->record.writtenfixedresults.insert(index);
+    for (auto &[index, writing] : cur.resultconstruction) {
+        if ((size_t)index >= spec->rets.size() || !BuiltInPlace(spec->rets[index])) continue;
+        if (writing.started) spec->record.resultwrites[index] = FnRecord::ResultWrite::Storage;
+        else if (writing.wrotecount) spec->record.resultwrites[index] = FnRecord::ResultWrite::Count;
+    }
     spec->record.mayreturn = exits.reached;
     reachable = savereach;
     RecordEnvExits(spec);
@@ -4028,6 +4031,12 @@ inline void TypeCheck::CheckReturn(Return *r) {
     // A return written in a defer body, or in a function value written in
     // one, would leave the body (§6.6), whichever function it exits.
     if (deferbodies && InDeferBody()) Error(r, "return cannot leave a defer body (§6.6)");
+    // Only the selected evaluation may deliver this return to an enclosing
+    // function. A helper checked inside the probe still infers its own returns.
+    if (JumpLeavesProbe(frames[tf].scopebase)) {
+        reachable = false;
+        return;
+    }
     auto tspec = frames[tf].spec;
     r->target = frames[tf].sf;
     r->targetspec = tspec;
@@ -4334,15 +4343,22 @@ inline void TypeCheck::BeginCallResults() {
 // A call can start constructing a value in its destination
 // after its operands complete, even if the callee subsequently exits
 // without returning. A reference result is loaded after the call.
-inline void TypeCheck::NoteCallConstruction(const vector<TypeExpr *> &results, const FnSpec *callee) {
+inline void TypeCheck::NoteCallConstruction(const vector<TypeExpr *> &results, const FnSpec *callee,
+                                            bool dispatch) {
     if (!reachable || cur.probingtypes) return;
     for (size_t i = 0; i < results.size(); i++) {
         auto dest = CallResultDest(i);
         auto t = results[i];
         if (!dest || !dest->construction || !IsAggregate(t) || !BuiltInPlace(t)) continue;
-        if (ClassOf(t) == SC_FIXED && callee) {
-            auto rec = RecordOf(callee);
-            if (rec && !rec->mayreturn && !rec->writtenfixedresults.count((int)i)) continue;
+        if (auto rec = callee ? RecordOf(callee) : nullptr; rec && !rec->mayreturn) {
+            auto write = rec->resultwrites.find((int)i);
+            if (write == rec->resultwrites.end()) continue;
+            if (write->second == FnRecord::ResultWrite::Count &&
+                (ClassOf(t) == SC_RESIZABLE ||
+                 (!dispatch && callee->HasElementRun(callee->receivesouterreturn)))) {
+                dest->construction->WriteCount(dest->countdest);
+                continue;
+            }
         }
         dest->construction->started = true;
     }

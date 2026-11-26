@@ -89,6 +89,14 @@ fn moved_slice(in_helper: bool) -> i64[] {
 }
 
 fn stop() -> i64 { abort("stop"); }
+fn stopped_array() -> i64[] { abort("stop"); }
+fn stopped_empty() -> i64[] { defer { abort("stop"); } return []; }
+fn stopped_first() -> i64[] { [stop()] }
+fn forward_stopped() -> i64[] { stopped_first() }
+fn stopped_local(n: i64) -> i64[] {
+    var result: i64[] = [n, stop()];
+    return result;
+}
 fn numbers(n: i64 = stop()) -> i64[] { [n] }
 fn fixed_numbers(n: i64) -> i64[2] { [n, stop()] }
 struct Linked { n: i64, next: Linked&<u32>? }
@@ -135,6 +143,10 @@ fn stopped_builtin(flag: bool) -> i64[>..] {
     defer { if flag { alias.push(stop()); } }
     defer { if flag { alias.append([1, stop()]); } }
     defer { if flag { alias.append(numbers(stop())); } }
+    defer { if flag { alias.append(stopped_array()); } }
+    defer { if flag { alias.append(stopped_empty()); } }
+    defer { if flag { alias.append(forward_stopped()); } }
+    defer { if flag { alias.append(stopped_local(7)); } }
     defer { if flag { alias.append(if flag { numbers(stop()) } else { numbers() }); } }
     defer { if flag { alias.append(fixed_numbers(1)); } }
     defer { if flag { alias.resize(2, stop()); } }

@@ -1,8 +1,7 @@
 // error: defer body writes through an alias to out
 fn stop() -> i64 { abort("stop"); }
 fn numbers(n: i64) -> i64[] {
-    var result: i64[] = [n, stop()];
-    return result;
+    return [n, stop()];
 }
 fn build(n: i64) -> i64[>..] {
     var out: i64[>..] = [41];

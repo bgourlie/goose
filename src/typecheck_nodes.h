@@ -192,6 +192,7 @@ inline Val ArrayLit::Check(TypeCheck &tc, TypeExpr *expected) {
             expected->arr->akind != A_LIMITED || expected->arr->sizeexpr)
             tc.Error(this, "[..cap] constructs a limited array of construction-time "
                            "capacity; it needs a T[..] destination");
+        if (tc.curdst.construction && tc.reachable) tc.curdst.construction->started = true;
         v.type = expected;
         return v;
     }
@@ -211,6 +212,11 @@ inline Val ArrayLit::Check(TypeCheck &tc, TypeExpr *expected) {
         v.lithi = lithi;
     };
     TypeExpr *elem = nullptr;
+    auto construction = tc.curdst.construction;
+    auto starts = construction && construction->run != this && tc.reachable;
+    // A prefix belongs to the whole array. Counts of nested elements are
+    // part of the bytes written to that array.
+    TypeCheck::Saved elementcounts(tc.curdst.countdest, TypeCheck::ArrayCountDest::Storage);
     int64_t wantcount = -1;
     int64_t capacity = -1;   // A limited array's static capacity, which the literal must fit.
     // The array a literal is where the destination names no array type: a
@@ -222,6 +228,7 @@ inline Val ArrayLit::Check(TypeCheck &tc, TypeExpr *expected) {
         if (tc.ClassOf(elem) == SC_FIXED) return tc.ast.ArrayOf(elem, A_FIXED, line, count);
         auto t = tc.ast.ArrayOf(elem, A_VAR, line);
         tc.ValidateType(t, line, VT_LOCAL);
+        if (starts) construction->WriteCount(elementcounts.saved);
         return t;
     };
     auto atslice = expected && expected->kind == TY_SLICE;
@@ -237,9 +244,10 @@ inline Val ArrayLit::Check(TypeCheck &tc, TypeExpr *expected) {
     TypeCheck::FlagScope nofieldsteps(tc.curdst.fieldsteps, false);
     // A fixed array and an appended run write their elements in order.
     // Other array representations write their length before the elements.
-    if (auto c = tc.curdst.construction; c && c->run != this && expected &&
-        expected->kind == TY_ARRAY && !IsArrayKind(expected, A_FIXED) && tc.reachable)
-        c->started = true;
+    if (starts && expected && expected->kind == TY_ARRAY && !IsArrayKind(expected, A_FIXED)) {
+        if (IsArrayKind(expected, A_LIMITED)) construction->started = true;
+        else construction->WriteCount(elementcounts.saved);
+    }
     if (fillval) {
         auto cnt = tc.FillCount(fillcount);
         if (cnt < 0) tc.Error(this, "array fill count cannot be negative");

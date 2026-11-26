@@ -87,7 +87,25 @@ fn check_format_overload() {
     assert(format(40) { n => n + 2 } == 42);
 }
 
+struct EarlyStop {}
+fn format(out: u8[>..]&, s: EarlyStop) { return 7 from early; }
+fn format(out: u8[>..]&, s: EarlyStop, other: MaybeStop) { abort("wrong overload"); }
+fn early(mode: i64, flag: bool) {
+    var out: u8[>..] = [];
+    fn read() { return later_global; }
+    fn jump() -> i64 { if flag { return true from early; } return 3; }
+    if mode == 0 { format(out, EarlyStop {}, later_global); }
+    if mode == 1 { format(out, EarlyStop {}, read() + 1); }
+    if mode == 2 { format(out, EarlyStop {}, if flag { return true; } else { 3 }); }
+    if mode == 3 { format(out, EarlyStop {}, jump() + 1); }
+    return 42;
+}
+let early_results = [early(0, true), early(1, true), early(2, true), early(3, true)];
+let later_global: i64 = 8;
+
 fn main() {
+    for value in early_results { assert(value == 7); }
+    assert(early(4, true) == 42);
     check_format_overload();
     assert(render(true) == 5 && order == 13);
     order = 0;
