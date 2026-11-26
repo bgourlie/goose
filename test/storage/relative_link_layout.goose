@@ -9,9 +9,17 @@ fn linked() -> Node[] {
 
 fn growable() -> Node[>..] { linked() }
 
+fn as_limited() -> Node[..] { linked() }
+
+fn keep_length(nodes: Node[..]&) {
+    nodes.pop_n(0);
+    nodes.resize(nodes.len);
+}
+
 fn limited_pair() -> Node[..] {
     var nodes: Node[..] = [Node {}, Node {}];
     nodes[0].next .= nodes[1];
+    keep_length(nodes);
     return nodes;
 }
 
@@ -42,6 +50,8 @@ fn entries() -> Entry[] {
 }
 
 fn main() {
+    let converted: Node[] = as_limited();
+    assert(converted.len == 2 && converted[0].next .== converted[1]);
     let pair: Node[] = forward_pair();
     assert(pair.len == 2 && pair[0].next .== pair[1]);
     let run: Node[] = grown_pair();

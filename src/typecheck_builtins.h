@@ -477,6 +477,7 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
     };
     // resize has two forms (§3.3); a target below zero is caught at runtime.
     bool empties = d.kind == B_CLEAR;
+    bool maydropslots = d.flags & BF_SHRINKS;
     if (d.kind == B_RESIZE) {
         auto length = CheckIntAny(args[1]);
         if (args.size() == 3) {
@@ -613,7 +614,13 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
     for (auto i = 0; d.args[i]; i++) {
         auto &an = args[base + i];
         switch (d.args[i]) {
-            case 'i': CheckIntAny(an); break;
+            case 'i': {
+                auto count = CheckIntAny(an);
+                int64_t lo, hi;
+                if (d.kind == B_POP_N && !count.constfrom && IntConsts(count, lo, hi) && !lo && !hi)
+                    maydropslots = false;
+                break;
+            }
             case 'e': {
                 // An element built in place is under construction while
                 // its expression runs (§1.3(4)).
@@ -691,15 +698,17 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
             default: assert(false);
         }
     }
-    // Ordinary builtin stores follow evaluation of all their operands.
-    if (d.flags & BF_WRITE) NoteStorageWrite(rv, recvarr, rv.refplace, reachable || writesduringargs,
-                                             d.flags & BF_SHRINKS ? StorageWrite::MayDropSlots : StorageWrite::Storage);
-    // Popping the current length empties either kind of array. Both
-    // receiver expressions must name the same stable storage.
-    if (d.kind == B_POP_N) {
+    if (d.kind == B_POP_N || d.kind == B_RESIZE) {
         auto len = Is<Dot>(args[1]);
-        empties = len && len->member == B_LEN && SamePath(args[0], len->obj);
+        if (len && len->member == B_LEN && SamePath(args[0], len->obj)) {
+            if (d.kind == B_POP_N) empties = true;
+            // A fill expression can change the length after it was read.
+            else if (args.size() == 2) maydropslots = false;
+        }
     }
+    // Record a write even if its count preserves every limited-array slot.
+    if (d.flags & BF_WRITE) NoteStorageWrite(rv, recvarr, rv.refplace, reachable || writesduringargs,
+                                             maydropslots ? StorageWrite::MayDropSlots : StorageWrite::Storage);
     // Emptying a limited array unpublishes its whole live prefix, just as
     // assigning [] does. Existing slot views keep their storage (§5.3).
     if (empties && ak == A_LIMITED) {

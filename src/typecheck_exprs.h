@@ -1431,6 +1431,7 @@ inline bool TypeCheck::FitsAt(Val &v, TypeExpr *dt, bool delivered) {
             else return false;
             if (v.emptyarr) {
                 if (dt->arr->akind == A_FIXED && ArraySize(dt->arr) != 0) return false;
+                v.intactprefix = IsArrayKind(dt, A_LIMITED);
                 v.type = dt;
                 return true;
             }
@@ -1466,7 +1467,7 @@ inline bool TypeCheck::FitsAt(Val &v, TypeExpr *dt, bool delivered) {
                 links.Include(link, path, target);
             }
             v.elementlinks = std::move(links);
-            v.intactprefix = false;
+            v.intactprefix = IsArrayKind(dt, A_LIMITED);
             v.type = dt;
             return true;
         }
