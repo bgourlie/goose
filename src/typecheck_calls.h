@@ -111,10 +111,19 @@ inline Val TypeCheck::CheckNamedCall(Call *c, Ident *id, TypeExpr *expected) {
         // A user function set sharing a builtin's name (a `format`
         // overload, §3.7) takes the calls it matches; the builtin the rest.
         auto entry = SaveFlow();
-        auto nomatch = false;
-        auto v = ResolveCall(c, cands, env, id->name, nullptr, nopre,
-                             entry, bd ? &nomatch : nullptr, expected);
-        if (!nomatch) return v;
+        bool user = true;
+        if (bd && !cur.probingtypes) {
+            // A builtin can render each argument before evaluating the next.
+            // Select the spelling's meaning before checking either order.
+            OperandTypeProbe probe(*this, entry);
+            user = ResolveCall(c, cands, env, id->name, nullptr, nopre, entry, expected,
+                               CallLookup::Select).type != nullptr;
+        }
+        if (user) {
+            auto lookup = bd ? CallLookup::WithBuiltin : CallLookup::Functions;
+            auto v = ResolveCall(c, cands, env, id->name, nullptr, nopre, entry, expected, lookup);
+            if (v.type) return v;
+        }
         // Without a cast, an argument might have matched a function (JudgeCastAt).
         auto fallback = builtinfallback;
         fallback.insert(c->args.begin(), c->args.end());
@@ -202,11 +211,22 @@ inline FnValBind TypeCheck::LocalFnValue(const vector<SFunction *> &fns, FnSpec 
 inline Val TypeCheck::CheckUfcsCall(Call *c, Dot *d, TypeExpr *expected) {
     if (d->accessorowner) Error(d, "const for field accessor is not callable");
     auto entry = SaveFlow();
-    Val ov;
-    {
+    auto bd = LookupBuiltin(d->name);
+    // A member consumes the checked receiver. Other builtins check operand
+    // zero themselves, with the same context as in the free-function form.
+    auto builtinchecksreceiver = bd && !(bd->flags & BF_MEMBER);
+    auto probesreceiver = builtinchecksreceiver && !cur.probingtypes;
+    auto receiver = [&] {
         PathScope ps(*this, d->obj);
         Discovering discovering(*this, c);
-        ov = CheckV(d->obj, nullptr);
+        return CheckV(d->obj, nullptr);
+    };
+    Val ov;
+    if (probesreceiver) {
+        OperandTypeProbe probe(*this, entry);
+        ov = receiver();
+    } else {
+        ov = receiver();
     }
     d->obj->exprtype = ov.type;
     auto rt = ov.type;
@@ -216,7 +236,6 @@ inline Val TypeCheck::CheckUfcsCall(Call *c, Dot *d, TypeExpr *expected) {
     // remaining builtins (a.f(b) is exactly f(a, b)). Only a member needs
     // an optional receiver narrowed first: the others take it as f(a, b)
     // takes a, so r.assert() is what narrows r (§3.8).
-    auto bd = LookupBuiltin(d->name);
     if (bd && (bd->flags & BF_MEMBER) && !(bd->flags & BF_PROPERTY) &&
         rt->kind == TY_ARRAY) {
         CheckWaitingArg(c, d->obj, &entry);
@@ -253,15 +272,21 @@ inline Val TypeCheck::CheckUfcsCall(Call *c, Dot *d, TypeExpr *expected) {
         DefaultScopeName(d->name, c, true);
         cands = ast.LookupMethods(d->name, d->ns, rt);
     }
-    if (!cands.empty())
-        return ResolveCall(c, cands, env, d->name, &ov, d->obj, entry, nullptr, expected);
-    CheckWaitingArg(c, d->obj, &entry);
+    if (!cands.empty()) {
+        if (probesreceiver) ov = receiver();
+        return ResolveCall(c, cands, env, d->name, &ov, d->obj, entry, expected);
+    }
+    if (!builtinchecksreceiver) CheckWaitingArg(c, d->obj, &entry);
     // A member builtin taking any receiver (bytes_of) takes it as checked.
     NoArrayJoin(ov);
     if (bd && !(bd->flags & BF_PROPERTY)) {
         RefCopyWarnings(ov);
         auto argnodes = c->ArgNodes();
-        auto v = CheckBuiltin(c, *bd, argnodes, &ov);
+        // Inside an enclosing type probe the receiver above already ran in
+        // that probe. A user overload could reuse it, whereas the builtin
+        // starts its own operand checks at the call's entry.
+        if (builtinchecksreceiver && !probesreceiver) RestoreFlow(entry);
+        auto v = CheckBuiltin(c, *bd, argnodes, builtinchecksreceiver ? nullptr : &ov);
         c->SetArgNodes(argnodes);
         return v;
     }
@@ -370,7 +395,7 @@ inline void TypeCheck::AddParamDefaults(Call *c, MatchInfo &best, vector<Node *>
 // each against its concrete parameter type (adapting literals etc.).
 inline Val TypeCheck::ResolveCall(Call *c, vector<SFunction *> &cands, FnSpec *env,
                                   string_view name, Val *preval, Node *&prenode,
-                                  const FlowState &entry, bool *nomatch, TypeExpr *expected) {
+                                  const FlowState &entry, TypeExpr *expected, CallLookup lookup) {
     vector<Node *> argnodes;
     vector<Val> argvals;
     ArgumentFlows inputs { entry };
@@ -400,14 +425,13 @@ inline Val TypeCheck::ResolveCall(Call *c, vector<SFunction *> &cands, FnSpec *e
             // A pending array (`var out = []`) is completed by the builtin
             // sharing this name (push, append, alloc_index, alloc_ref,
             // format), never by user code.
-            if (nomatch && IsPendingArray(v.type)) {
-                *nomatch = true;
-                return Val {};
-            }
+            if (lookup != CallLookup::Functions && IsPendingArray(v.type)) return Val {};
             RequireComplete(v.type, a->line);
-            RefArg(a, v);
-            argnodes.push_back(a);
-            a->exprtype = v.type;
+            auto arg = a;
+            RefArg(arg, v);
+            if (lookup != CallLookup::Select) a = arg;
+            argnodes.push_back(arg);
+            arg->exprtype = v.type;
             argvals.push_back(std::move(v));
         }
     }
@@ -434,14 +458,12 @@ inline Val TypeCheck::ResolveCall(Call *c, vector<SFunction *> &cands, FnSpec *e
                      which));
     };
     if (tied.size() > 1) ambiguous(tied);
+    if (lookup == CallLookup::Select && !tied.empty()) return VoidVal();
     if (tied.empty()) {
         // Tag dispatch (§8.2): the match-as-overload-set form.
-        auto v = TryDispatch(c, cands, env, argnodes, argvals, name, inputs);
+        auto v = TryDispatch(c, cands, env, argnodes, argvals, name, inputs, lookup == CallLookup::Select);
         if (v.type) return v;
-        if (nomatch) {   // The caller has a builtin of this name to fall back on.
-            *nomatch = true;
-            return Val {};
-        }
+        if (lookup != CallLookup::Functions) return Val {};
         // An overload converting an integer argument to a float is the last
         // resort, after dispatch and a builtin: a call either took before
         // the conversion was implicit takes it still (§7.1).
@@ -482,7 +504,8 @@ inline Val TypeCheck::ResolveCall(Call *c, vector<SFunction *> &cands, FnSpec *e
             auto t = IsPlainRef(av.type) ? av.type->ref->sub : av.type;
             return t && t->kind == TY_ENUM;
         });
-        return ties.empty() && conv.size() == 1 && !nomatch && !adt && SameMatch(conv[0], best);
+        return ties.empty() && conv.size() == 1 && lookup == CallLookup::Functions &&
+               !adt && SameMatch(conv[0], best);
     });
     ContextualFloatCall(c, cands, env, argnodes, argvals, best, expected, name);
     FnSpec *denv = nullptr;
@@ -1168,7 +1191,7 @@ inline TypeExpr *TypeCheck::SubstOwn(TypeExpr *pt, vector<pair<string_view, Type
 // Returns a Val with null type when no dispatch position exists.
 inline Val TypeCheck::TryDispatch(Call *c, vector<SFunction *> &cands, FnSpec *env,
                                   vector<Node *> &argnodes, vector<Val> &argvals,
-                                  string_view name, const ArgumentFlows &inputs) {
+                                  string_view name, const ArgumentFlows &inputs, bool matchonly) {
     auto found = -1;
     vector<MatchInfo> matches;  // Per variant, for the found position.
     TypeExpr *enumtype = nullptr;
@@ -1263,6 +1286,7 @@ inline Val TypeCheck::TryDispatch(Call *c, vector<SFunction *> &cands, FnSpec *e
                          "written: a dispatched call passes no case's defaults (§8.2)"));
         return Val {};
     }
+    if (matchonly) return VoidVal();
     // Without a cast, the call resolves as it does where no overload takes
     // it (ResolveCall) and it dispatches at the same position, each variant
     // to the same case.
@@ -2000,6 +2024,7 @@ inline void TypeCheck::ReplayEnvExits(FnSpec *spec) {
 // which records what it had assigned by then for a call reusing it.
 inline void TypeCheck::NoteExit(int tf, Node *at, const vector<RetRoot> &results,
                                 vector<FnRecord::InterruptedAssign> interrupted) {
+    if (cur.probingtypes) return;
     auto current = RealFrameIndex();
     interrupted = CheckExitScopes(std::max(frames[tf].scopebase, frames[current].scopebase), at,
                                   current != tf, std::move(interrupted));
@@ -4097,7 +4122,7 @@ inline Val TypeCheck::CheckFunValCall(Call *c, const FnValBind &fb, TypeExpr *ex
     if (fb.named) {
         vector<SFunction *> cands = fb.set ? *fb.set : vector<SFunction *> { fb.named };
         Node *nopre = nullptr;
-        return ResolveCall(c, cands, fb.env, fb.named->name, nullptr, nopre, SaveFlow(), nullptr, expected);
+        return ResolveCall(c, cands, fb.env, fb.named->name, nullptr, nopre, SaveFlow(), expected);
     }
     auto fv = fb.fv;
     // The body runs in this body's state, as part of the calling statement:
@@ -4261,7 +4286,7 @@ inline bool TypeCheck::ResultLayoutFits(TypeExpr *from, TypeExpr *to) {
 // after its operands complete, even if the callee subsequently exits
 // without returning. A reference result is loaded after the call.
 inline void TypeCheck::NoteCallConstruction(const vector<TypeExpr *> &results, const FnSpec *callee) {
-    if (!reachable) return;
+    if (!reachable || cur.probingtypes) return;
     for (size_t i = 0; i < results.size(); i++) {
         auto dest = CallResultDest(i);
         auto t = results[i];
@@ -4281,6 +4306,7 @@ inline void TypeCheck::NoteCallConstruction(const vector<TypeExpr *> &results, c
 // specialized the body. Concrete local roots must agree here.
 inline bool TypeCheck::RelativeDestination(const Roots &source, Dest dest, TypeExpr *pointee,
                                           Node *at, bool record, bool forwarding) {
+    record = record && !cur.probingtypes;
     if (source.None() || dest.unknown) return true;
     if (!source.Exact() || (!dest.result && !dest.roots.Exact())) return false;
     auto roots = source;
@@ -4336,6 +4362,7 @@ inline bool TypeCheck::RelativeDestination(const Roots &source, Dest dest, TypeE
 }
 
 inline void TypeCheck::CheckCalleeRelative(Call *call, FnSpec *spec, vector<Val> &args) {
+    if (cur.probingtypes) return;
     if (!reachable) return;
     auto rec = RecordOf(spec);
     if (!rec) return;

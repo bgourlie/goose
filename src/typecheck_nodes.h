@@ -354,8 +354,6 @@ inline Val StructLit::Check(TypeCheck &tc, TypeExpr *expected) {
     if (t->kind == TY_STRUCT) {
         auto st = t->struc->st;
         if (t->struc->args.empty() && !st->generics.empty()) {
-            // Inferring generic arguments evaluates no receiving-slot stores.
-            TypeCheck::Saved<TypeCheck::Construction *> writing(tc.curdst.construction, nullptr);
             // Infer the struct's generics from the field initializers as
             // written, in the order written: the first to bind a parameter
             // binds it. A check after the first finds them as CheckInits
@@ -364,6 +362,7 @@ inline Val StructLit::Check(TypeCheck &tc, TypeExpr *expected) {
             // the first inference gave; the source order it kept
             // (sourcefieldindices) picks out the written ones.
             auto entry = tc.SaveFlow();
+            TypeCheck::OperandTypeProbe probe(tc, entry);
             vector<FieldInit *> written;
             if (sourcefieldindices.empty()) {
                 for (auto &fi : inits) written.push_back(&fi);
@@ -411,7 +410,6 @@ inline Val StructLit::Check(TypeCheck &tc, TypeExpr *expected) {
                 args.push_back(bound);
             }
             t = tc.ast.StructOf(st, std::move(args), line);
-            tc.RestoreFlow(entry);
         }
         auto inst = tc.GetStructInst(t);
         sinst = inst;
@@ -465,6 +463,7 @@ inline Val Binary::Check(TypeCheck &tc, TypeExpr *) {
     tc.ForgetCastAlt(this);
     if (op == T_DOTEQ || op == T_DOTNEQ) return tc.CheckRefIdentity(this);
     if (op == T_ANDAND || op == T_OROR) return tc.CheckLogical(this);
+    if (op == T_EQ || op == T_NEQ) return tc.CheckEquality(this);
     auto lv = tc.Operand(left);
     auto rv = tc.Operand(right);
     return tc.CheckBinaryResult(this, lv, rv);

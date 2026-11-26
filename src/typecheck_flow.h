@@ -2590,6 +2590,7 @@ inline Roots TypeCheck::OwnersAtPlace(const Roots &storage, const RefPlace &plac
 // Collect a deferred write while checking the body. Publish it when that
 // defer runs, either to an enclosing defer or to the executing function.
 inline void TypeCheck::RecordStorageWrite(FnRecord::StorageWrite write, Defer *executing) {
+    if (cur.probingtypes) return;
     auto spec = CurRealFrame().spec;
     if (!spec || !write.root || write.root->isglobal || IsTemp(write.root)) return;
     if (!cur.deferring && write.root->ownerspec == spec) {

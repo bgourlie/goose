@@ -1955,6 +1955,39 @@ inline Val TypeCheck::CheckLogical(Binary *b) {
     return v;
 }
 
+// Heterogeneous array comparisons borrow each array as a slice (§4.5).
+// Determine which operands need a view before checking them in order: the
+// left view is then live during the right operand, and neither runs twice.
+inline Val TypeCheck::CheckEquality(Binary *b) {
+    auto element = [](TypeExpr *t) -> TypeExpr * {
+        return t->kind == TY_ARRAY ? t->arr->sub : t->kind == TY_SLICE ? t->sub : nullptr;
+    };
+    if (!cur.probingtypes) {
+        auto entry = SaveFlow();
+        OperandTypeProbe probe(*this, entry);
+        auto lt = LoadType(Operand(b->left).type);
+        if (auto elem = element(lt)) {
+            auto rt = LoadType(Operand(b->right).type);
+            auto other = element(rt);
+            if (other && !TypeEq(lt, rt) && TypeEq(elem, other)) {
+                if (lt->kind != TY_SLICE) b->left = WholeSlice(b->left);
+                if (rt->kind != TY_SLICE) b->right = WholeSlice(b->right);
+            }
+        }
+    }
+    auto lv = Operand(b->left);
+    auto rv = Operand(b->right);
+    if (cur.probingtypes) {
+        auto le = element(LoadType(lv.type)), re = element(LoadType(rv.type));
+        if (le && re && TypeEq(le, re)) {
+            Val v;
+            v.type = ast.booltype;
+            return v;
+        }
+    }
+    return CheckBinaryResult(b, lv, rv);
+}
+
 inline Val TypeCheck::CheckBinaryResult(Binary *b, Val &lv, Val &rv) {
     NoUntypedEmptyArray(lv, b->left, TName(b->op));
     NoUntypedEmptyArray(rv, b->right, TName(b->op));
@@ -1989,27 +2022,6 @@ inline Val TypeCheck::CheckBinaryResult(Binary *b, Val &lv, Val &rv) {
         if (!numeric(lt) || !numeric(rt)) {
             if (lt->kind == TY_FN || lt->kind == TY_VOID)
                 Error(b, "these values cannot be compared");
-            // Two arrays or slices of one element type compare as slices,
-            // whatever their kinds (§4.5): `name == "x"`, `a[..] == b`.
-            auto elemof = [](TypeExpr *t) -> TypeExpr * {
-                if (t->kind == TY_SLICE) return t->sub;
-                if (t->kind == TY_ARRAY) return t->arr->sub;
-                return nullptr;
-            };
-            if (!TypeEq(lt, rt) && elemof(lt) && elemof(rt) &&
-                TypeEq(elemof(lt), elemof(rt))) {
-                if (lt->kind != TY_SLICE) {
-                    b->left = WholeSlice(b->left);
-                    lv = Operand(b->left);
-                    lt = LoadType(lv.type);
-                }
-                if (rt->kind != TY_SLICE) b->right = WholeSlice(b->right);
-                // The adaptation can turn a copied fixed-array operand into
-                // a retained view. Recheck the RHS with that view live, as
-                // call arguments are rechecked after parameter adaptation.
-                rv = Operand(b->right);
-                rt = LoadType(rv.type);
-            }
             if (!TopConstEq(lt, rt))
                 Error(b, cat("== requires operands of the same type, got ",
                              TypeStr(lt), " and ", TypeStr(rt)));

@@ -1949,7 +1949,7 @@ inline void TypeCheck::GrowOnlyShrinkAt(Node *c, const string &op, VarDef *vd,
 // A deferred shrink observes both the writes in its own body up to this
 // point and the storage as it stands when the enclosing block exits.
 inline void TypeCheck::CheckLinkShrink(const LinkShrink &s) {
-    if (!reachable) return;
+    if (!reachable || cur.probingtypes) return;
     if (cur.deferring) {
         cur.deferring->shrinks.emplace_back(s, CurrentLinkEffects());
         return;
@@ -2141,7 +2141,7 @@ inline LinkField TypeCheck::StoredField(const LinkField &field, const Roots &own
 
 inline void TypeCheck::RecordLinkStore(const Roots &owners, TypeExpr *reached,
                                       ElementLink link, Node *at, LinkLocation place, const LinkField &field) {
-    if (!reachable || owners.None()) return;
+    if (!reachable || cur.probingtypes || owners.None()) return;
     link.intail |= place.intail;
     for (auto &d : ShrinkTargets(owners, reached, false)) {
         if (IsTemp(d.root)) continue;
@@ -4580,6 +4580,7 @@ inline TypeExpr *TypeCheck::SoleResizableIn(TypeExpr *t) {
 }
 
 inline void TypeCheck::NoteGrow(Node *at, const Roots &roots, const string &what, TypeExpr *t) {
+    if (cur.probingtypes) return;
     auto arr = SoleResizableIn(t);
     auto note = [&](vector<TypeExpr *> &types) {
         for (auto u : types)
@@ -4600,7 +4601,7 @@ inline void TypeCheck::NoteGrow(Node *at, const Roots &roots, const string &what
 // would be freed under it (CheckGrowsSince).
 inline void TypeCheck::NoteShrinkEvent(Node *at, VarDef *root, TypeExpr *bound,
                                        const string &what, TypeExpr *t) {
-    if (!root || IsTemp(root)) return;
+    if (cur.probingtypes || !root || IsTemp(root)) return;
     cur.growlog.push_back({ at, root, !bound, what, true, SoleResizableIn(t) });
 }
 

@@ -2259,6 +2259,7 @@ struct TypeCheck {
     Val CheckRefIdentity(Binary *b);
     Val CheckLogical(Binary *b);
     Val CheckBinaryResult(Binary *b, Val &lv, Val &rv);
+    Val CheckEquality(Binary *b);
     Val NumericBinary(Binary *b, Val lv, Val rv, TypeExpr *&ct, bool trial);
     void DecidedComparison(Binary *b, const Val &lv, const Val &rv, TypeExpr *lt, TypeExpr *rt);
     Val NumericUnary(Unary *u, const Val &v, bool trial);
@@ -2473,9 +2474,12 @@ struct TypeCheck {
     vector<SFunction *> LookupLocalFns(string_view name, FnSpec *&env);
     FnValBind LocalFnValue(const vector<SFunction *> &fns, FnSpec *env);
     Val CheckUfcsCall(Call *c, Dot *d, TypeExpr *expected);
+    // A name shared with a builtin can fall back to it (null result). During
+    // selection a non-null result just says a user overload or dispatch won.
+    enum class CallLookup { Functions, WithBuiltin, Select };
     Val ResolveCall(Call *c, vector<SFunction *> &cands, FnSpec *env, string_view name, Val *preval,
-                    Node *&prenode, const FlowState &entry, bool *nomatch = nullptr,
-                    TypeExpr *expected = nullptr);
+                    Node *&prenode, const FlowState &entry, TypeExpr *expected,
+                    CallLookup lookup = CallLookup::Functions);
     void MatchCandidates(Call *c, vector<SFunction *> &cands, FnSpec *env, vector<Val> &argvals,
                          vector<MatchInfo> &tied, vector<MatchInfo> &converting, string *failures,
                          string_view name);
@@ -2524,7 +2528,8 @@ struct TypeCheck {
     bool BindTypes(TypeExpr *pt, TypeExpr *at, vector<pair<string_view, TypeExpr *>> &b);
     TypeExpr *SubstOwn(TypeExpr *pt, vector<pair<string_view, TypeExpr *>> &b);
     Val TryDispatch(Call *c, vector<SFunction *> &cands, FnSpec *env, vector<Node *> &argnodes,
-                    vector<Val> &argvals, string_view name, const ArgumentFlows &inputs);
+                    vector<Val> &argvals, string_view name, const ArgumentFlows &inputs,
+                    bool matchonly);
 
     // ------------------------------------------------------------------
     // Specialization: find or create the FnSpec for a resolved call and
@@ -3079,6 +3084,10 @@ struct TypeCheck {
     // from the summary. A function value's body is checked in its call's
     // statement and keeps it (CheckFunValCall).
     struct BodyState {
+        // Operand types needed to choose an evaluation order. The chosen
+        // call or initializer checks the storage effects in that order.
+        // A newly specialized callee still checks and records its own body.
+        bool probingtypes = false;
         map<int, Construction> fixedresults;
         Rebuild *rebuild = nullptr;
         // The node being checked and every node it is nested in (PathEntry).
@@ -3123,6 +3132,16 @@ struct TypeCheck {
         vector<Kill> kills;
     };
     BodyState cur;
+    struct OperandTypeProbe {
+        TypeCheck &tc;
+        const FlowState &entry;
+        FlagScope probing;
+        Saved<Construction *> writing;
+        OperandTypeProbe(TypeCheck &t, const FlowState &flow)
+            : tc(t), entry(flow), probing(t.cur.probingtypes, true),
+              writing(t.curdst.construction, nullptr) {}
+        ~OperandTypeProbe() { tc.RestoreFlow(entry); }
+    };
     // The states of the bodies being checked around this one, outermost
     // first: the callers' on the compile-time call path.
     vector<BodyState *> outerbodies;
@@ -3165,6 +3184,7 @@ struct TypeCheck {
     void ApplyCalleeGrows(Node *at, FnSpec *spec, vector<Val> &argvals, string_view name);
     void ApplyCalleeStorage(Node *at, FnSpec *spec, vector<Val> &args, string_view name,
                             const vector<Node *> &argnodes, bool applyexits) {
+        if (cur.probingtypes) return;
         ApplyCalleeShrinks(at, spec, args, name, argnodes, applyexits);
         // A write through a stored reference can reach a value installed
         // by this same call. Its stores have now been mapped to the caller.

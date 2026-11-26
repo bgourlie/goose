@@ -997,7 +997,22 @@ inline void Assign::CgStmt(CodeGen &cg) {
         else cg.L(lv.s, " = ", x, ";");
         return;
     }
-    cg.GenAny(rhs, Dst { DK_LVALUE, lv.s, lv.t });
+    // Ordinary fixed values are complete, including an inline body's
+    // defers, before an existing slot changes. Embedded relative offsets
+    // must instead be constructed at their final address.
+    if ((cg.IsCtl(rhs) || Is<Call>(rhs)) && cg.IsFix(t) && !cg.NeedsResultLocation(t)) {
+        auto tmp = cg.T();
+        cg.FixedLocal(t, tmp);
+        cg.GenAny(rhs, cg.FreshLv(tmp, t));
+        if (cg.IsStaticLimited(t)) {
+            // Only the live elements of a limited array belong to its value.
+            cg.CopyIntoLimited({ tmp, t, true }, t, line, lv.s, false);
+        } else {
+            cg.L(lv.s, " = ", tmp, ";");
+        }
+    } else {
+        cg.GenAny(rhs, Dst { DK_LVALUE, lv.s, lv.t });
+    }
 }
 
 inline void IncDec::CgStmt(CodeGen &cg) {

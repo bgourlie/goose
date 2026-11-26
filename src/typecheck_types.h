@@ -584,7 +584,7 @@ inline TypeExpr *TypeCheck::PendingElemFromSeq(const Val &av, Node *at) {
 // again at its destination, where its flow and growth effects take place.
 inline void TypeCheck::InferPendingArray(TypeExpr *arrt, Node *input, Node *at, PendingInput kind) {
     auto entry = SaveFlow();
-    auto growbase = cur.growlog.size();
+    OperandTypeProbe probe(*this, entry);
     auto av = DecayRef(CheckV(input, nullptr));
     if (kind == PendingInput::Element) {
         JudgeCastAt(input, nullptr, av);
@@ -592,8 +592,6 @@ inline void TypeCheck::InferPendingArray(TypeExpr *arrt, Node *input, Node *at, 
     } else {
         CompletePending(arrt, PendingElemFromSeq(av, at), at->line);
     }
-    RestoreFlow(entry);
-    cur.growlog.resize(growbase);
 }
 
 inline void TypeCheck::CompletePending(TypeExpr *arrt, TypeExpr *elem, Line l) {
