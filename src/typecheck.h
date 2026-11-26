@@ -2825,7 +2825,8 @@ struct TypeCheck {
     bool RetainsRelativeSlot(TypeExpr *part, TypeExpr *array, TypeExpr *replaced);
     bool LinkMayReachElements(TypeExpr *array, TypeExpr *pointee);
     ValueLinks LiveElementLinks(VarDef *owner, TypeExpr *target = nullptr,
-                               TypeExpr *replaced = nullptr, bool callerchecks = false, Node *shrink = nullptr);
+                               TypeExpr *replaced = nullptr, bool callerchecks = false, Node *shrink = nullptr,
+                               set<TypeExpr *> *globalSlots = nullptr);
     // Whether a shrink whose receiver has these roots knows the arrays it
     // frees: none is static data or a temporary (§5.1).
     static bool ShrinkRootsKnown(const Roots &roots) {
@@ -2852,7 +2853,8 @@ struct TypeCheck {
     std::optional<Kill> MapParamPart(FnSpec *spec, const vector<Node *> &args, const vector<Val> &vals,
                                      size_t param, const string &path, bool relative, size_t at);
     void NoteKill(Assign *assign, const LVal &loc, TypeExpr *target, const Val &v, size_t at);
-    bool MayViewLimitedSlot(const Kill &part, TypeExpr *array, Node *shrink = nullptr);
+    bool MayViewLimitedSlot(const Kill &part, TypeExpr *array, Node *shrink = nullptr,
+                            set<TypeExpr *> *globalSlots = nullptr);
     bool CanExposeLimitedSlot(TypeExpr *array, TypeExpr *pointee);
     bool HasLimitedSlotView(VarDef *owner, const LinkField &part, TypeExpr *array, Node *shrink);
     bool MayKeepLimitedSlots(TypeExpr *t, const Kill &part, Node *value);
@@ -3002,9 +3004,10 @@ struct TypeCheck {
         bool incoming; // Links from before this activation may still survive.
         bool arrayonly;
         set<string> clearedfields;  // Global fields overwritten on every path to this shrink.
+        set<TypeExpr *> slots;  // A global view into these limited arrays can expose a surviving link.
     };
     vector<GlobalShrink> globalshrinks;
-    void NoteGlobalShrink(const LinkShrink &shrink);
+    void NoteGlobalShrink(const LinkShrink &shrink, set<TypeExpr *> slots);
     [[noreturn]] void ThreadIndexError(Node *at, TypeExpr *t);
     void CheckGlobalShrinks();
     // Whether what a store record leads to may point into the array `arr`

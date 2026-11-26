@@ -1422,7 +1422,7 @@ inline bool TypeCheck::RetainsRelativeSlot(TypeExpr *part, TypeExpr *array, Type
 // Consult only writes that reach this point. Captures and globals can
 // also carry links into a body from its caller, until a proven overwrite.
 inline ValueLinks TypeCheck::LiveElementLinks(VarDef *owner, TypeExpr *target, TypeExpr *replaced,
-                                              bool callerchecks, Node *shrink) {
+                                              bool callerchecks, Node *shrink, set<TypeExpr *> *globalSlots) {
     if (!owner->elementlinks) return {};
     auto storage = OwnerType(owner);
     auto t = storage ? LoadType(storage) : target;
@@ -1432,9 +1432,16 @@ inline ValueLinks TypeCheck::LiveElementLinks(VarDef *owner, TypeExpr *target, T
     bool cleared = t && KilledFor(owner, owner, t, arr, since, true, replaced);
     auto emptiestail = replaced && ResizableArrayIn(replaced);
     ValueLinks links;
-    auto retain = [&](ElementLink link, const LinkField &field, const LinkField &to) {
+    auto retain = [&](ElementLink link, const LinkField &field, const LinkField &to,
+                      std::optional<string_view> suffix = {}) {
         if (!link || (emptiestail && link.intail) || !LinkMayReachElements(arr, link.pointee)) return;
         if (target && target->kind == TY_ARRAY && InRetainedField(owner, link.pointee, to.base, to.path)) return;
+        if (shrink && suffix) {
+            Kill part { owner, field.base, string(*suffix), 0, true };
+            auto array = KillPartType(part);
+            if (array && !MayViewLimitedSlot(part, array, shrink,
+                                            link.direction == EL_ANY ? globalSlots : nullptr)) return;
+        }
         // A value read out of its owner carries its field paths with it.
         // Shrink queries only need the types and directions of retained links.
         auto path = [&](const LinkField &part) -> string_view {
@@ -1445,12 +1452,7 @@ inline ValueLinks TypeCheck::LiveElementLinks(VarDef *owner, TypeExpr *target, T
     for (auto &[part, write] : cur.links.live) {
         if (part.owner != owner) continue;
         if (storage && cleared && write.at < since) continue;
-        if (shrink && write.suffix) {
-            Kill suffix { owner, part.field.base, string(*write.suffix), 0, true };
-            auto array = KillPartType(suffix);
-            if (array && !MayViewLimitedSlot(suffix, array, shrink)) continue;
-        }
-        retain(part.link, part.field, part.target);
+        retain(part.link, part.field, part.target, write.suffix);
     }
     auto spec = CurRealFrame().spec;
     // A named callee records shrinks of captured owners as external shrinks.
@@ -1725,10 +1727,16 @@ inline void TypeCheck::NoteOverwrite(Node *lval, const Roots &loc, size_t at, Ty
 // A limited array keeps its capacity slots across assignment (§5.3). Once
 // the live count changes, the old suffix can only be observed through an
 // existing view of an element or one of its parts.
-inline bool TypeCheck::MayViewLimitedSlot(const Kill &part, TypeExpr *array, Node *shrink) {
+inline bool TypeCheck::MayViewLimitedSlot(const Kill &part, TypeExpr *array, Node *shrink,
+                                          set<TypeExpr *> *globalSlots) {
     auto owner = part.container;
-    if (cur.deferring || !owner || owner->isglobal || !owner->type || owner->ownerspec != CurRealFrame().spec)
-        return true;  // The caller may hold such a view.
+    if (cur.deferring || !owner || !owner->type) return true;
+    // Keep an external prefix overwrite conditional. At the shrink each
+    // caller replays it against its own views. Global bindings are checked
+    // after every function's stores are known.
+    if (owner->isglobal || owner->ownerspec != CurRealFrame().spec) {
+        if (!part.relative || !shrink || (owner->isglobal && !globalSlots)) return true;
+    }
     // Follow incoming links back to a live prefix or a held view. A cycle
     // of links entirely within discarded suffixes has no such entry point.
     LinkField start { part.base, part.path };
@@ -1738,6 +1746,7 @@ inline bool TypeCheck::MayViewLimitedSlot(const Kill &part, TypeExpr *array, Nod
         auto [field, type] = std::move(pending.back());
         pending.pop_back();
         if (HasLimitedSlotView(owner, field, type, shrink)) return true;
+        if (owner->isglobal) globalSlots->insert(type);
         for (auto &[slot, write] : cur.links.live) {
             if (slot.owner != owner || slot.target.ApartFrom(field.base, field.path) ||
                 !CanExposeLimitedSlot(type, slot.link.pointee)) continue;
@@ -2197,11 +2206,13 @@ inline void TypeCheck::CheckLinkShrink(const LinkShrink &s) {
         cur.deferring->shrinks.emplace_back(s, CurrentLinkEffects());
         return;
     }
-    if (LiveElementLinks(s.owner, s.array, s.effect.replaced, !s.viaclass, s.at).MayPointForward())
+    set<TypeExpr *> slots;
+    if (LiveElementLinks(s.owner, s.array, s.effect.replaced, !s.viaclass, s.at,
+                         s.owner->isglobal && !s.viaclass ? &slots : nullptr).MayPointForward())
         Error(s.at, cat(s.operation, ": retained storage may have a self-relative link "
                         "to a removed element (§5.1)"));
     if (s.viaclass) return;
-    if (s.owner->isglobal) NoteGlobalShrink(s);
+    if (s.owner->isglobal) NoteGlobalShrink(s, std::move(slots));
     NoteShrink(s.owner, s.bound, s.effect);
     NoteShrinkOrder(s.owner, s.bound);
 }
@@ -3124,7 +3135,7 @@ inline void TypeCheck::ThreadIndexError(Node *at, TypeExpr *t) {
 // A shrink of global array vd, or of what vd only bounds, for
 // CheckGlobalShrinks. The first shrink checked stands for the others of the
 // same array, which differ in nothing that judgement asks.
-inline void TypeCheck::NoteGlobalShrink(const LinkShrink &s) {
+inline void TypeCheck::NoteGlobalShrink(const LinkShrink &s, set<TypeExpr *> slots) {
     auto vd = s.owner;
     auto bound = s.bound, replaced = s.effect.replaced;
     auto arrayonly = s.array && s.array->kind == TY_ARRAY;
@@ -3144,8 +3155,9 @@ inline void TypeCheck::NoteGlobalShrink(const LinkShrink &s) {
         if (gs.arr == vd && gs.incoming == incoming && gs.arrayonly == arrayonly &&
             gs.clearedfields == fields && !gs.replaced == !replaced &&
             (!replaced || TypeEq(gs.replaced, replaced)) && !gs.bound == !bound &&
-            (!bound || TypeEq(gs.bound, bound))) return;
-    globalshrinks.push_back({ vd, bound, s.at->line, s.operation, Chain({}), replaced, incoming, arrayonly, std::move(fields) });
+            (!bound || TypeEq(gs.bound, bound)) && gs.slots == slots) return;
+    globalshrinks.push_back({ vd, bound, s.at->line, s.operation, Chain({}), replaced, incoming,
+                              arrayonly, std::move(fields), std::move(slots) });
 }
 
 // A global may hold a reference into a global array only where a store, or
@@ -3198,7 +3210,23 @@ inline void TypeCheck::CheckGlobalShrinks() {
             }
             for (auto g : ast.globals) {
                 for (auto gd : g->defs) {
-                    if (gd == arr || !gd->type || !HoldsPlainRef(gd->type)) continue;
+                    if (!gd->type || !HoldsPlainRef(gd->type)) continue;
+                    if (!gs.slots.empty()) {
+                        vector<TypeExpr *> reached;
+                        ReachedThroughRefs(gd->type, reached);
+                        for (auto slots : gs.slots) {
+                            if (none_of(reached.begin(), reached.end(), [&](TypeExpr *pt) {
+                                return CanExposeLimitedSlot(slots, pt);
+                            })) continue;
+                            GlobalReach reach { *this, arr, slots, bycontainer, {}, {} };
+                            Line where;
+                            if (reach.Holds(gd, &where))
+                                ErrorIn(LocOf(gs.at), cat(gs.prefix, ": global ", gd->name,
+                                        " may still expose a limited-array slot with a self-relative link "
+                                        "to a removed element, stored at ", Where(where), " (§5.1)"), gs.chain);
+                        }
+                    }
+                    if (gd == arr) continue;
                     // A reference to nothing the array's storage can hold,
                     // nor a u8 that may be a byte view of it, is no concern.
                     vector<TypeExpr *> ps;
