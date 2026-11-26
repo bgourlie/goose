@@ -2869,7 +2869,7 @@ struct TypeCheck {
     // Builtins (§3.7, §9.3, §11.2) and array members (§3.3, §5.4).
 
     Val CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> &args, Val *precv);
-    enum class SlotRemoval { None, Possible, All };
+    enum class SlotRemoval { None, Possible, All, NamedZeroPop };
     SlotRemoval CountedRemoval(BuiltinKind op, const vector<Node *> &args, const Val &count,
                                const Val &receiver, TypeExpr *array);
     void CheckByteOut(Call *c, Node *out, const string &form);
@@ -2898,7 +2898,8 @@ struct TypeCheck {
     const string *EmbedShader(Call *c, vector<Node *> &args);
     const string *EmbedFile(Call *c, vector<Node *> &args);
     void CheckGrowShrink(Node *at, const char *op, Node *recv, const Val &rv,
-                         SlotRemoval removal);
+                         SlotRemoval removal, VarDef *zerocount);
+    bool RelyOnZeroCounts(const set<VarDef *> &counts, Node *at);
     void GrowOnlyAssignKnown(Assign *a, const Roots &built, bool whole);
     bool RetainsRelativeSlot(TypeExpr *part, TypeExpr *array, TypeExpr *replaced);
     bool LinkMayReachElements(TypeExpr *array, TypeExpr *pointee);
@@ -3082,7 +3083,7 @@ struct TypeCheck {
     struct GlobalShrink {
         VarDef *arr = nullptr;
         TypeExpr *bound = nullptr;
-        Line at;
+        Node *at;
         string prefix;
         vector<Diagnostic::Related> chain;
         TypeExpr *replaced;
@@ -3090,6 +3091,7 @@ struct TypeCheck {
         bool arrayonly;
         set<string> clearedfields;  // Global fields overwritten on every path to this shrink.
         set<TypeExpr *> slots;  // A global view into these limited arrays can expose a surviving link.
+        set<VarDef *> zerocounts;
     };
     vector<GlobalShrink> globalshrinks;
     void NoteGlobalShrink(const LinkShrink &shrink, set<TypeExpr *> slots);

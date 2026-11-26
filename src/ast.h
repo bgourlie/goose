@@ -2626,6 +2626,8 @@ struct ShrinkEffect {
     TypeExpr *replaced;
     TypeExpr *arrayreceiver = nullptr; // A shrink of this array alone preserves its owner's fixed fields.
     bool mayremove = true; // A grow-only shrink operation can preserve every slot.
+    // All possible removals are zero-count pops if these bindings retain their initial values.
+    set<VarDef *> zerocounts;
     ShrinkEffect(ShrinkBalance b = SB_UNBALANCED, TypeExpr *r = nullptr)
         : balance(b), replaced(r) {}
 };
