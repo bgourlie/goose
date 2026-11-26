@@ -47,6 +47,7 @@ fn choose(mode: i64, flag: bool) -> i64 {
     var out: u8[>..] = [];
     var later: i64;
     fn read_later() -> i64 { later }
+    fn inferred_later() { read_later() }
     if mode == 0 { print(Stop {}, if flag { 1 } else { 2 }); }
     if mode == 1 {
         let text = Stop {}.str(if flag { 1 } else { 2 });
@@ -71,6 +72,8 @@ fn choose(mode: i64, flag: bool) -> i64 {
     }
     // No overload takes four arguments. The last call is never reached.
     if mode == 7 { format(out, 1, Stop {}, read_later()); }
+    if mode == 8 { format(out, Stop {}, read_later()); }
+    if mode == 9 { format(out, Stop {}, inferred_later() + 1); }
     let text = str(MaybeStop { stop: flag }, if flag { 1 } else { 2 });
     assert(text == "x2");
     return 42;
@@ -94,5 +97,6 @@ fn main() {
     assert(choose(3, true) == 8);
     assert(choose(5, true) == 7 && choose(5, false) == 42);
     assert(choose(6, true) == 7 && choose(6, false) == 7 && choose(7, false) == 7);
+    assert(choose(8, false) == 7 && choose(9, false) == 7);
     print("ok");
 }

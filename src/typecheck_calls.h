@@ -126,6 +126,7 @@ inline Val TypeCheck::CheckNamedCall(Call *c, Ident *id, TypeExpr *expected) {
             // A builtin can render each argument before evaluating the next.
             // Select the spelling's meaning before checking either order.
             OperandTypeProbe probe(*this, entry);
+            Saved querying(signatureoperand, c->args.empty() ? nullptr : c->args.back());
             user = ResolveCall(c, cands, env, id->name, nullptr, nopre, entry, expected,
                                CallLookup::Select).type != nullptr;
         }
@@ -320,11 +321,10 @@ inline void TypeCheck::RefArg(Node *&a, Val &v) {
                     " is passed by reference without it (§4.1)"));
 }
 
-// The type bindings a parameter default sees (§7.1): the function's own, and
-// those of the functions a nested one is declared in that no type parameter
-// of a function inside hides (§11.1), but no function value bound to a
-// generic parameter, which a default does not call.
-inline FnSpec *TypeCheck::ParamDefaultEnv(const MatchInfo &mi) {
+// The type bindings in a resolved declaration: the function's own and the
+// visible bindings of its lexical ancestors (§11.1). Parameter defaults
+// (§7.1) and declared result types both use this environment.
+inline FnSpec *TypeCheck::SignatureTypeEnv(const MatchInfo &mi) {
     auto env = ast.NewFunValEnv();
     env->bindings = mi.bindings;
     vector<string_view> hidden;
@@ -518,9 +518,13 @@ inline Val TypeCheck::ResolveCall(Call *c, vector<SFunction *> &cands, FnSpec *e
                !adt && SameMatch(conv[0], best);
     });
     ContextualFloatCall(c, cands, env, argnodes, argvals, best, expected, name);
+    if (signatureoperand == c && cur.probingtypes) {
+        auto v = ProbeDeclaredResult(c, { &best, 1 });
+        if (v.type) return v;
+    }
     FnSpec *denv = nullptr;
     if (best.nwritten < best.paramtypes.size()) {
-        denv = ParamDefaultEnv(best);
+        denv = SignatureTypeEnv(best);
         AddParamDefaults(c, best, argnodes, argvals, prenode != nullptr, denv);
     }
     LoadSliceArgs(argvals, best.paramtypes);
@@ -534,6 +538,7 @@ inline Val TypeCheck::ResolveCall(Call *c, vector<SFunction *> &cands, FnSpec *e
     // it.
     auto argsreach = reachable;
     RecheckArgs(c, cands, best, denv, argnodes, -1, {}, entry);
+    BeginCallResults();
     // Replay restored the caller's bindings. A completed callee now leaves
     // its captures as its recorded exits did, just as at a reused call.
     if (!spec->inprogress) ReplayEnvExits(spec);
@@ -560,6 +565,26 @@ inline Val TypeCheck::ResolveCall(Call *c, vector<SFunction *> &cands, FnSpec *e
     CalleesReturn({ spec }, argsreach);
     WarnDeprecatedCall(*this, c, name, best.sf);
     return CallResult(c, spec, argvals);
+}
+
+// Only the declared result is needed for the last operand of overload
+// selection. Earlier calls can change what subsequent operands read.
+// An inferred result still needs its body, as do results whose provenance
+// can affect argument conversion and dispatch arms with different results.
+inline Val TypeCheck::ProbeDeclaredResult(Call *c, span<const MatchInfo> matches) {
+    Val v;
+    for (auto &mi : matches) {
+        if (!mi.sf->has_rets || mi.sf->rets.size() != 1) return {};
+        auto t = mi.sf->rets[0];
+        if (HasGenerics(t)) t = SubstEnv(t, SignatureTypeEnv(mi));
+        if (HasGenerics(t) || IsRefOrSlice(t) || HoldsPlainRef(t) ||
+            (v.type && !TypeEq(t, v.type))) return {};
+        v.type = t;
+    }
+    v.Set(TempRoot(), false);
+    c->rettypes = { v.type };
+    lastcallrets = { v };
+    return v;
 }
 
 // Phase 2 of a call (ResolveCall, TryDispatch): each argument checked again
@@ -1295,6 +1320,10 @@ inline Val TypeCheck::TryDispatch(Call *c, vector<SFunction *> &cands, FnSpec *e
         return Val {};
     }
     if (matchonly) return VoidVal();
+    if (signatureoperand == c && cur.probingtypes) {
+        auto v = ProbeDeclaredResult(c, matches);
+        if (v.type) return v;
+    }
     // Without a cast, the call resolves as it does where no overload takes
     // it (ResolveCall) and it dispatches at the same position, each variant
     // to the same case.
@@ -1366,6 +1395,7 @@ inline Val TypeCheck::TryDispatch(Call *c, vector<SFunction *> &cands, FnSpec *e
         });
         RecordVal(argnodes[found], byreference ? argvals[found] : DecayRef(argvals[found]));
     }, inputs.entry);
+    BeginCallResults();
     auto entry = SaveFlow();
     FlowState exits;
     exits.reachable = false;
@@ -1765,6 +1795,8 @@ inline FnSpec *TypeCheck::GetOrCreateSpec(MatchInfo &mi, vector<Val> &argvals, N
         }
     }
     for (auto spec : sf->specs) {
+        if (!spec->inprogress && provisionalcaptures.count(spec) &&
+            !(spec->incycle && CycleHead(spec)->inprogress)) continue;
         // A reuse would merge an exemplar's call into what the real calls
         // agreed on (CheckExemplars).
         if (spec->id < exemplarbase) continue;
@@ -4201,6 +4233,7 @@ inline Val TypeCheck::CheckFunValCall(Call *c, const FnValBind &fb, TypeExpr *ex
     // checked here is an environment of its own (FnSpec::isfunval), so what
     // it declares and specializes captures this clone's variables.
     reachable = reachable && argsreach;
+    BeginCallResults();
     auto named = NamedSpec(fb.env);
     auto env = ast.NewFunValEnv();
     env->sf = named ? named->sf : nullptr;
@@ -4288,6 +4321,14 @@ inline Val TypeCheck::CheckFunValCall(Call *c, const FnValBind &fb, TypeExpr *ex
 inline bool TypeCheck::ResultLayoutFits(TypeExpr *from, TypeExpr *to) {
     if (!to || to->kind == TY_VOID || TopConstEq(from, to)) return true;
     return from->kind == TY_VARIANT && to->kind == TY_ENUM && SameAdt(AdtOf(from), to);
+}
+
+// An argument can write into the old receiver. Effects of the body and
+// its result follow this point; an exit before delivery keeps the old links.
+inline void TypeCheck::BeginCallResults() {
+    if (cur.probingtypes) return;
+    for (auto &d : callresultdsts)
+        if (d.replacement) d.replacement->at = storeevents.size();
 }
 
 // A call can start constructing a value in its destination

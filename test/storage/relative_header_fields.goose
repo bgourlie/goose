@@ -10,6 +10,16 @@ fn reset(header: Header&) { header.first .= null; }
 fn linked(node: Node&) -> Header { Header { first: node } }
 fn forward(node: Node&) -> Header { linked(node) }
 
+fn plant(list: List&) -> i64 { list.header.first .= list.nodes[0]; return 42; }
+fn empty_header(n: i64) -> Header { assert(n == 42); Header {} }
+fn replace(list: List&, use_block: bool) {
+    list.header = if use_block {
+        block { let n = plant(list); break empty_header(n); }
+    } else { empty_header(plant(list)) };
+    assert(list.header.first == null);
+    list.nodes.clear();
+}
+
 fn reset_to_default(list: List&) -> Node&? {
     list.header.first .= list.nodes[0];
     return default<Node&?>();
@@ -27,6 +37,10 @@ export fn clear_shared() {
 
 fn main() {
     var list = List { header: Header {}, nodes: [Node { value: 1 }] };
+    replace(list, false);
+    list.nodes.push(Node { value: 1 });
+    replace(list, true);
+    list.nodes.push(Node { value: 1 });
     list.header.first .= list.nodes[0];
     list.header.first .= null;
     list.nodes.clear();

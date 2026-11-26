@@ -387,6 +387,7 @@ struct TypeCheck {
         bool fill = false;
         bool appended = false;       // New elements at the end of a grow-only array.
         Construction *construction = nullptr;
+        Kill *replacement = nullptr; // Whole assigned value; its fields are separate destinations.
         Dest() {}
         Dest(const Roots &r, bool vb = false, TypeExpr *re = nullptr)
             : roots(r), varbind(vb), reached(re), unknown(r.None()) {}
@@ -2480,6 +2481,9 @@ struct TypeCheck {
     // A name shared with a builtin can fall back to it (null result). During
     // selection a non-null result just says a user overload or dispatch won.
     enum class CallLookup { Functions, WithBuiltin, Select };
+    // No later operand needs this call's effects while selecting an overload.
+    Node *signatureoperand = nullptr;
+    Val ProbeDeclaredResult(Call *c, span<const MatchInfo> matches);
     Val ResolveCall(Call *c, vector<SFunction *> &cands, FnSpec *env, string_view name, Val *preval,
                     Node *&prenode, const FlowState &entry, TypeExpr *expected,
                     CallLookup lookup = CallLookup::Functions);
@@ -2510,7 +2514,7 @@ struct TypeCheck {
     // hooks give every argument.
     bool TryMatch(SFunction *sf, Call *c, vector<Val> &argvals, MatchInfo &mi, string &why,
                   bool defaults = false);
-    FnSpec *ParamDefaultEnv(const MatchInfo &mi);
+    FnSpec *SignatureTypeEnv(const MatchInfo &mi);
     void AddParamDefaults(Call *c, MatchInfo &best, vector<Node *> &argnodes,
                           vector<Val> &argvals, bool receiver, FnSpec *env);
     template<typename F> void InParamDefault(Call *c, const MatchInfo &mi, FnSpec *env,
@@ -2674,6 +2678,7 @@ struct TypeCheck {
         NoteStorageWrite(storage, type, place, reachable);
     }
     void NoteCallConstruction(const vector<TypeExpr *> &results, const FnSpec *callee = nullptr);
+    void BeginCallResults();
     void ApplyCalleeWrites(FnSpec *spec, const vector<Val> &args);
     void CheckDefer(Defer *d);
     DeferEffects CheckDeferredBody(Defer *d);
@@ -2788,6 +2793,7 @@ struct TypeCheck {
     std::optional<Kill> MapParamPart(FnSpec *spec, const vector<Node *> &args, const vector<Val> &vals,
                                      size_t param, const string &path, bool relative, size_t at);
     void NoteKill(Node *lval, const LVal &loc, TypeExpr *target, const Val &v, size_t at);
+    void NoteOverwrite(Kill kill);
     void NoteOverwrite(Node *path, const Roots &loc, size_t at, TypeExpr *target,
                        const RefPlace *place = nullptr);
     bool KilledFor(VarDef *c, VarDef *base, TypeExpr *t, TypeExpr *arr, size_t &since,
@@ -3139,6 +3145,10 @@ struct TypeCheck {
         vector<Kill> kills;
     };
     BodyState cur;
+    // Bodies that supplied a type during a probe using a capture that had
+    // no value yet. A call that executes must check its own specialization.
+    unordered_set<FnSpec *> provisionalcaptures;
+    bool ProbeReadsCapture(VarDef *vd);
     bool JumpLeavesProbe(int target) const {
         return cur.probingtypes && scopes[target].serial <= *cur.probingtypes;
     }

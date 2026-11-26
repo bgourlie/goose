@@ -1673,13 +1673,24 @@ inline void TypeCheck::NoteOverwrite(Node *lval, const Roots &loc, size_t at, Ty
     if (!reachable) return;
     auto kill = OverwrittenPart(lval, loc, target, at, place);
     if (!kill || (!kill->relative && (kill->container->isglobal || kill->base->isglobal))) return;
-    erase_if(cur.kills, [&](const Kill &k) { return k.SamePart(*kill); });
-    cur.kills.push_back(std::move(*kill));
+    NoteOverwrite(std::move(*kill));
+}
+
+inline void TypeCheck::NoteOverwrite(Kill kill) {
+    // A branch or call may already have delivered this part at a more
+    // precise boundary than the enclosing assignment can establish.
+    for (auto &k : cur.kills) {
+        if (!k.SamePart(kill)) continue;
+        k.at = std::max(k.at, kill.at);
+        if (k.relative) ApplyLinkKill(k);
+        return;
+    }
+    cur.kills.push_back(std::move(kill));
     if (cur.kills.back().relative) ApplyLinkKill(cur.kills.back());
 }
 
-// The assignment overwrites old links; the stores made in its RHS start at
-// k.at and belong to the new value.
+// Stores before k.at belong to the old value. Construction of the new
+// value or effects after construction can install links that survive.
 inline void TypeCheck::ApplyLinkKill(const Kill &k) {
     if (cur.links.live.empty()) return;
     auto owner = k.container;

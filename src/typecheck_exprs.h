@@ -191,7 +191,7 @@ inline void TypeCheck::RequireAssigned(VarDef *vd, Node *at, string_view use) {
     if (vd->assigned) return;
     // An uninitialized local has a declared type. A probe can use it to
     // choose an overload; the selected evaluation checks each actual read.
-    if (cur.probingtypes && !vd->isglobal && vd->type) return;
+    if (!vd->isglobal && vd->type && (cur.probingtypes || ProbeReadsCapture(vd))) return;
     // Its initializer's check failed and reported why: a use is no error
     // of its own.
     if (failedglobals.count(vd)) throw Abandoned {};
@@ -202,6 +202,21 @@ inline void TypeCheck::RequireAssigned(VarDef *vd, Node *at, string_view use) {
                      : string();
     if (!use.empty()) Error(at, cat(use, " reads ", vd->name, " before it is assigned", order));
     Error(at, cat("variable ", vd->name, " may be used before it is assigned", order));
+}
+
+// A probe sometimes needs the body (an inferred result or effects on the
+// next operand). A captured local's type is available independently of its
+// assignment at that call site. Recheck every body that depended on the
+// provisional read if execution later reaches it, including its callers.
+inline bool TypeCheck::ProbeReadsCapture(VarDef *vd) {
+    if (vd->ownerspec == CurRealFrame().spec) return false;
+    for (auto i = (int)outerbodies.size() - 1; i >= 0; i--) {
+        if (!outerbodies[i]->probingtypes) continue;
+        for (auto &frame : frames)
+            if (frame.bodyidx > i && frame.spec) provisionalcaptures.insert(frame.spec);
+        return true;
+    }
+    return false;
 }
 
 // A conversion into an index or bound type, and from_bytes' verification of
@@ -1041,7 +1056,19 @@ inline Val TypeCheck::CheckValue(Node *&n, TypeExpr *expected, bool callsite, bo
                    (!expected || expected->kind == TY_VOID || BuiltInPlace(expected));
     auto forwards = construction && (literal || run || IsBranchConstruct(n) || Is<Call>(n));
     Saved writing(curdst.construction, forwards ? construction : nullptr);
+    // Each branch delivers the whole value on its own path. For a leaf,
+    // keep stores from the start of its construction; a call refines that
+    // boundary after its arguments. Never pass a whole overwrite to a field.
+    std::optional<Kill> delivery;
+    auto replacement = cur.probingtypes ? nullptr : curdst.replacement;
+    if (replacement && !IsBranchConstruct(n)) {
+        delivery = *replacement;
+        delivery->at = storeevents.size();
+        replacement = Is<Call>(n) ? &*delivery : nullptr;
+    }
+    Saved replacing(curdst.replacement, replacement);
     auto v = CheckV(n, expected);
+    if (delivery && reachable && v.HasResultType()) NoteOverwrite(std::move(*delivery));
     // A branch delivers its value before its scope's defers run.
     if (construction && v.type->kind != TY_VOID && reachable) construction->started = true;
     // An argument's casts are its call's to judge (JudgeCallCasts).

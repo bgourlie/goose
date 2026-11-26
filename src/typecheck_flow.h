@@ -796,7 +796,7 @@ inline void TypeCheck::DefaultScopeName(string_view name, Node *at, bool fnonly)
             if (p.name == name) error(cat("parameter ", name));
     // Whether a type parameter of f has the name, which hides what is around
     // f's declaration: the default sees it where it is bound to a type
-    // (ParamDefaultEnv).
+    // (SignatureTypeEnv).
     auto typeparam = [&](SFunction *f) {
         for (auto &g : f->generics) {
             if (g.name != name) continue;
@@ -3119,6 +3119,14 @@ inline Val TypeCheck::CheckAssignedValue(Assign *a, TypeExpr *target, TypeExpr *
     auto base = cur.growlog.size();
     Val v;
     {
+        // Track delivery into the exact part being replaced. An argument
+        // evaluated before that delivery can still write to the old value.
+        // A runtime-capacity limited array instead copies after the RHS.
+        std::optional<Kill> replacement;
+        if (!cur.probingtypes && IsAggregate(target) && HasRelRefT(target) &&
+            ClassOf(target) != SC_VARIABLE)
+            replacement = OverwrittenPart(a->lval, built, target, storeevents.size(), &built.place);
+        if (replacement) dest.replacement = &*replacement;
         Rebuild r { cur.rebuild, CurDepth(), a->lval, target, built };
         Saved active(cur.rebuild, arr ? &r : cur.rebuild);
         v = CheckValueAt(a->rhs, target, dest);
