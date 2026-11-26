@@ -2507,7 +2507,7 @@ inline void TypeCheck::ApplyLinkEffects(const LinkEffects &effects) {
     for (auto &[part, write] : effects.writes.live) {
         storeevents.push_back(storeevents[write.at]);
         storeevents.back().boundfield = part.boundfield;
-        cur.links.Add(storeevents.back(), storeevents.size() - 1, write.suffix);
+        cur.links.Add(storeevents.back(), storeevents.size() - 1, write);
     }
 }
 
@@ -2790,10 +2790,15 @@ inline void TypeCheck::RecordStorageWrite(FnRecord::StorageWrite write, Defer *e
     if (cur.probingtypes) return;
     auto spec = CurRealFrame().spec;
     if (!spec || !write.root || write.root->isglobal || IsTemp(write.root)) return;
-    if (write.effect != StorageWrite::Storage && write.root->type && write.root->ownerspec == spec &&
-        IsArrayKind(write.root->type, A_LIMITED) && TopConstEq(write.root->type, write.type)) {
-        write.root->intactprefix = false;
-        cur.links.DropPrefix(write.root);
+    if (write.effect != StorageWrite::Storage) {
+        if (write.root->type && write.root->ownerspec == spec && TopConstEq(write.root->type, write.type))
+            write.root->intactprefix = false;
+        cur.links.DropPrefixes([&](VarDef *prefix) {
+            auto t = prefix->type;
+            if (t && IsAddressRef(t)) t = t->ref->sub;
+            return (!t || TopConstEq(t, write.type)) &&
+                   MayAliasRoots(PrefixOwner(prefix), true, write.root, write.exact) != AL_NO;
+        });
     }
     if (!cur.deferring && write.root->ownerspec == spec) {
         if (!executing || write.effect == StorageWrite::PrefixOnly) return;
@@ -3052,8 +3057,8 @@ inline void TypeCheck::CheckVarDecl(VarDecl *vd, bool global) {
         d->intactprefix = !global && IsArrayKind(t, A_LIMITED) && v && v->intactprefix;
         if (IsArrayKind(t, A_LIMITED) && v) d->limitedcapacity = v->extent.capacity;
         if (v && !global && !d->isvar && IsAddressRef(t) && v->Exact())
-            if (auto owner = LivePrefixTarget(init); owner && owner == v->Root())
-                cur.links.targets[d] = owner;
+            if (auto prefix = LivePrefixTarget(init); prefix && PrefixOwner(prefix) == v->Root())
+                cur.links.targets[d] = prefix;
         if (global) CheckVarExtent(d, vd);
         if (v && IsRefOrSlice(t)) {
             BindRefProvenance(d, *v);

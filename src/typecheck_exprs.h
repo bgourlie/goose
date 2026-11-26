@@ -10,6 +10,18 @@ namespace goose {
 // ------------------------------------------------------------------
 // Lvalue paths: names, fields, elements, optionally through references.
 
+// A local identifies its whole array. An immutable array parameter identifies
+// its particular argument even when several parameters share a lifetime root.
+inline VarDef *TypeCheck::LimitedPrefix(VarDef *owner, const RefPlace &place, TypeExpr *array) {
+    auto base = place.Base();
+    if (!owner || !base || !base->type || base->isglobal || !base->ownerspec ||
+        place.Enclosing() || !place.Path().empty() || place.fields.Multiple()) return nullptr;
+    if (base == owner && TopConstEq(base->type, array)) return base;
+    if (base->isparam && !base->isvar && IsAddressRef(base->type) && base->ref.Exact() &&
+        base->ref.Root() == owner && TopConstEq(base->type->ref->sub, array)) return base;
+    return nullptr;
+}
+
 inline VarDef *TypeCheck::LivePrefixTarget(Node *n) {
     if (!n || cur.links.targets.empty()) return nullptr;
     if (auto u = Is<Unary>(n); u && u->op == T_BITAND) n = u->child;
@@ -104,10 +116,8 @@ inline TypeCheck::LVal TypeCheck::CheckLValue(Node *n, PathUse use) {
         // the subscript invalidates this evidence just like a later shrink.
         cur.links.targets.erase(n);
         auto owner = lv.Exact() ? lv.Root() : nullptr;
-        if (reachable && IsArrayKind(lv.type, A_LIMITED) && !IsRefOrSlice(elem) && owner && owner->type &&
-            owner->ownerspec && owner->ownerspec == CurRealFrame().spec && TopConstEq(owner->type, lv.type) &&
-            lv.place.Base() == owner && lv.place.Path().empty() && !lv.place.Enclosing() && HasRelRefT(elem))
-            cur.links.targets[n] = owner;
+        if (reachable && IsArrayKind(lv.type, A_LIMITED) && !IsRefOrSlice(elem) && HasRelRefT(elem))
+            if (auto prefix = LimitedPrefix(owner, lv.place, lv.type)) cur.links.targets[n] = prefix;
         lv.place = lv.place.Inside(ast.places, IsArrayKind(lv.type, A_GROW));
         if (use != PathUse::Reread) CheckIntAny(ix->idx);
         if (lv.type->cq) lv.writable = false;   // An element of a const value.
@@ -1577,8 +1587,9 @@ inline bool TypeCheck::FitsAt(Val &v, TypeExpr *dt, bool delivered) {
                 }
                 if (recordingrelative && !dt->ref->pool && !curdst.result) {
                     ElementLink link { pointee, curdst.appended ? EL_BACKWARD : EL_ANY };
-                    link.livetarget = have && have == LivePrefixTarget(fitnode) && have == want;
-                    StoreElementLink(curdst, dt, link, fitnode, links, {}, target);
+                    auto prefix = LivePrefixTarget(fitnode);
+                    if (prefix && (PrefixOwner(prefix) != have || have != want)) prefix = nullptr;
+                    StoreElementLink(curdst, dt, link, fitnode, links, {}, target, prefix);
                 }
                 v.type = dt;
                 return true;

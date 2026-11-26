@@ -299,17 +299,12 @@ struct TypeCheck {
             auto operator<=>(const Part &) const = default;
             auto operator<=>(VarDef *v) const { return std::compare_three_way {}(owner, v); }
         };
-        struct Write {
+        struct Write : FnRecord::LinkState {
             size_t at;
-            // An old slot outside a limited array's new live prefix can be
-            // reached only through a view. The path is relative to field.base.
-            std::optional<string_view> suffix;
-            bool livetarget;
 
             void Include(const Write &other) {
                 at = std::max(at, other.at);
-                if (suffix != other.suffix) suffix.reset();
-                livetarget &= other.livetarget;
+                LinkState::Include(other);
             }
         };
         map<Part, Write, std::less<>> live;
@@ -317,10 +312,10 @@ struct TypeCheck {
         // to address a live element of a particular limited array on this path.
         using Target = variant<Node *, VarDef *>;
         map<Target, VarDef *> targets;
-        void DropPrefix(VarDef *owner) {
-            erase_if(targets, [&](const auto &p) { return p.second == owner; });
-            auto [first, last] = live.equal_range(owner);
-            for (; first != last; ++first) first->second.livetarget = false;
+        template<typename F> void DropPrefixes(F matches) {
+            erase_if(targets, [&](const auto &p) { return matches(p.second); });
+            for (auto &[part, write] : live)
+                if (write.liveprefix && matches(write.liveprefix)) write.liveprefix = nullptr;
         }
         vector<RelativeStore> resultlinks; // Writes into the result under construction on this path.
         // A repeated literal captures its operand before installing any
@@ -344,9 +339,9 @@ struct TypeCheck {
             }
         };
         map<ArrayLit *, FillLinks> fills;
-        void Add(const StoreEvent &e, size_t index, std::optional<string_view> suffix = {}, bool livetarget = false) {
+        void Add(const StoreEvent &e, size_t index, FnRecord::LinkState state = {}) {
             Part part { e.container, e.elementlink, e.storefield, e.linkclass, e.linktarget, e.boundfield };
-            Write write { index, suffix, livetarget };
+            Write write { state, index };
             auto [it, added] = live.try_emplace(std::move(part), write);
             if (!added) it->second.Include(write);
         }
@@ -384,7 +379,7 @@ struct TypeCheck {
         FnRecord::LinkStores ClassStores() const {
             FnRecord::LinkStores stores;
             for (auto &[part, write] : live)
-                if (part.summary >= 0) FnRecord::IncludeStore(stores, part.summary, write.suffix);
+                if (part.summary >= 0) FnRecord::IncludeStore(stores, part.summary, write);
             return stores;
         }
         // Loop convergence depends on the possible writes, not event numbers.
@@ -393,8 +388,7 @@ struct TypeCheck {
                    live.size() == o.live.size() &&
                    equal(live.begin(), live.end(), o.live.begin(),
                          [](const auto &a, const auto &b) {
-                             return a.first == b.first && a.second.suffix == b.second.suffix &&
-                                    a.second.livetarget == b.second.livetarget;
+                             return a.first == b.first && a.second == b.second;
                          });
         }
     };
@@ -2059,6 +2053,10 @@ struct TypeCheck {
     enum class PathUse { Evaluate, ComparisonView, Reread };
     LVal CheckLValue(Node *n, PathUse use = PathUse::Evaluate);
     VarDef *LivePrefixTarget(Node *n);
+    static VarDef *PrefixOwner(VarDef *prefix) {
+        return prefix->type && IsAddressRef(prefix->type) ? prefix->ref.Root() : prefix;
+    }
+    VarDef *LimitedPrefix(VarDef *owner, const RefPlace &place, TypeExpr *array);
     LVal LValueBase(Node *n, PathUse use = PathUse::Evaluate);
     LVal ValueBase(Node *n, const Val &v);
     Val CheckSlice(SliceExpr *se, LVal lv);
@@ -2989,7 +2987,7 @@ struct TypeCheck {
         auto [first, last] = cur.links.live.equal_range(v);
         cur.links.live.erase(first, last);
         erase_if(cur.kills, [&](const Kill &k) { return k.container == v; });
-        cur.links.DropPrefix(v);
+        cur.links.DropPrefixes([&](VarDef *prefix) { return prefix == v; });
         cur.links.targets.erase(v);
         if (!v->type || v->isvar || !IsAddressRef(v->type)) return;
         cur.links.ForgetBindings([&](VarDef *base) { return base == v; });
@@ -3019,11 +3017,12 @@ struct TypeCheck {
                             const Roots &mapped, LinkField field, const LinkField **bound = nullptr);
     void RecordElementLinks(const Dest &dest, TypeExpr *type, const ValueLinks &links, Node *at);
     void StoreElementLink(const Dest &dest, TypeExpr *type, ElementLink link, Node *at,
-                          const Roots &borrowed, string_view path = {}, const LinkField &target = {});
+                          const Roots &borrowed, string_view path = {}, const LinkField &target = {},
+                          VarDef *liveprefix = nullptr);
     void FinishFill(ArrayLit *fill, const Dest &dest);
     void RecordLinkStore(const Roots &owners, TypeExpr *reached, ElementLink link, Node *at,
                          LinkLocation place = {}, const LinkField &field = {}, const LinkField &target = {},
-                         const LinkField *boundfield = nullptr, std::optional<string_view> suffix = {});
+                         const LinkField *boundfield = nullptr, FnRecord::LinkState state = {});
     void NoteSlotStore(const StoreEvent &e);
     // How NeverStoredError words a grow-shrink array `gs` a value pointing at
     // `roots` may point into: as the array itself where it is the value's one
@@ -3378,9 +3377,6 @@ struct TypeCheck {
         if (cur.probingtypes) return;
         if (hasdefers && reachable) ApplyCalleeReads(spec, args);
         ApplyCalleeShrinks(at, spec, args, name, argnodes, applyexits);
-        // A write through a stored reference can reach a value installed
-        // by this same call. Its stores have now been mapped to the caller.
-        ApplyCalleeWrites(spec, args);
         ApplyCalleeGrows(at, spec, args, name);
     }
     // Whether an element pushed into, or allocated in, an array of `elem`

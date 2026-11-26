@@ -2978,15 +2978,23 @@ struct FnRecord {
             out.writes.insert(right.writes.begin(), right.writes.end());
         });
     }
-    // Per class store, the limited-array field whose old suffix alone can
-    // still contain it. An unconditional occurrence keeps the write live.
-    using LinkStores = map<int, std::optional<string_view>>;
-    static void IncludeStore(LinkStores &stores, int index, std::optional<string_view> suffix) {
-        auto [it, added] = stores.try_emplace(index, suffix);
-        if (!added && it->second != suffix) it->second.reset();
+    struct LinkState {
+        std::optional<string_view> suffix; // The slot only survives outside this field's live length.
+        VarDef *liveprefix = nullptr;      // The target is live in this array or array parameter.
+
+        void Include(const LinkState &other) {
+            if (suffix != other.suffix) suffix.reset();
+            if (liveprefix != other.liveprefix) liveprefix = nullptr;
+        }
+        bool operator==(const LinkState &) const = default;
+    };
+    using LinkStores = map<int, LinkState>;
+    static void IncludeStore(LinkStores &stores, int index, const LinkState &state) {
+        auto [it, added] = stores.try_emplace(index, state);
+        if (!added) it->second.Include(state);
     }
     static void JoinStores(LinkStores &stores, const LinkStores &other) {
-        for (auto &[index, suffix] : other) IncludeStore(stores, index, suffix);
+        for (auto &[index, state] : other) IncludeStore(stores, index, state);
     }
     // Relative links in the caller's storage at an exit or a shrink.
     // Only common overwrites and possible writes survive a join.

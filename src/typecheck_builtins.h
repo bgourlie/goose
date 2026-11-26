@@ -1495,7 +1495,7 @@ inline ValueLinks TypeCheck::LiveElementLinks(VarDef *owner, TypeExpr *target, T
     for (auto &[part, write] : cur.links.live) {
         if (part.owner != owner) continue;
         if (storage && cleared && write.at < since) continue;
-        retain(part.link, part.field, part.target, write.suffix, write.livetarget);
+        retain(part.link, part.field, part.target, write.suffix, write.liveprefix == owner);
     }
     auto spec = CurRealFrame().spec;
     // A named callee records shrinks of captured owners as external shrinks.
@@ -2469,16 +2469,20 @@ inline void TypeCheck::RecordElementLinks(const Dest &dest, TypeExpr *type, cons
     for (auto [link, path, target] : links.slots) {
         link.intail |= IsArrayKind(type, A_GROW);
         // A returned proof describes this whole array's length.
-        link.livetarget &= IsArrayKind(type, A_LIMITED) && dest.fieldsteps && dest.field.base &&
-                           dest.field.path.empty() && dest.field.base == dest.roots.Root();
+        auto base = dest.field.base;
+        auto prefix = link.livetarget && IsArrayKind(type, A_LIMITED) && dest.fieldsteps &&
+                      dest.field.path.empty() && base && base->ownerspec && !base->isglobal &&
+                      base == dest.roots.Root() ? base : nullptr;
+        link.livetarget = false;
         auto to = dest.field;
         if (to.base && dest.fieldsteps) to.path += target;
-        StoreElementLink(dest, type, link, at, {}, path, to);
+        StoreElementLink(dest, type, link, at, {}, path, to, prefix);
     }
 }
 
 inline void TypeCheck::StoreElementLink(const Dest &dest, TypeExpr *type, ElementLink link, Node *at,
-                                       const Roots &borrowed, string_view path, const LinkField &target) {
+                                       const Roots &borrowed, string_view path, const LinkField &target,
+                                       VarDef *liveprefix) {
     if (!reachable || dest.discarded || dest.roots.None()) return;
     auto reached = dest.reached ? dest.reached : type;
     std::optional<string_view> suffix;
@@ -2490,14 +2494,14 @@ inline void TypeCheck::StoreElementLink(const Dest &dest, TypeExpr *type, Elemen
         // arrays may also place a slot within a growable tail.
         assert(!dest.fieldsteps);
         link.intail |= dest.place.intail;
-        link.livetarget = false; // The captured target can outlive its original length during the fill.
+        // The captured target can outlive its original length during the fill.
         cur.links.fills[dest.repeated].slots[{ reached, link, target }].Add(borrowed);
         return;
     }
     auto field = dest.field;
     if (field.base && dest.fieldsteps) field.path += path;
     RecordLinkStore(dest.roots, reached, link, at, dest.place, field, target,
-                    dest.boundsteps ? ast.places.Project(dest.boundfield, path) : dest.boundfield, suffix);
+                    dest.boundsteps ? ast.places.Project(dest.boundfield, path) : dest.boundfield, { suffix, liveprefix });
 }
 
 inline void TypeCheck::FinishFill(ArrayLit *fill, const Dest &dest) {
@@ -2520,11 +2524,9 @@ inline LinkField TypeCheck::StoredField(const LinkField &field, const Roots &own
 inline void TypeCheck::RecordLinkStore(const Roots &owners, TypeExpr *reached,
                                       ElementLink link, Node *at, LinkLocation place, const LinkField &field,
                                       const LinkField &target, const LinkField *boundfield,
-                                      std::optional<string_view> suffix) {
+                                      FnRecord::LinkState state) {
     if (!reachable || cur.probingtypes || owners.None()) return;
     link.intail |= place.intail;
-    auto livetarget = link.livetarget && owners.Exact();
-    link.livetarget = false;
     for (auto &d : ShrinkTargets(owners, reached, false)) {
         if (IsTemp(d.root)) continue;
         StoreEvent e;
@@ -2542,9 +2544,10 @@ inline void TypeCheck::RecordLinkStore(const Roots &owners, TypeExpr *reached,
         e.at = at->line;
         AddStoreEvent(e);
         auto index = storeevents.size() - 1;
-        cur.links.Add(storeevents.back(), index, e.storefield.base ? suffix : std::nullopt,
-                      livetarget && !d.bound && d.root == owners.Root() && !cur.deferring &&
-                      d.root->ownerspec && d.root->ownerspec == CurRealFrame().spec);
+        auto write = state;
+        if (!e.storefield.base) write.suffix.reset();
+        if (d.bound || !owners.Exact() || d.root != owners.Root()) write.liveprefix = nullptr;
+        cur.links.Add(storeevents.back(), index, write);
     }
 }
 
@@ -4687,14 +4690,22 @@ inline void TypeCheck::ApplyCalleeShrinks(Node *at, FnSpec *spec, vector<Val> &a
         for (size_t i = 0; i < origins.size(); i++) {
             auto &e = storeevents[storesbase + i];
             if (!e.elementlink) continue;
-            std::optional<string_view> suffix;
+            FnRecord::LinkState state;
             if (live && origins[i] >= 0) {
                 auto it = live->find(origins[i]);
                 if (it == live->end()) continue;
-                if (it->second && e.storefield.base) {
+                if (auto prefix = it->second.liveprefix; prefix && !e.bound) {
+                    if (prefix->ownerspec != spec) {
+                        if (PrefixOwner(prefix) == e.container) state.liveprefix = prefix;
+                    } else if (prefix->isparam) {
+                        auto place = ArgumentPlace(spec, prefix, argvals);
+                        state.liveprefix = LimitedPrefix(e.container, place, prefix->type->ref->sub);
+                    }
+                }
+                if (it->second.suffix && e.storefield.base) {
                     auto &from = spec->record.classevents[origins[i]];
                     auto base = from.storefield.base;
-                    FnRecord::CallerKill guard { -1, string(*it->second), true, from.container, base };
+                    FnRecord::CallerKill guard { -1, string(*it->second.suffix), true, from.container, base };
                     auto p = find(spec->params.begin(), spec->params.end(), base);
                     if (p != spec->params.end()) {
                         guard.param = (int)(p - spec->params.begin());
@@ -4702,10 +4713,10 @@ inline void TypeCheck::ApplyCalleeShrinks(Node *at, FnSpec *spec, vector<Val> &a
                     }
                     auto mapped = mapkill(guard);
                     if (mapped && mapped->container == e.container && e.storefield.Within(mapped->base, mapped->path))
-                        suffix = ast.Intern(mapped->path);
+                        state.suffix = ast.Intern(mapped->path);
                 }
             }
-            cur.links.Add(e, storesbase + i, suffix);
+            cur.links.Add(e, storesbase + i, state);
         }
     };
     auto apply = [&](const Hit &h, ShrinkBalance judged) {
@@ -4772,7 +4783,10 @@ inline void TypeCheck::ApplyCalleeShrinks(Node *at, FnSpec *spec, vector<Val> &a
     // The record read: none in a cycle's first round (RecordOf), whose back
     // edge shrinks nothing yet.
     auto rec = RecordOf(spec);
-    if (!rec) return;
+    if (!rec) {
+        ApplyCalleeWrites(spec, argvals);
+        return;
+    }
     // Where each grow-only shrink stands in the body, as the record says: not
     // for a body still being checked or a recursive cycle's, whose rounds
     // replace the record, nor a function value's body.
@@ -4915,10 +4929,15 @@ inline void TypeCheck::ApplyCalleeShrinks(Node *at, FnSpec *spec, vector<Val> &a
     for (auto &h : hits) apply(h, judge(h));
     ApplyCalleeLiveShrinks(at, spec, argvals, name);
     auto projectexit = [&](const FnRecord::ExitLinks &exit) {
-        if (!ordered) return;
-        cur.links = entrylinks;
-        for (auto &k : exit.overwrites) argkill(k, true);
-        projectlinks(&exit.stores);
+        if (ordered) {
+            cur.links = entrylinks;
+            for (auto &k : exit.overwrites) argkill(k, true);
+        }
+        // The mapped stores are available to resolve writes through references.
+        // A possible shrink invalidates incoming targets. The callee has already
+        // judged which of its own writes still have live targets at this exit.
+        ApplyCalleeWrites(spec, argvals);
+        if (ordered) projectlinks(&exit.stores);
     };
     for (auto &exit : rec->outerexits) {
         auto tf = FrameOfSpec(exit.target);
@@ -4933,6 +4952,7 @@ inline void TypeCheck::ApplyCalleeShrinks(Node *at, FnSpec *spec, vector<Val> &a
         RestoreFlow(flow);
     }
     if (applyexits) projectexit(rec->exitlinks);
+    else ApplyCalleeWrites(spec, argvals);
 }
 
 inline bool TypeCheck::BuiltInPlace(TypeExpr *elem) {
