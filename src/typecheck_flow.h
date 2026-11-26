@@ -3108,17 +3108,27 @@ inline Val TypeCheck::CheckAssignedValue(Assign *a, TypeExpr *target, TypeExpr *
         else if (FixedPlacedResult(target)) dest.construction = &construction;
     }
     if (arr) {
+        // The shrink excludes the value being replaced. Publish its
+        // overwrite only once the assignment completes (NoteKill):
+        // an exit from the RHS can still encounter the old header.
+        auto part = OverwrittenPart(a->lval, built, target, storeevents.size(), &built.place)
+                        .value_or(Kill { .relative = true });
+        auto keep = MayKeepLimitedSlots(target, part, nullptr);
+        if (keep && !cur.probingtypes && (Is<StructLit>(a->rhs) || IsBranchConstruct(a->rhs))) {
+            // Resolve constructor fragments, defaults and valued breaks in the
+            // RHS's scope. Only its shape contributes to the entry-state shrink.
+            auto entry = SaveFlow();
+            bool completes;
+            {
+                OperandTypeProbe probe(*this, entry);
+                SlotScope slot(*this, true);
+                CheckValueAt(a->rhs, target, dest);
+                completes = reachable;
+            }
+            if (completes) keep = MayKeepLimitedSlots(target, part, a->rhs);
+        }
         {
-            struct Restore {
-                bool &flag, saved;
-                ~Restore() { flag = saved; }
-            } restore { rebuilding, rebuilding };
-            rebuilding = true;
-            // The shrink excludes the value being replaced. Publish its
-            // overwrite only once the assignment completes (NoteKill):
-            // an exit from the RHS can still encounter the old header.
-            auto part = OverwrittenPart(a->lval, built, target, storeevents.size(), &built.place);
-            auto keep = MayKeepLimitedSlots(target, part.value_or(Kill { .relative = true }), a->rhs);
+            FlagScope rs(rebuilding, true);
             auto replaced = keep ? arr : target;
             ShrinkThrough(a, "assign", ExprStr(a->lval), built, target, { SB_UNBALANCED, replaced });
         }

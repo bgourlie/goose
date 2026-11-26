@@ -1248,18 +1248,6 @@ NODE(StructLit)
             if (fieldindices[k] == fieldidx) return inits[k].val;
         return nullptr;
     }
-    // An in-place assignment checks its initial shrink before checking
-    // the RHS. Inspect the initializer for a known field in place, including
-    // a declared default. CheckInits still evaluates it in its own scope.
-    Node *InitFor(int fieldidx, const vector<Field> &fields) const {
-        if (!fieldindices.empty()) return InitFor(fieldidx);
-        int pos = 0;
-        for (const auto &fi : inits) {
-            if (fi.val->nkind == NK_ConstFor || fi.val->nkind == NK_ConstIf) return nullptr;
-            if (fi.FieldIndex(fields, pos) == fieldidx) return fi.val;
-        }
-        return fields[fieldidx].defaultval;
-    }
 NODE_END
 
 NODE(Unary)

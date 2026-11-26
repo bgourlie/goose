@@ -1826,7 +1826,12 @@ inline bool TypeCheck::MayKeepLimitedSlots(TypeExpr *t, const Kill &part, Node *
     // Every completing arm delivers into the same destination. A block
     // without a tail cannot supply a value (§6.4).
     auto keeps = [&](Node *v) { return MayKeepLimitedSlots(t, part, v); };
+    auto breakskeep = [&](const vector<Break *> &breaks) {
+        return any_of(breaks.begin(), breaks.end(), [&](Break *b) { return keeps(b->val); });
+    };
     if (auto b = Is<Block>(value)) return b->tail && keeps(b->tail);
+    if (auto b = Is<EarlyBlock>(value)) return keeps(b->body) || breakskeep(b->breaks);
+    if (auto l = Is<LoopExpr>(value)) return breakskeep(l->breaks);
     if (auto b = Is<IfExpr>(value)) return keeps(b->thenb) || keeps(b->elseb);
     if (auto m = Is<MatchExpr>(value))
         return any_of(m->arms.begin(), m->arms.end(), [&](const MatchArm &arm) { return keeps(arm.body); });
@@ -1853,7 +1858,7 @@ inline bool TypeCheck::MayKeepLimitedSlots(TypeExpr *t, const Kill &part, Node *
     auto lit = t->kind != TY_ENUM ? Is<StructLit>(value) : nullptr;
     for (auto &run : FieldRuns(t)) for (size_t i = 0; i < run.ftypes->size(); i++)
         if (MayKeepLimitedSlots((*run.ftypes)[i], part.Field((*run.fields)[i].name),
-                                lit ? lit->InitFor((int)i, *run.fields) : nullptr))
+                                lit ? lit->InitFor((int)i) : nullptr))
             return true;
     return false;
 }
