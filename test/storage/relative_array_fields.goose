@@ -157,6 +157,12 @@ fn empty_limited_slots() {
     x.slots[0].link .= x.values[0];
     x.slots.resize(0);
     x.values.clear();
+    x.values.push(44);
+    x.slots.push(Entry {});
+    x.slots[0].link .= x.values[0];
+    x.slots.pop_n(x.slots.len);
+    x.values.clear();
+    assert(x.slots.len == 0 && x.values.len == 0);
 }
 
 fn flat_slot_view() {

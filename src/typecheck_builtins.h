@@ -695,6 +695,10 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
     if (d.flags & BF_WRITE) NoteStorageWrite(rv, recvarr, rv.refplace, reachable || writesduringargs);
     // Emptying a limited array unpublishes its whole live prefix, just as
     // assigning [] does. Existing slot views keep their storage (§5.3).
+    if (ak == A_LIMITED && d.kind == B_POP_N) {
+        auto len = Is<Dot>(args[1]);
+        empties = len && len->member == B_LEN && SamePath(args[0], len->obj);
+    }
     if (empties && ak == A_LIMITED) {
         if (HasRelRefT(elem)) NoteOverwrite(args[0], rv, storeevents.size(), recvarr, &rv.refplace);
         if (HoldsPlainRef(elem)) NoteOverwrite(args[0], rv, storeevents.size(), recvarr, nullptr);
