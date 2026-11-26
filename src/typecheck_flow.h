@@ -2611,26 +2611,30 @@ inline Roots TypeCheck::OwnersAtPlace(const Roots &storage, const RefPlace &plac
 // ends the inline path: its slot and what the slot holds are separate.
 inline void TypeCheck::NoteStorageRead(Node *n) {
     if (!reachable || cur.probingtypes) return;
-    bool slotonly = false;
+    auto property = Is<Dot>(n);
+    bool header = property && (property->member == B_LEN || property->member == B_CAP);
+    bool slotonly = header || cur.bindingread == n;
     if (cur.nodepath.size() > 1) {
         auto parent = cur.nodepath[cur.nodepath.size() - 2].node;
         if (auto d = Is<Dot>(parent); d && d->obj == n) return; // The complete path records the read.
         if (auto a = Is<Assign>(parent); a && a->lval == n) {
-            slotonly = a->op == T_DOTASSIGN || (a->op == T_ASSIGN && n->exprtype && n->exprtype->kind == TY_SLICE);
+            slotonly |= a->op == T_DOTASSIGN || (a->op == T_ASSIGN && n->exprtype && n->exprtype->kind == TY_SLICE);
         } else if (auto b = Is<Binary>(parent)) {
             auto other = b->left == n ? b->right : b->left;
-            slotonly = b->op == T_DOTEQ || b->op == T_DOTNEQ ||
+            slotonly |= b->op == T_DOTEQ || b->op == T_DOTNEQ ||
                        ((b->op == T_EQ || b->op == T_NEQ) && Is<NullLit>(other));
         }
-        if (slotonly && Is<Ident>(n) && n->exprtype && IsRefOrSlice(n->exprtype)) return;
+        if (auto id = Is<Ident>(n); slotonly && id && id->vdef && id->vdef->type && IsRefOrSlice(id->vdef->type))
+            return;
     }
     auto base = n;
     while (auto d = Is<Dot>(base)) base = d->obj;
     auto id = Is<Ident>(base);
     auto v = id ? id->vdef : nullptr;
     auto spec = CurRealFrame().spec;
-    if (!v || !v->type || !spec || (!cur.deferring && !v->isglobal && v->ownerspec == spec)) return;
+    if (!v || !v->type || !spec) return;
     auto ref = IsRefOrSlice(v->type);
+    if (!cur.deferring && !ref && !v->isglobal && v->ownerspec == spec) return;
     auto holder = ref ? PointeeOf(v->type) : v->type;
     auto place = ref ? (v->type->kind == TY_SLICE ? v->SlicePlace() : v->PointeePlace(ast.places))
                      : RefPlace { {}, { v } };
@@ -2679,7 +2683,7 @@ inline void TypeCheck::NoteStorageRead(Node *n) {
         if (ClassOf(t) == SC_ROOT) holder = field;
         if (IsRefOrSlice(field)) {
             // A reference on the way to a destination must be followed to locate its final slot.
-            if (*it != n) slotonly = false;
+            if (*it != n && !(header && *it == property->obj && field->kind == TY_SLICE)) slotonly = false;
             break;
         }
     }
@@ -2747,7 +2751,10 @@ inline void TypeCheck::CollectStorageRead(vector<StorageRead> &reads, const Stor
 
 inline void TypeCheck::RecordStorageRead(const StorageRead &read) {
     auto spec = CurRealFrame().spec;
-    if (!spec || (!cur.deferring && !read.var->isglobal && read.var->ownerspec == spec)) return;
+    if (!spec) return;
+    // A binding local to a helper can still dereference storage from its caller.
+    if (!cur.deferring && !read.var->isglobal && read.var->ownerspec == spec &&
+        (!read.owner.root || read.owner.root->ownerspec == spec)) return;
     auto &reads = cur.deferring ? cur.deferring->reads : spec->record.capturereads;
     CollectStorageRead(reads, read);
 }
@@ -3144,6 +3151,7 @@ inline void TypeCheck::CheckVarDecl(VarDecl *vd, bool global) {
                 vd->inits[i] = refinit->child;
                 refinit = nullptr;
             }
+            Saved binding(cur.bindingread, vd->byref || (ann && IsRefOrSlice(ann)) ? vd->inits[i] : nullptr);
             if (vd->byref && !ann) {
                 // `let r .= e;` binds a reference to e: an lvalue by
                 // reference, a reference or slice value as it is (§3.8).

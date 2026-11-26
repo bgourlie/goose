@@ -3229,6 +3229,7 @@ struct TypeCheck {
         Rebuild *rebuild = nullptr;
         // The node being checked and every node it is nested in (PathEntry).
         vector<PathEntry> nodepath;
+        Node *bindingread = nullptr; // Initializer evaluated as a reference or slice binding.
         // The argument print, str or format is rendering, and as which
         // builtin: its views stay live while its parts' format overloads run,
         // and so does where it lies (`renderwhere`) unless an overload takes
