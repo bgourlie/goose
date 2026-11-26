@@ -1427,8 +1427,9 @@ inline ValueLinks TypeCheck::LiveElementLinks(VarDef *owner, TypeExpr *target, T
     bool cleared = t && KilledFor(owner, owner, t, arr, since, true, replaced);
     auto emptiestail = replaced && ResizableArrayIn(replaced);
     ValueLinks links;
-    auto retain = [&](ElementLink link, const LinkField &field) {
+    auto retain = [&](ElementLink link, const LinkField &field, const LinkField &to) {
         if (!link || (emptiestail && link.intail) || !LinkMayReachElements(arr, link.pointee)) return;
+        if (target && target->kind == TY_ARRAY && InRetainedField(owner, link.pointee, to.base, to.path)) return;
         // A value read out of its owner carries its field paths with it.
         // Shrink queries only need the types and directions of retained links.
         auto named = !target && field.base == owner && !field.path.empty();
@@ -1442,7 +1443,7 @@ inline ValueLinks TypeCheck::LiveElementLinks(VarDef *owner, TypeExpr *target, T
             auto array = KillPartType(suffix);
             if (array && !MayViewLimitedSlot(suffix, array, shrink)) continue;
         }
-        retain(part.link, part.field);
+        retain(part.link, part.field, part.target);
     }
     auto spec = CurRealFrame().spec;
     // A named callee records shrinks of captured owners as external shrinks.
@@ -1455,10 +1456,22 @@ inline ValueLinks TypeCheck::LiveElementLinks(VarDef *owner, TypeExpr *target, T
                 none_of(cur.kills.begin(), cur.kills.end(), [&](const Kill &k) {
                     return k.relative && !k.prefixonly && k.container == owner && i < k.at &&
                            e.storefield.Within(k.base, k.path);
-                })) retain(e.elementlink, e.storefield);
+                })) retain(e.elementlink, e.storefield, e.linktarget);
         }
     }
     return links;
+}
+
+// The resizable value owns its tail. A field path starting from that
+// value and ending in fixed or variable prefix storage cannot name an
+// element released by shrinking the tail array.
+inline bool TypeCheck::InRetainedField(VarDef *owner, TypeExpr *pointee, VarDef *base, string_view path) {
+    if (!base || !pointee || path.empty()) return false;
+    if (base != owner && !(base->isparam && !base->isvar && IsAddressRef(base->type) &&
+                           base->ref.Exact() && base->ref.Root() == owner &&
+                           ClassOf(base->type->ref->sub) == SC_RESIZABLE)) return false;
+    auto field = FieldPathType(base, path);
+    return field && !IsRefOrSlice(field) && ClassOf(field) != SC_RESIZABLE && CanContain(field, pointee);
 }
 
 // Whether a reference to `of`, or a byte view, may point into what a shrink
@@ -1468,12 +1481,8 @@ inline bool TypeCheck::ShrinkMayFree(VarDef *root, TypeExpr *bound, bool growonl
                                      TypeExpr *of, bool byteview, TypeExpr *receiver, const RefPlace *place) {
     // Shrinking an array releases elements of its tail. An inline field of
     // the same owner outside that tail retains its own storage.
-    if (receiver && receiver->kind == TY_ARRAY && place && place->base == root &&
-        !place->path.empty() && !place->location.intail) {
-        auto field = FieldPathType(root, place->path);
-        if (field && of && !IsRefOrSlice(field) && ClassOf(field) != SC_RESIZABLE && CanContain(field, of))
-            return false;
-    }
+    if (receiver && receiver->kind == TY_ARRAY && place && !place->location.intail &&
+        InRetainedField(root, of, place->base, place->path)) return false;
     if (byteview) return bound ? Viewable(bound) : MayBeViewed(root);
     if (bound) return !of || (growonly ? CanContain(bound, of) : GrowShrinkContains(bound, of));
     if (growonly) {
@@ -1712,27 +1721,44 @@ inline bool TypeCheck::MayViewLimitedSlot(const Kill &part, TypeExpr *array, Nod
     auto owner = part.container;
     if (cur.deferring || !owner || owner->isglobal || !owner->type || owner->ownerspec != CurRealFrame().spec)
         return true;  // The caller may hold such a view.
+    // Follow incoming links back to a live prefix or a held view. A cycle
+    // of links entirely within discarded suffixes has no such entry point.
+    LinkField start { part.base, part.path };
+    set<LinkField> seen { start };
+    vector<pair<LinkField, TypeExpr *>> pending { { start, array } };
+    while (!pending.empty()) {
+        auto [field, type] = std::move(pending.back());
+        pending.pop_back();
+        if (HasLimitedSlotView(owner, field, type, shrink)) return true;
+        for (auto &[slot, write] : cur.links.live) {
+            if (slot.owner != owner || slot.target.ApartFrom(field.base, field.path) ||
+                !CanExposeLimitedSlot(type, slot.link.pointee)) continue;
+            if (write.at < part.at && slot.field.Within(part.base, part.path)) continue;
+            if (!write.suffix) return true;
+            LinkField source { slot.field.base, string(*write.suffix) };
+            if (!seen.insert(source).second) continue;
+            auto container = FieldPathType(source.base, source.path);
+            if (!container || !IsArrayKind(container, A_LIMITED)) return true;
+            pending.emplace_back(std::move(source), container);
+        }
+    }
+    return false;
+}
+
+inline bool TypeCheck::CanExposeLimitedSlot(TypeExpr *array, TypeExpr *pointee) {
     // A view of a flat field cannot expose links in its siblings. A byte
     // view of the element image can still observe the stored representation.
-    auto exposes = [&](TypeExpr *pointee) {
-        return (IsU8(pointee) && Viewable(array)) ||
-               (LinkMayReachElements(array, pointee) &&
-                (HasRelRefT(pointee) || HoldsPlainRef(pointee)));
-    };
+    return (IsU8(pointee) && Viewable(array)) ||
+           (LinkMayReachElements(array, pointee) && (HasRelRefT(pointee) || HoldsPlainRef(pointee)));
+}
+
+inline bool TypeCheck::HasLimitedSlotView(VarDef *owner, const LinkField &part, TypeExpr *array, Node *shrink) {
+    auto exposes = [&](TypeExpr *pointee) { return CanExposeLimitedSlot(array, pointee); };
     auto holderview = [&](TypeExpr *type) {
         vector<TypeExpr *> reached;
         ReachedThroughRefs(type, reached);
         return any_of(reached.begin(), reached.end(), exposes);
     };
-    // Old links inside this array cannot make their own removed slots
-    // reachable. Newly constructed links and links in siblings can.
-    for (auto &[slot, write] : cur.links.live) {
-        if (slot.owner != owner || !exposes(slot.link.pointee)) continue;
-        if (slot.target.ApartFrom(part.base, part.path)) continue;
-        if (slot.field.Within(part.base, part.path) &&
-            (write.at < part.at || write.suffix == part.path)) continue;
-        return true;
-    }
     auto aliases = [&](const Roots &roots) {
         return roots.Unknown() || roots.Any([&](const RootAlt &a) {
             return a.root == owner || (!a.exact && Depth(a.root) >= Depth(owner));
@@ -1740,8 +1766,7 @@ inline bool TypeCheck::MayViewLimitedSlot(const Kill &part, TypeExpr *array, Nod
     };
     auto direct = [&](const Roots &roots, const RefPlace &place, TypeExpr *pointee) {
         if (place.nullonly || !exposes(pointee)) return false;
-        if (place.base && place.base == part.base && !FieldPathWithin(place.path, part.path) &&
-            !FieldPathWithin(part.path, place.path)) return false;
+        if (part.ApartFrom(place.base, place.path)) return false;
         return aliases(OwnersAtPlace(roots, place));
     };
     auto through = [&](VarDef *v, const Prov &p, TypeExpr *t) {
@@ -2051,9 +2076,10 @@ inline void TypeCheck::GrowOnlyShrinkAt(Node *c, const string &op, VarDef *vd,
     // The elements freed: of the array itself, or for a bound, of an array
     // of its type. A parameter class's storage is not known here.
     auto arrtype = ShrunkType(vd, bound);
-    CheckLinkShrink({ c, cat("cannot ", op, " ", what), vd, bound, arr ? arr : arrtype,
+    auto receiver = effect.arrayreceiver ? effect.arrayreceiver : arr;
+    CheckLinkShrink({ c, cat("cannot ", op, " ", what), vd, bound, receiver ? receiver : arrtype,
                       effect, viaclass });
-    CheckHeldShrinks(c, op, vd, what, true, bound, arr);
+    CheckHeldShrinks(c, op, vd, what, true, bound, receiver);
     ShrinkScanVars([&](VarDef *v) {
         // The array's own holder is scanned as any other where the fields
         // before its tail may hold references, which may point into the tail.
@@ -2073,7 +2099,7 @@ inline void TypeCheck::GrowOnlyShrinkAt(Node *c, const string &op, VarDef *vd,
             auto path = t->kind == TY_REF && ClassOf(t->ref->sub) == SC_RESIZABLE;
             auto place = t->kind == TY_REF ? v->PointeePlace() : v->SlicePlace();
             auto into = !path && ShrinkMayFree(vd, bound, true, PointeeOf(t), v->ref.byteview,
-                                               arr, v->isvar ? nullptr : &place) &&
+                                               receiver, v->isvar ? nullptr : &place) &&
                         RefMayPointInto(v, vd, true, bound);
             // A reference to a slice or to a value holding references, the
             // path to an array included, also reaches what those point at,
@@ -2160,7 +2186,7 @@ inline void TypeCheck::CheckLinkShrink(const LinkShrink &s) {
         Error(s.at, cat(s.operation, ": retained storage may have a self-relative link "
                         "to a removed element (§5.1)"));
     if (s.viaclass) return;
-    if (s.owner->isglobal) NoteGlobalShrink(s.at, s.operation, s.owner, s.bound, s.effect.replaced);
+    if (s.owner->isglobal) NoteGlobalShrink(s);
     NoteShrink(s.owner, s.bound, s.effect);
     NoteShrinkOrder(s.owner, s.bound);
 }
@@ -3074,8 +3100,10 @@ inline void TypeCheck::ThreadIndexError(Node *at, TypeExpr *t) {
 // A shrink of global array vd, or of what vd only bounds, for
 // CheckGlobalShrinks. The first shrink checked stands for the others of the
 // same array, which differ in nothing that judgement asks.
-inline void TypeCheck::NoteGlobalShrink(Node *at, const string &prefix, VarDef *vd,
-                                        TypeExpr *bound, TypeExpr *replaced) {
+inline void TypeCheck::NoteGlobalShrink(const LinkShrink &s) {
+    auto vd = s.owner;
+    auto bound = s.bound, replaced = s.effect.replaced;
+    auto arrayonly = s.array && s.array->kind == TY_ARRAY;
     size_t since;
     // A named callee's own array is checked with the links reaching each
     // call. A bound may name another global, and a host can call an export
@@ -3089,10 +3117,11 @@ inline void TypeCheck::NoteGlobalShrink(Node *at, const string &prefix, VarDef *
             if (k.relative && !k.prefixonly && k.container == vd && k.base == vd) fields.insert(k.path);
     }
     for (auto &gs : globalshrinks)
-        if (gs.arr == vd && gs.incoming == incoming && gs.clearedfields == fields && !gs.replaced == !replaced &&
+        if (gs.arr == vd && gs.incoming == incoming && gs.arrayonly == arrayonly &&
+            gs.clearedfields == fields && !gs.replaced == !replaced &&
             (!replaced || TypeEq(gs.replaced, replaced)) && !gs.bound == !bound &&
             (!bound || TypeEq(gs.bound, bound))) return;
-    globalshrinks.push_back({ vd, bound, at->line, prefix, Chain({}), replaced, incoming, std::move(fields) });
+    globalshrinks.push_back({ vd, bound, s.at->line, s.operation, Chain({}), replaced, incoming, arrayonly, std::move(fields) });
 }
 
 // A global may hold a reference into a global array only where a store, or
@@ -3104,9 +3133,10 @@ inline void TypeCheck::NoteGlobalShrink(Node *at, const string &prefix, VarDef *
 inline void TypeCheck::CheckGlobalShrinks() {
     if (globalshrinks.empty()) return;
     map<VarDef *, vector<size_t>> bycontainer;
-    map<VarDef *, set<pair<ElementLink, LinkField>>> globallinks;
+    map<VarDef *, set<tuple<ElementLink, LinkField, LinkField>>> globallinks;
     for (auto &e : storeevents)
-        if (e.elementlink && e.container->isglobal) globallinks[e.container].emplace(e.elementlink, e.storefield);
+        if (e.elementlink && e.container->isglobal)
+            globallinks[e.container].emplace(e.elementlink, e.storefield, e.linktarget);
     for (size_t i = 0; i < madestores.size(); i++)
         bycontainer[madestores[i].container].push_back(i);
     for (auto &gs : globalshrinks) CheckItem([&] {
@@ -3132,8 +3162,9 @@ inline void TypeCheck::CheckGlobalShrinks() {
                 auto &writes = globallinks[arr];
                 if (RetainsRelativeSlot(LoadType(arr->type), tail, gs.replaced) &&
                     any_of(writes.begin(), writes.end(), [&](const auto &write) {
-                        auto &[link, field] = write;
+                        auto &[link, field, to] = write;
                         return link.direction == EL_ANY && !(emptiestail && link.intail) &&
+                               !(gs.arrayonly && InRetainedField(arr, link.pointee, to.base, to.path)) &&
                                LinkMayReachElements(tail, link.pointee) &&
                                none_of(gs.clearedfields.begin(), gs.clearedfields.end(),
                                        [&](const string &path) { return field.Within(arr, path); });
@@ -3580,6 +3611,8 @@ inline void TypeCheck::NoteRootEvent(VarDef *root, P param, X external) {
 inline void TypeCheck::NoteShrink(VarDef *root, TypeExpr *bound, ShrinkEffect effect) {
     auto merge = [&](ShrinkEffect &prior) {
         prior.balance = std::max(prior.balance, effect.balance);
+        if (!prior.arrayreceiver || !effect.arrayreceiver ||
+            !TopConstEq(prior.arrayreceiver, effect.arrayreceiver)) prior.arrayreceiver = nullptr;
         if (!prior.replaced || !effect.replaced) prior.replaced = nullptr;
         else if (!TopConstEq(prior.replaced, effect.replaced)) {
             // Both replace storage on the same resizable tail. Keep only
@@ -3806,6 +3839,7 @@ inline string TypeCheck::TargetStr(const ShrinkTarget &t) {
 inline void TypeCheck::ShrinkThrough(Node *at, const string &verb, const string &recv,
                                      const Roots &roots, TypeExpr *arr, ShrinkEffect effect) {
     auto root = roots.Root();
+    if (arr->kind == TY_ARRAY) effect.arrayreceiver = arr;
     auto growonly = GrowOnlyTail(arr);
     for (auto &t : ShrinkTargets(roots, arr, false, growonly)) {
         auto bound = t.bound ? arr : nullptr;

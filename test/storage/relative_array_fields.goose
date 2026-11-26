@@ -206,6 +206,40 @@ fn disjoint_target() {
     assert(x.first .== x.other);
 }
 
+struct Anchored { first: i64&<u32>?, head: i64, tail: i64[>..] }
+fn trim_tail(x: Anchored&) {
+    x.first .= x.head;
+    x.tail.clear();
+}
+fn fixed_link_target() {
+    var x = Anchored { head: 7, tail: [42] };
+    x.first .= x.head;
+    x.tail.clear();
+    assert(x.first .== x.head);
+    x.tail.push(42);
+    trim_tail(x);
+    assert(x.first .== x.head);
+}
+
+struct Cell { next: Cell&<u32>?, value: i64&<u32>? }
+struct Chain { first: Cell[..2], second: Cell[..2], values: i64[>..] }
+fn empty_cells(cells: Cell[..2]&) { cells.clear(); }
+fn discarded_cycle() {
+    var x = Chain { first: [Cell {}], second: [Cell {}], values: [42] };
+    x.first[0].next .= x.second[0];
+    x.second[0].next .= x.first[0];
+    x.second[0].value .= x.values[0];
+    {
+        let view .= x.first[0];
+        x.second.clear();
+        empty_cells(x.first);
+        let next .= view.next;
+        if next { assert(next.value .== x.values[0]); }
+    }
+    x.values.clear();
+    assert(x.values.len == 0);
+}
+
 fn main() {
     nested_arrays();
     indexed_field(1);
@@ -222,5 +256,7 @@ fn main() {
     replace_in_branches(1);
     clear_through_helper();
     disjoint_target();
+    fixed_link_target();
+    discarded_cycle();
     print("ok");
 }

@@ -2114,6 +2114,7 @@ struct TypeCheck {
     }
     bool ShrinkMayFree(VarDef *root, TypeExpr *bound, bool growonly, TypeExpr *of,
                        bool byteview, TypeExpr *receiver = nullptr, const RefPlace *place = nullptr);
+    bool InRetainedField(VarDef *owner, TypeExpr *pointee, VarDef *base, string_view path);
     bool ShrinkMayMove(VarDef *root, TypeExpr *bound, TypeExpr *t);
     void CheckHeldShrinks(Node *at, const string &op, VarDef *root,
                           const string &what, bool growonly, TypeExpr *bound = nullptr,
@@ -2843,6 +2844,8 @@ struct TypeCheck {
                                      size_t param, const string &path, bool relative, size_t at);
     void NoteKill(Assign *assign, const LVal &loc, TypeExpr *target, const Val &v, size_t at);
     bool MayViewLimitedSlot(const Kill &part, TypeExpr *array, Node *shrink = nullptr);
+    bool CanExposeLimitedSlot(TypeExpr *array, TypeExpr *pointee);
+    bool HasLimitedSlotView(VarDef *owner, const LinkField &part, TypeExpr *array, Node *shrink);
     bool MayKeepLimitedSlots(TypeExpr *t, const Kill &part, Node *value);
     void NoteOverwrite(Kill kill, TypeExpr *target, Node *value = nullptr);
     void NoteOverwrite(Node *path, const Roots &loc, size_t at, TypeExpr *target,
@@ -2986,10 +2989,11 @@ struct TypeCheck {
         vector<Diagnostic::Related> chain;
         TypeExpr *replaced;
         bool incoming; // Links from before this activation may still survive.
+        bool arrayonly;
         set<string> clearedfields;  // Global fields overwritten on every path to this shrink.
     };
     vector<GlobalShrink> globalshrinks;
-    void NoteGlobalShrink(Node *at, const string &prefix, VarDef *vd, TypeExpr *bound, TypeExpr *replaced);
+    void NoteGlobalShrink(const LinkShrink &shrink);
     [[noreturn]] void ThreadIndexError(Node *at, TypeExpr *t);
     void CheckGlobalShrinks();
     // Whether what a store record leads to may point into the array `arr`

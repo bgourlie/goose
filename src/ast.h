@@ -2420,6 +2420,7 @@ enum ShrinkBalance { SB_BALANCED, SB_UNBALANCED };
 struct ShrinkEffect {
     ShrinkBalance balance;
     TypeExpr *replaced;
+    TypeExpr *arrayreceiver = nullptr; // A shrink of this array alone preserves its owner's fixed fields.
     ShrinkEffect(ShrinkBalance b = SB_UNBALANCED, TypeExpr *r = nullptr)
         : balance(b), replaced(r) {}
 };
