@@ -2728,6 +2728,10 @@ struct TypeCheck {
 
     Val CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> &args, Val *precv);
     void CheckByteOut(Call *c, Node *out, const string &form);
+    // Later passes walk only the arguments that can execute. Overload
+    // resolution on a subsequent check still needs the call as written.
+    unordered_map<Call *, vector<Node *>> unrenderedargs;
+    void CheckRenderArgs(Call *c, const BuiltinDef &d, vector<Node *> &args, const Val *out = nullptr);
     void CheckPrintable(Call *c, const char *what, vector<Node *> &args, size_t i,
                         const Val *out = nullptr);
     // The types on the path from an argument to the part being checked
@@ -3087,7 +3091,7 @@ struct TypeCheck {
         // Operand types needed to choose an evaluation order. The chosen
         // call or initializer checks the storage effects in that order.
         // A newly specialized callee still checks and records its own body.
-        bool probingtypes = false;
+        std::optional<int> probingtypes; // Last scope serial before the innermost probe.
         map<int, Construction> fixedresults;
         Rebuild *rebuild = nullptr;
         // The node being checked and every node it is nested in (PathEntry).
@@ -3132,13 +3136,16 @@ struct TypeCheck {
         vector<Kill> kills;
     };
     BodyState cur;
+    bool JumpLeavesProbe(int target) const {
+        return cur.probingtypes && scopes[target].serial <= *cur.probingtypes;
+    }
     struct OperandTypeProbe {
         TypeCheck &tc;
         const FlowState &entry;
-        FlagScope probing;
+        Saved<std::optional<int>> probing;
         Saved<Construction *> writing;
         OperandTypeProbe(TypeCheck &t, const FlowState &flow)
-            : tc(t), entry(flow), probing(t.cur.probingtypes, true),
+            : tc(t), entry(flow), probing(t.cur.probingtypes, t.scopeserial),
               writing(t.curdst.construction, nullptr) {}
         ~OperandTypeProbe() { tc.RestoreFlow(entry); }
     };

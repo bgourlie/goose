@@ -2240,6 +2240,12 @@ inline void TypeCheck::CheckBreak(Break *b) {
     if (si == -2) Error(b, "break cannot cross a const for expansion boundary");
     if (si == -3) JumpLeavesDefer(b, "break");
     if (si < 0) Error(b, "break outside of a loop or block");
+    // Only the committed check delivers a value, runs the enclosing defers,
+    // or contributes an exit to a target outside the probe.
+    if (JumpLeavesProbe(si)) {
+        reachable = false;
+        return;
+    }
     Val exit;
     if (b->val) {
         if (!Is<LoopExpr>(scopes[si].node) && !Is<EarlyBlock>(scopes[si].node))
@@ -2338,6 +2344,10 @@ inline void TypeCheck::CheckContinue(Node *n) {
     if (si == -3) JumpLeavesDefer(n, "continue");
     if (si < 0) Error(n, "continue outside of a loop");
     if (!reachable) return;
+    if (JumpLeavesProbe(si)) {
+        reachable = false;
+        return;
+    }
     CheckExitScopes(si, n);
     if (!reachable) return;
     auto &sc = scopes[si];

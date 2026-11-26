@@ -40,18 +40,14 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
     // The fully custom builtins first.
     switch (d.kind) {
         case B_PRINT:
-            for (size_t i = 0; i < args.size(); i++) CheckPrintable(c, d.name, args, i);
+            CheckRenderArgs(c, d, args);
             return VoidVal();
         case B_STR: {
             // str(a, b, ...): a fresh u8[>..] holding the arguments' text,
             // built at the destination like any resizable result (§7.3).
             auto t = GrowU8Array(c->line);
             c->rettypes.push_back(t);
-            for (size_t i = 0; i < args.size(); i++) {
-                CheckPrintable(c, d.name, args, i);
-                // Each argument's completed text is copied to the result.
-                NoteCallConstruction(c->rettypes);
-            }
+            CheckRenderArgs(c, d, args);
             Val v;
             v.type = t;
             v.Set(TempRoot(), false);
@@ -468,7 +464,7 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
     if (d.kind == B_FORMAT) {
         if (!IsU8(elem))
             Error(c, cat(".format appends text to u8 arrays, not ", TypeStr(rv.type)));
-        for (size_t i = 1; i < args.size(); i++) CheckPrintable(c, d.name, args, i, &rv);
+        CheckRenderArgs(c, d, args, &rv);
         return VoidVal();
     }
     auto elementplace = rv.ElementPlace();
@@ -865,6 +861,24 @@ inline void TypeCheck::CheckByteOut(Call *c, Node *out, const string &form) {
                  "non-writable provenance, §9.5)");
     NoteGrow(c, ov, cat(BuiltinByKind(c->builtin).grows, " ", ExprStr(out)), ot);
     NoteStorageWrite(ov, ot, ov.refplace);
+}
+
+// Each argument is evaluated and rendered before the next one starts. A
+// formatter that exits its caller leaves the remaining arguments unexecuted.
+inline void TypeCheck::CheckRenderArgs(Call *c, const BuiltinDef &d, vector<Node *> &args,
+                                      const Val *out) {
+    size_t count = out ? 1 : 0;
+    // format has already evaluated its output receiver.
+    while (count < args.size() && (count == 0 || reachable)) {
+        CheckPrintable(c, d.name, args, count, out);
+        count++;
+        if (d.kind == B_STR) NoteCallConstruction(c->rettypes);
+    }
+    if (count == args.size()) return;
+    unrenderedargs[c].assign(args.begin() + count, args.end());
+    args.resize(count);
+    // A member spelling checks a separate argument list with its receiver first.
+    if (Is<Dot>(c->callee)) c->args.resize(count - 1);
 }
 
 // An argument of print/str/format (§3.7): every value type has a text

@@ -45,6 +45,8 @@ inline void WarnDeprecatedValue(TypeCheck &tc, Node *at, const vector<SFunction 
 
 inline Val TypeCheck::CheckCall(Call *c, TypeExpr *expected) {
     // A node may be re-checked in argument phase 2; reset annotations.
+    if (auto suffix = unrenderedargs.extract(c))
+        c->args.insert(c->args.end(), suffix.mapped().begin(), suffix.mapped().end());
     c->spec = nullptr;
     c->dispatch.clear();
     c->builtin = -1;
