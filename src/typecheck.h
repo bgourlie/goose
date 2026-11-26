@@ -2999,7 +2999,7 @@ struct TypeCheck {
     void FinishFill(ArrayLit *fill, const Dest &dest);
     void RecordLinkStore(const Roots &owners, TypeExpr *reached, ElementLink link, Node *at,
                          LinkLocation place = {}, const LinkField &field = {}, const LinkField &target = {},
-                         const LinkField *boundfield = nullptr);
+                         const LinkField *boundfield = nullptr, std::optional<string_view> suffix = {});
     void NoteSlotStore(const StoreEvent &e);
     // How NeverStoredError words a grow-shrink array `gs` a value pointing at
     // `roots` may point into: as the array itself where it is the value's one

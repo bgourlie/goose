@@ -1464,6 +1464,7 @@ inline ValueLinks TypeCheck::LiveElementLinks(VarDef *owner, TypeExpr *target, T
             if (array && !MayViewLimitedSlot(part, array, shrink,
                                             link.direction == EL_ANY ? globalSlots : nullptr)) return;
         }
+        link.suffixonly = !target && t && IsArrayKind(t, A_LIMITED) && field.base == owner && suffix && suffix->empty();
         // A value read out of its owner carries its field paths with it.
         // Shrink queries only need the types and directions of retained links.
         auto path = [&](const LinkField &part) -> string_view {
@@ -2271,6 +2272,7 @@ inline void TypeCheck::NoteLitElem(LitDeep &deep, Node *at, const Val &v, TypeEx
         for (auto &[value, path, target] : v.elementlinks.slots) {
             auto link = value;
             link.intail |= IsArrayKind(t, A_GROW);
+            link.suffixonly = false; // A nested array's capacity slots belong to the enclosing value.
             auto member = [&](string_view part) -> string_view {
                 return field.empty() ? string_view {} : ast.Intern(cat(".", field, part));
             };
@@ -2440,6 +2442,10 @@ inline void TypeCheck::StoreElementLink(const Dest &dest, TypeExpr *type, Elemen
                                        const Roots &borrowed, string_view path, const LinkField &target) {
     if (!reachable || dest.discarded || dest.roots.None()) return;
     auto reached = dest.reached ? dest.reached : type;
+    std::optional<string_view> suffix;
+    if (link.suffixonly && IsArrayKind(type, A_LIMITED) && dest.fieldsteps && dest.field.base)
+        suffix = ast.Intern(dest.field.path);
+    link.suffixonly = false; // Stored links name their containing array by path.
     if (dest.repeated) {
         // Element slots share the field containing the array. Nested
         // arrays may also place a slot within a growable tail.
@@ -2451,7 +2457,7 @@ inline void TypeCheck::StoreElementLink(const Dest &dest, TypeExpr *type, Elemen
     auto field = dest.field;
     if (field.base && dest.fieldsteps) field.path += path;
     RecordLinkStore(dest.roots, reached, link, at, dest.place, field, target,
-                    dest.boundsteps ? ast.places.Project(dest.boundfield, path) : dest.boundfield);
+                    dest.boundsteps ? ast.places.Project(dest.boundfield, path) : dest.boundfield, suffix);
 }
 
 inline void TypeCheck::FinishFill(ArrayLit *fill, const Dest &dest) {
@@ -2473,7 +2479,8 @@ inline LinkField TypeCheck::StoredField(const LinkField &field, const Roots &own
 
 inline void TypeCheck::RecordLinkStore(const Roots &owners, TypeExpr *reached,
                                       ElementLink link, Node *at, LinkLocation place, const LinkField &field,
-                                      const LinkField &target, const LinkField *boundfield) {
+                                      const LinkField &target, const LinkField *boundfield,
+                                      std::optional<string_view> suffix) {
     if (!reachable || cur.probingtypes || owners.None()) return;
     link.intail |= place.intail;
     for (auto &d : ShrinkTargets(owners, reached, false)) {
@@ -2493,7 +2500,7 @@ inline void TypeCheck::RecordLinkStore(const Roots &owners, TypeExpr *reached,
         e.at = at->line;
         AddStoreEvent(e);
         auto index = storeevents.size() - 1;
-        cur.links.Add(storeevents.back(), index);
+        cur.links.Add(storeevents.back(), index, e.storefield.base ? suffix : std::nullopt);
     }
 }
 

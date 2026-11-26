@@ -1441,34 +1441,35 @@ inline bool TypeCheck::FitsAt(Val &v, TypeExpr *dt, bool delivered) {
             }
             if (dt->arr->akind == A_FIXED) return false;
             if (!TypeEq(selem, dt->arr->sub)) return false;
+            // An array conversion copies the live run. Suffix slots remain observable
+            // through references into the source but are absent from the destination.
+            ValueLinks links;
+            for (auto [link, path, target] : v.elementlinks.slots) {
+                if (link.suffixonly) continue;
+                link.intail = IsArrayKind(dt, A_GROW);
+                links.Include(link, path, target);
+            }
             // Changing the outer layout moves or removes its header. Offsets
             // within the element run survive, but an offset to the array
             // itself would no longer address an array of its declared type.
             if (t->kind == TY_ARRAY &&
-                v.elementlinks.Any([&](auto link) { return TopConstEq(link.pointee, t); })) {
+                links.Any([&](auto link) { return TopConstEq(link.pointee, t); })) {
                 fitfail = cat("cannot construct ", TypeStr(dt), " from ", TypeStr(t),
                               ": a self-relative link may name the source array itself, "
                               "whose layout the conversion changes (§3.9)");
                 return false;
             }
-            if (dt->arr->akind == A_GROWSHRINK && v.elementlinks) {
+            if (dt->arr->akind == A_GROWSHRINK && links) {
                 fitfail = cat("cannot construct ", TypeStr(dt), " from ", TypeStr(t),
                               ": a shrink could remove an element that a self-relative "
                               "reference still names (§5.2)");
                 return false;
             }
-            if (IsArrayKind(t, A_LIMITED) && !v.intactprefix && v.elementlinks.MayPointForward()) {
+            if (IsArrayKind(t, A_LIMITED) && !v.intactprefix && links.MayPointForward()) {
                 fitfail = cat("cannot construct ", TypeStr(dt), " from ", TypeStr(t),
                               ": a self-relative link may name a slot beyond the live length "
                               "that the conversion would discard (§5.3)");
                 return false;
-            }
-            // All slots in the converted array now belong to its element run.
-            ValueLinks links;
-            for (auto &[value, path, target] : v.elementlinks.slots) {
-                auto link = value;
-                link.intail = IsArrayKind(dt, A_GROW);
-                links.Include(link, path, target);
             }
             v.elementlinks = std::move(links);
             v.intactprefix = IsArrayKind(dt, A_LIMITED);
