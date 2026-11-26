@@ -527,7 +527,7 @@ struct TypeCheck {
     void ExpandInitializers(vector<FieldInit> &inits);
     void ExpandArms(vector<MatchArm> &arms);
     bool IsValuelessTail(const Node *n);
-    bool MentionsName(Node *n, string_view name, set<SFunction *> &seen);
+    bool MentionsName(Node *n, string_view name, set<SFunction *> &seen, span<VarDef *> locals = {});
     bool EscapingContinue(Node *n);
     bool UsedAfter(VarDef *v);
 
@@ -552,6 +552,7 @@ struct TypeCheck {
         // The frame checking it, whose variables and lexical parents' its
         // names are (UsedAfter).
         int frame = 0;
+        size_t varcount = 0;  // Bindings visible to this node, before entering any operand's block.
     };
     // A defer still sees the declarations at registration when a mutable
     // binding it uses acquires another possible target before scope exit.

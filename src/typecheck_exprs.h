@@ -432,7 +432,7 @@ inline bool TypeCheck::Descend(Node *n) {
     auto idx = cur.nodepath.empty() ? -1 : OperandIndex(cur.nodepath.back().node, n,
                                                         cur.nodepath.back().pos);
     if (idx >= 0) cur.nodepath.back().pos = idx;
-    cur.nodepath.push_back({ n, idx, 0, false, (int)frames.size() - 1 });
+    cur.nodepath.push_back({ n, idx, 0, false, (int)frames.size() - 1, vars.size() });
     return true;
 }
 
@@ -649,9 +649,9 @@ template<typename F> void TypeCheck::LaterOperands(F f) {
         auto i = 0;
         ForOperands(e.node, [&](Node *ch, HoldKind) {
             auto at = i++;
-            if (at > e.pos || (last && at == e.pos)) f(ch, e.frame);
+            if (at > e.pos || (last && at == e.pos)) f(ch, e.frame, e.varcount);
         });
-        if (!last) AfterHead(e.node, cur.nodepath[k + 1].node, [&](Node *p) { f(p, e.frame); });
+        if (!last) AfterHead(e.node, cur.nodepath[k + 1].node, [&](Node *p) { f(p, e.frame, e.varcount); });
     }
 }
 
@@ -3418,7 +3418,7 @@ inline void TypeCheck::CheckStmts(Block *b) {
 // Whether the code under n names `name`, including through a nested
 // function called directly or passed as a static function value (§7.6).
 // A shadowing declaration conservatively counts as a mention.
-inline bool TypeCheck::MentionsName(Node *n, string_view name, set<SFunction *> &seen) {
+inline bool TypeCheck::MentionsName(Node *n, string_view name, set<SFunction *> &seen, span<VarDef *> locals) {
     if (!n) return false;
     auto nested = [&](string_view used) {
         for (auto &[si, sf] : localfns)
@@ -3426,7 +3426,14 @@ inline bool TypeCheck::MentionsName(Node *n, string_view name, set<SFunction *> 
                 MentionsName(sf->body, name, seen)) return true;
         return false;
     };
-    if (auto id = Is<Ident>(n)) return id->name == name || nested(id->name);
+    if (auto id = Is<Ident>(n)) {
+        if (id->name == name) return true;
+        if (id->vdef || localfns.empty()) return false;
+        // A bare name can pass a nested function as a static argument.
+        // A variable in the use's lexical scope hides that function (§11.1).
+        if (any_of(locals.begin(), locals.end(), [&](VarDef *v) { return v->name == id->name; })) return false;
+        return nested(id->name);
+    }
     if (auto fd = Is<FnDecl>(n)) {
         if (fd->sf->body && seen.insert(fd->sf).second &&
             MentionsName(fd->sf->body, name, seen))
@@ -3436,7 +3443,8 @@ inline bool TypeCheck::MentionsName(Node *n, string_view name, set<SFunction *> 
         if (auto d = Is<Dot>(c->callee); d && nested(d->name)) return true;
     }
     auto hit = false;
-    n->Children([&](Node *ch) { hit = hit || MentionsName(ch, name, seen); });
+    if (Is<FunVal>(n)) locals = {};  // The body has its own bindings.
+    n->Children([&](Node *ch) { hit = hit || MentionsName(ch, name, seen, locals); });
     return hit;
 }
 
@@ -3499,7 +3507,7 @@ inline bool TypeCheck::ExposedLater(VarDef *v) {
         return any || !inchild;
     };
     auto exposed = false;
-    LaterOperands([&](Node *n, int fi) {
+    LaterOperands([&](Node *n, int fi, size_t) {
         exposed = exposed || (NamesFrame(fi, vframe) && exposes(n));
     });
     return exposed;
@@ -3526,11 +3534,14 @@ inline bool TypeCheck::UsedAfter(VarDef *v) {
     if (v->componentowner && v->type) v = v->componentowner;
     set<SFunction *> seen;
     auto vframe = FrameOfScope(Depth(v) - 1);
-    auto mentions = [&](Node *n, int fi) {
-        return NamesFrame(fi, vframe) && MentionsName(n, v->name, seen);
+    auto mentions = [&](Node *n, int fi, size_t varcount = 0) {
+        if (!NamesFrame(fi, vframe)) return false;
+        auto first = (size_t)frames[fi].varbase;
+        auto locals = varcount > first ? span(vars).subspan(first, varcount - first) : span<VarDef *> {};
+        return MentionsName(n, v->name, seen, locals);
     };
     auto later = false;
-    LaterOperands([&](Node *n, int fi) { later = later || mentions(n, fi); });
+    LaterOperands([&](Node *n, int fi, size_t varcount) { later = later || mentions(n, fi, varcount); });
     if (later) return true;
     // The scopes the exit leaves, from `cut` on, and the statement it is in
     // the innermost block (its stmts.size() for the tail).
@@ -3575,10 +3586,12 @@ inline bool TypeCheck::UsedAfter(VarDef *v) {
         auto exits = &bp == &blockpos.back() && exitat != SIZE_MAX;
         if (bp.scopeidx >= cut && !exits) continue;
         auto end = exits ? min(exitat + 1, stmts.size()) : stmts.size();
+        auto nextscope = (size_t)bp.scopeidx + 1;
+        auto varcount = nextscope < scopes.size() ? (size_t)scopes[nextscope].varbase : vars.size();
         for (auto i = bp.idx + 1; i < end; i++)
-            if (mentions(stmts[i], fi)) return true;
+            if (mentions(stmts[i], fi, varcount)) return true;
         if ((!exits || exitat == stmts.size()) && bp.idx < stmts.size() && bp.block->tail &&
-            mentions(bp.block->tail, fi))
+            mentions(bp.block->tail, fi, varcount))
             return true;
     }
     return false;
