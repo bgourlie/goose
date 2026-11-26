@@ -2724,6 +2724,17 @@ struct FnRecord {
         Effect effect;
     };
     vector<StorageWrite> storagewrites;
+    // Storage observed by reading a capture. The place and owner are those
+    // at the read, including when the body later restores the binding.
+    struct StorageRead {
+        VarDef *var;
+        TypeExpr *holder, *field; // Null field reads the whole holder.
+        RefPlace place;
+        RootAlt owner;
+        bool byteview;
+        Node *at;
+    };
+    vector<StorageRead> capturereads;
     enum class ResultWrite { Count, Storage };
     // A variable array's count can be returned separately from its elements.
     // Every other write here can change the receiving storage itself.

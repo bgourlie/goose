@@ -3096,6 +3096,10 @@ inline bool TypeCheck::SameRecord(const FnRecord &a, const FnRecord &b, const Fn
         return false;
     };
     auto sametype = [&](TypeExpr *x, TypeExpr *y) { return !x == !y && (!x || TypeEq(x, y)); };
+    if (!is_permutation(a.capturereads.begin(), a.capturereads.end(),
+                        b.capturereads.begin(), b.capturereads.end(),
+                        [&](const auto &p, const auto &q) { return SameStorageRead(p, q); }))
+        return why("captured reads");
     if (a.storagewrites.size() != b.storagewrites.size() ||
         !is_permutation(a.storagewrites.begin(), a.storagewrites.end(), b.storagewrites.begin(),
             [&](const auto &p, const auto &q) {

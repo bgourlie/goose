@@ -2516,8 +2516,8 @@ inline void TypeCheck::RunExitDefers(int first, span<const FnRecord::Interrupted
         for (auto it = scopes[i].defers.rbegin(); it != scopes[i].defers.rend(); ++it) {
             RefreshDeferredBody(*it);
             for (auto &write : it->writes) RecordStorageWrite(write, it->statement);
-            for (auto &a : interrupted)
-                CheckBuiltUses(it->statement->body, a.lval, a.type, a.owners, ResizableArrayIn(a.type), &a.place);
+            for (auto &a : interrupted) CheckDeferredReads(*it, a);
+            for (auto &read : it->reads) RecordStorageRead(read);
             for (auto &[shrink, before] : it->shrinks) {
                 Saved links(cur.links, cur.links);
                 Saved kills(cur.kills, cur.kills);
@@ -2603,6 +2603,94 @@ inline Roots TypeCheck::OwnersAtPlace(const Roots &storage, const RefPlace &plac
                 return owner;
             }
     return storage;
+}
+
+// A checked name or field path is observed with the binding it has here.
+// Property reads stop at the value they inspect, and a stored reference
+// ends the inline path: its slot and what the slot holds are separate.
+inline void TypeCheck::NoteStorageRead(Node *n) {
+    if (!reachable || cur.probingtypes) return;
+    if (cur.nodepath.size() > 1) {
+        auto parent = cur.nodepath[cur.nodepath.size() - 2].node;
+        if (auto d = Is<Dot>(parent); d && d->obj == n) return; // The complete path records the read.
+        if (auto a = Is<Assign>(parent); a && a->op == T_DOTASSIGN && a->lval == n && Is<Ident>(n))
+            return; // Rebinding the slot does not use its former pointee.
+    }
+    auto base = n;
+    while (auto d = Is<Dot>(base)) base = d->obj;
+    auto id = Is<Ident>(base);
+    auto v = id ? id->vdef : nullptr;
+    auto spec = CurRealFrame().spec;
+    if (!v || !v->type || !spec || (!cur.deferring && !v->isglobal && v->ownerspec == spec)) return;
+    auto ref = IsRefOrSlice(v->type);
+    auto holder = ref ? PointeeOf(v->type) : v->type;
+    auto place = ref ? (v->type->kind == TY_SLICE ? v->SlicePlace() : v->PointeePlace(ast.places))
+                     : RefPlace { {}, v };
+    if (place.nullonly) return;
+    Prov storage;
+    storage.TakeAlts(ref ? OwnersAtPlace(RefRootsOf(v), place) : RootsOf(v));
+    auto add = [&](const Prov &where, TypeExpr *type, TypeExpr *field, const RefPlace &selected) {
+        for (auto &owner : where.alts)
+            RecordStorageRead({ v, type, field, selected, owner, ref && v->ref.byteview, n });
+    };
+
+    vector<Dot *> fields;
+    for (auto d = Is<Dot>(n); d; d = Is<Dot>(d->obj))
+        if (d->fieldidx >= 0) fields.push_back(d);
+    if (ClassOf(holder) == SC_ROOT && fields.empty()) {
+        // A bare root exposes all its independently owned components.
+        auto inst = GetStructInst(holder);
+        for (size_t i = 0; i < inst->ftypes.size(); i++) {
+            if (inst->st->fields[i].ispad) continue;
+            auto where = storage;
+            auto at = place;
+            ProjectField(where, at, holder, inst->run, i);
+            add(where, inst->ftypes[i], nullptr, at);
+        }
+        return;
+    }
+    TypeExpr *field = nullptr;
+    for (auto it = fields.rbegin(); it != fields.rend(); ++it) {
+        auto t = field ? field : holder;
+        auto runs = FieldRuns(t);
+        if (runs.size() != 1) break;
+        auto i = (*it)->fieldidx;
+        ProjectField(storage, place, t, runs[0], i);
+        field = (*runs[0].ftypes)[i];
+        if (ClassOf(t) == SC_ROOT) holder = field;
+        if (IsRefOrSlice(field)) break;
+    }
+    add(storage, holder, field, place);
+}
+
+inline void TypeCheck::RecordStorageRead(const StorageRead &read) {
+    auto spec = CurRealFrame().spec;
+    if (!spec || (!cur.deferring && !read.var->isglobal && read.var->ownerspec == spec)) return;
+    auto &reads = cur.deferring ? cur.deferring->reads : spec->record.capturereads;
+    if (none_of(reads.begin(), reads.end(), [&](const StorageRead &r) { return SameStorageRead(r, read); }))
+        reads.push_back(read);
+}
+
+// Arguments are observed by their own evaluation. The call additionally
+// exposes what its body read through captures, in the caller's coordinates.
+inline void TypeCheck::ApplyCalleeReads(FnSpec *spec, const vector<Val> &args) {
+    auto rec = RecordOf(spec);
+    if (!rec) return;
+    for (auto read : rec->capturereads) {
+        auto owner = read.owner;
+        read.place = CallerPlace(read.place, spec, args);
+        bool view = false;
+        if (ClassParam(spec, owner.root, view) < 0) {
+            RecordStorageRead(read);
+            continue;
+        }
+        auto mapped = OwnersAtPlace(MapClass(spec, owner.root, args), read.place);
+        for (auto &alt : mapped.alts) {
+            read.owner = alt;
+            read.owner.exact &= owner.exact;
+            RecordStorageRead(read);
+        }
+    }
 }
 
 // Collect a deferred write while checking the body. Publish it when that

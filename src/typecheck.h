@@ -479,6 +479,7 @@ struct TypeCheck {
     struct DeferEnv;
     struct DeferEffects {
         Defer *statement = nullptr;
+        vector<FnRecord::StorageRead> reads;
         vector<FnRecord::StorageWrite> writes;
         vector<pair<VarDef *, RefPlace>> bindings; // Captures rebound on normal completion.
         vector<pair<LinkShrink, LinkEffects>> shrinks;
@@ -2162,6 +2163,7 @@ struct TypeCheck {
         NodeScope ns(*this, n);
         auto cyclecalls = frames.back().cyclecalls;
         auto v = n->Check(*this, expected);
+        if (hasdefers && (Is<Ident>(n) || Is<Dot>(n))) NoteStorageRead(n);
         if (v.type == fntype && !Is<Ident>(n) && !Is<FunVal>(n))
             Error(n, "a function value must be a function name or block literal (§7.6); "
                      "evaluate runtime expressions separately");
@@ -2755,6 +2757,15 @@ struct TypeCheck {
     }
     void RecordStorageWrite(FnRecord::StorageWrite write, Defer *executing = nullptr);
     using StorageWrite = FnRecord::StorageWrite;
+    using StorageRead = FnRecord::StorageRead;
+    bool SameStorageRead(const StorageRead &a, const StorageRead &b) {
+        return a.var == b.var && a.owner == b.owner && a.place == b.place && a.byteview == b.byteview &&
+               TypeEq(a.holder, b.holder) && !a.field == !b.field && (!a.field || TypeEq(a.field, b.field));
+    }
+    void NoteStorageRead(Node *n);
+    void RecordStorageRead(const StorageRead &read);
+    void ApplyCalleeReads(FnSpec *spec, const vector<Val> &args);
+    void CheckDeferredReads(const DeferEffects &effects, const FnRecord::InterruptedAssign &assignment);
     void NoteStorageWrite(const Roots &storage, TypeExpr *type, const RefPlace &place, bool canwrite,
                           StorageWrite::Effect effect = StorageWrite::MayDropSlots);
     void NoteStorageWrite(const Roots &storage, TypeExpr *type, const RefPlace &place = {}) {
@@ -3319,6 +3330,7 @@ struct TypeCheck {
     void ApplyCalleeStorage(Node *at, FnSpec *spec, vector<Val> &args, string_view name,
                             const vector<Node *> &argnodes, bool applyexits) {
         if (cur.probingtypes) return;
+        if (hasdefers && reachable) ApplyCalleeReads(spec, args);
         ApplyCalleeShrinks(at, spec, args, name, argnodes, applyexits);
         // A write through a stored reference can reach a value installed
         // by this same call. Its stores have now been mapped to the caller.
@@ -3358,17 +3370,14 @@ struct TypeCheck {
     // The right-hand side of a whole assignment runs while the array's new
     // contents are built over its old ones (§4.4), so nothing it runs may
     // use the array: name it, or a reference to it, directly or in a
-    // function it calls. Also used for defers that unwind an interrupted
-    // assignment: onexit identifies the receiver's field when known.
-    void CheckBuiltUses(Node *rhs, Node *lval, TypeExpr *target, const Roots &built,
-                        TypeExpr *arr, const RefPlace *onexit = nullptr);
-    vector<LiveView> DeferredUseViews(VarDef *v, Dot *field, const RefPlace &target, bool &apart);
+    // function it calls.
+    void CheckBuiltUses(Node *rhs, Node *lval, TypeExpr *target, const Roots &built, TypeExpr *arr);
     Alias ReachesBuilt(VarDef *v, VarDef *built, bool exact, Node *lval, TypeExpr *target,
                        TypeExpr *arr, VarDef *&root);
     bool MayHoldBuilt(TypeExpr *y, Node *lval, TypeExpr *target);
     template<typename F, typename G> void EachUse(Node *n, F named, G called);
     TypeExpr *ReadFieldType(Dot *field, Node *base);
-    bool FieldsApart(Node *use, Node *lval, TypeExpr *target, bool onexit);
+    bool FieldsApart(Node *use, Node *lval, TypeExpr *target);
     // A checked field path in the specialization's body, or the whole variable.
     struct NamedUse {
         VarDef *var;

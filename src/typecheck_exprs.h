@@ -58,6 +58,7 @@ inline TypeCheck::LVal TypeCheck::CheckLValue(Node *n, PathUse use) {
         } else {
             record(lv);
         }
+        if (hasdefers) NoteStorageRead(n);
         return lv;
     }
     if (auto d = Is<Dot>(n)) {
@@ -70,6 +71,7 @@ inline TypeCheck::LVal TypeCheck::CheckLValue(Node *n, PathUse use) {
         if (lv.intemp) NoRelRefTempRead(d->obj, base, lv.type);
         n->exprtype = lv.type;
         RecordVal(n, ContainerRead(lv));
+        if (hasdefers) NoteStorageRead(n);
         return lv;
     }
     if (auto ix = Is<Index>(n)) {
