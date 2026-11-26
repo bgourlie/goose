@@ -598,15 +598,16 @@ template<typename F> void TypeCheck::HeldOperands(F f) {
         if (auto fill = Is<ArrayLit>(e.node); fill && fill->fillval) {
             auto pending = cur.links.fills.find(fill);
             if (pending != cur.links.fills.end()) {
-                auto hold = [&](TypeExpr *pointee, const Roots &roots) {
+                auto hold = [&](TypeExpr *pointee, const Roots &roots, const LinkField &target) {
                     if (roots.None()) return; // Internal links move with the captured value.
                     Val v;
                     v.TakeAlts(roots);
                     v.type = ast.RefTo(pointee, fill->line);
+                    if (target.base) v.refplace = { {}, target.base, ast.Intern(target.path), false, true };
                     f(Held { nullptr, std::move(v) });
                 };
-                for (auto &[slot, roots] : pending->second.slots) hold(slot.second.pointee, roots);
-                for (auto &link : pending->second.results) hold(link.pointee, link.source);
+                for (auto &[slot, roots] : pending->second.slots) hold(slot.link.pointee, roots, slot.target);
+                for (auto &link : pending->second.results) hold(link.pointee, link.source, link.target);
             }
         }
         auto own = e.discovering || (&e == &cur.nodepath.back() && Is<Call>(e.node));
@@ -1508,9 +1509,15 @@ inline bool TypeCheck::FitsAt(Val &v, TypeExpr *dt, bool delivered) {
                 auto want = dt->ref->pool ? dt->ref->pool : curdst.roots.Root();
                 auto have = dt->ref->pool ? PoolOf(links.Root()) : links.Root();
                 auto pointee = dt->ref->sub;
-                if (recordingrelative && !dt->ref->pool) pointee = LinkPointee(pointee);
+                LinkField target;
+                if (recordingrelative && !dt->ref->pool) {
+                    pointee = LinkPointee(pointee);
+                    auto &place = v.refplace;
+                    auto part = place.base ? FieldPathType(place.base, place.path) : nullptr;
+                    if (part && CanContain(part, pointee)) target = { place.base, string(place.path) };
+                }
                 auto fits = dt->ref->pool ? want && links.Exact() && have == want
-                    : RelativeDestination(links, curdst, pointee, fitnode, recordingrelative);
+                    : RelativeDestination(links, curdst, pointee, fitnode, recordingrelative, target);
                 if (!fits) {
                     auto why = links.Exact() ? string() : ReadBackWhy(links);
                     auto vroot = links.Root() ? links.Root()->name : string_view("static data");
@@ -1527,11 +1534,6 @@ inline bool TypeCheck::FitsAt(Val &v, TypeExpr *dt, bool delivered) {
                     return false;
                 }
                 if (recordingrelative && !dt->ref->pool && !curdst.result) {
-                    LinkField target;
-                    auto &place = v.refplace;
-                    auto part = place.base ? FieldPathType(place.base, place.path) : nullptr;
-                    if (part && CanContain(part, pointee))
-                        target = { place.base, string(place.path) };
                     StoreElementLink(curdst, dt, { pointee, curdst.appended ? EL_BACKWARD : EL_ANY },
                                      fitnode, links, {}, target);
                 }
@@ -3413,27 +3415,25 @@ inline void TypeCheck::CheckStmts(Block *b) {
     blockpos.back().idx = b->stmts.size();
 }
 
-// Whether the code under n names `name`: a variable use, or a call of a
-// nested function whose body does. Syntactic, so a shadowing declaration
-// counts too, which only errs on the safe side.
+// Whether the code under n names `name`, including through a nested
+// function called directly or passed as a static function value (§7.6).
+// A shadowing declaration conservatively counts as a mention.
 inline bool TypeCheck::MentionsName(Node *n, string_view name, set<SFunction *> &seen) {
     if (!n) return false;
-    if (auto id = Is<Ident>(n); id && id->name == name) return true;
+    auto nested = [&](string_view used) {
+        for (auto &[si, sf] : localfns)
+            if (sf->name == used && sf->body && seen.insert(sf).second &&
+                MentionsName(sf->body, name, seen)) return true;
+        return false;
+    };
+    if (auto id = Is<Ident>(n)) return id->name == name || nested(id->name);
     if (auto fd = Is<FnDecl>(n)) {
         if (fd->sf->body && seen.insert(fd->sf).second &&
             MentionsName(fd->sf->body, name, seen))
             return true;
     }
     if (auto c = Is<Call>(n)) {
-        string_view callee;
-        if (auto id = Is<Ident>(c->callee)) callee = id->name;
-        else if (auto d = Is<Dot>(c->callee)) callee = d->name;
-        if (!callee.empty()) {
-            for (auto &[si, sf] : localfns)
-                if (sf->name == callee && sf->body && seen.insert(sf).second &&
-                    MentionsName(sf->body, name, seen))
-                    return true;
-        }
+        if (auto d = Is<Dot>(c->callee); d && nested(d->name)) return true;
     }
     auto hit = false;
     n->Children([&](Node *ch) { hit = hit || MentionsName(ch, name, seen); });

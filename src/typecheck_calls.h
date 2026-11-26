@@ -4404,7 +4404,7 @@ inline void TypeCheck::NoteCallConstruction(const vector<TypeExpr *> &results, c
 // checked at every call, rather than assumed from the call that first
 // specialized the body. Concrete local roots must agree here.
 inline bool TypeCheck::RelativeDestination(const Roots &source, Dest dest, TypeExpr *pointee,
-                                          Node *at, bool record, bool forwarding) {
+                                          Node *at, bool record, LinkField targetfield, bool forwarding) {
     record = record && !cur.probingtypes;
     if (source.None() || dest.unknown) return true;
     if (!source.Exact() || (!dest.result && !dest.roots.Exact())) return false;
@@ -4423,6 +4423,7 @@ inline bool TypeCheck::RelativeDestination(const Roots &source, Dest dest, TypeE
             Roots mapped;
             for (auto &a : roots.alts)
                 mapped.Add(RetAltVal(s, a, *frames[k].argvals, ast.voidtype, at).AsRoots());
+            targetfield = MapStoreField(s, *frames[k].argvals, roots.Root(), mapped, targetfield);
             roots = mapped;
         }
         spec = dest.result;
@@ -4449,6 +4450,7 @@ inline bool TypeCheck::RelativeDestination(const Roots &source, Dest dest, TypeE
     rs.intail = dest.place.intail;
     rs.pointee = pointee;
     rs.source.Set(have, true);
+    rs.target = StoredField(targetfield, roots, have, false);
     if (dest.result) {
         rs.resultowner = dest.result;
         rs.result = dest.resultindex;
@@ -4485,6 +4487,7 @@ inline void TypeCheck::ApplyRelativeStore(Node *call, FnSpec *spec, vector<Val> 
         return out;
     };
     auto source = mapped(s.source);
+    auto targetfield = MapStoreField(spec, args, s.source.Root(), source, s.target);
     Dest dest;
     if (s.result < 0) dest = Dest(mapped(s.destination));
     else {
@@ -4506,7 +4509,7 @@ inline void TypeCheck::ApplyRelativeStore(Node *call, FnSpec *spec, vector<Val> 
         dest.discarded |= !survives;
     }
     dest.place.intail |= s.intail;
-    if (!RelativeDestination(source, dest, s.pointee, call, true, true)) {
+    if (!RelativeDestination(source, dest, s.pointee, call, true, targetfield, true)) {
         auto target = source.Root() ? string(source.Root()->name) : string("static data");
         auto receiver = dest.result ? cat("result ", dest.resultindex + 1, " of ", dest.result->sf->name)
             : dest.roots.Root() ? string(dest.roots.Root()->name) : string("a temporary or argument slot");
@@ -4515,7 +4518,7 @@ inline void TypeCheck::ApplyRelativeStore(Node *call, FnSpec *spec, vector<Val> 
                         target, " to receiving storage ", receiver));
     }
     if (s.result >= 0 && dest.reached && !dest.result && !dest.discarded && !source.None())
-        StoreElementLink(dest, dest.reached, { s.pointee, dest.appended ? EL_BACKWARD : EL_ANY }, call, source);
+        StoreElementLink(dest, dest.reached, { s.pointee, dest.appended ? EL_BACKWARD : EL_ANY }, call, source, {}, targetfield);
 }
 
 inline TypeExpr *TypeCheck::SubstEnv(TypeExpr *t, FnSpec *env) {

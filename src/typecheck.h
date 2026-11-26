@@ -314,7 +314,13 @@ struct TypeCheck {
         // links. Only paths that finish the operand reach those stores.
         struct FillLinks {
             // Link targets stay borrowed until the repeated elements are written.
-            map<pair<TypeExpr *, ElementLink>, Roots> slots;
+            struct Slot {
+                TypeExpr *reached;
+                ElementLink link;
+                LinkField target;
+                auto operator<=>(const Slot &) const = default;
+            };
+            map<Slot, Roots> slots;
             vector<RelativeStore> results;
             void Join(const FillLinks &other) {
                 for (auto &[slot, roots] : other.slots) slots[slot].Add(roots);
@@ -698,7 +704,7 @@ struct TypeCheck {
         return &callresultdsts[i];
     }
     bool RelativeDestination(const Roots &source, Dest dest, TypeExpr *pointee, Node *at,
-                             bool record, bool forwarding = false);
+                             bool record, LinkField target = {}, bool forwarding = false);
     void CheckCalleeRelative(Call *call, FnSpec *spec, vector<Val> &args);
     void ApplyRelativeStore(Node *call, FnSpec *spec, vector<Val> &args,
                             const RelativeStore &store, bool survives);
@@ -2919,6 +2925,8 @@ struct TypeCheck {
     void AddStoreEvent(const StoreEvent &e);
     void NoteRefPlace(VarDef *vd, const Val &v);
     RefPlace ArgumentPlace(FnSpec *spec, VarDef *param, const vector<Val> &args);
+    LinkField MapStoreField(FnSpec *spec, const vector<Val> &args, VarDef *owner,
+                            const Roots &mapped, LinkField field);
     void RecordElementLinks(const Dest &dest, TypeExpr *type, const ValueLinks &links, Node *at);
     void StoreElementLink(const Dest &dest, TypeExpr *type, ElementLink link, Node *at,
                           const Roots &borrowed, string_view path = {}, const LinkField &target = {});

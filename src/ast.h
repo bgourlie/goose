@@ -2569,6 +2569,7 @@ struct LiveShrink {
 // name parameter classes or lexical storage, mapped as return roots are.
 struct RelativeStore {
     Roots source, destination;
+    LinkField target; // Known field in the source root, mapped along with that root at calls.
     FnSpec *resultowner = nullptr; // Whose receiving slot, including for a nonlocal return.
     string field;  // Enclosing struct field path in the result, if any.
     bool intail = false;
@@ -2577,7 +2578,8 @@ struct RelativeStore {
     bool Same(const RelativeStore &other, Roots::Compare how = Roots::Compare::All) const {
         return resultowner == other.resultowner && result == other.result &&
                intail == other.intail && pointee == other.pointee &&
-               field == other.field && source.Same(other.source, how) && destination.Same(other.destination, how);
+               field == other.field && target == other.target &&
+               source.Same(other.source, how) && destination.Same(other.destination, how);
     }
 
     bool RecordedIn(const vector<RelativeStore> &stores,

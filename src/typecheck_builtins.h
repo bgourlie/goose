@@ -2332,6 +2332,22 @@ inline RefPlace TypeCheck::ArgumentPlace(FnSpec *spec, VarDef *param, const vect
     return IsAddressRef(pt) ? StoragePlace(arg, pt->ref->sub, arg.refplace) : RefPlace {};
 }
 
+inline LinkField TypeCheck::MapStoreField(FnSpec *spec, const vector<Val> &args, VarDef *owner,
+                                           const Roots &mapped, LinkField field) {
+    if (!field.base) return {};
+    if (field.base == owner && owner->componentbase) {
+        field.base = ExactComponent(mapped);
+        if (!field.base) return {};
+    } else if (field.base->ownerspec == spec) {
+        auto part = ArgumentPlace(spec, field.base, args);
+        // An indexed argument identifies the enclosing array. The callee's
+        // remaining path is inside its element.
+        if (!part.base) return {};
+        field = { part.base, part.enclosing ? string(part.path) : cat(part.path, field.path) };
+    }
+    return field;
+}
+
 // Internal links move with the complete element run. The destination alone
 // owns both ends, including when a call maps the store through a parameter.
 inline void TypeCheck::RecordElementLinks(const Dest &dest, TypeExpr *type, const ValueLinks &links, Node *at) {
@@ -2350,7 +2366,7 @@ inline void TypeCheck::StoreElementLink(const Dest &dest, TypeExpr *type, Elemen
         // arrays may also place a slot within a growable tail.
         assert(!dest.fieldsteps);
         link.intail |= dest.place.intail;
-        cur.links.fills[dest.repeated].slots[{ reached, link }].Add(borrowed);
+        cur.links.fills[dest.repeated].slots[{ reached, link, target }].Add(borrowed);
         return;
     }
     auto field = dest.field;
@@ -2362,7 +2378,7 @@ inline void TypeCheck::FinishFill(ArrayLit *fill, const Dest &dest) {
     auto pending = cur.links.fills.extract(fill);
     if (!pending || !reachable) return;
     for (auto &[slot, roots] : pending.mapped().slots)
-        StoreElementLink(dest, slot.first, slot.second, fill, roots);
+        StoreElementLink(dest, slot.reached, slot.link, fill, roots, {}, slot.target);
     for (auto &link : pending.mapped().results)
         link.AddTo(dest.repeated ? cur.links.fills[dest.repeated].results : cur.links.resultlinks);
 }
@@ -2622,19 +2638,6 @@ inline void TypeCheck::ApplyCalleeStores(FnSpec *spec, vector<Val> &argvals, Nod
         }
         return exact ? r : Bounds(r);
     };
-    auto mapfield = [&](const StoreEvent &e, const Roots &owners, LinkField field) {
-        if (field.base == e.container && e.container->componentbase) {
-            field.base = ExactComponent(owners);
-            if (!field.base) field = {};
-        } else if (field.base && field.base->ownerspec == spec) {
-            auto part = ArgumentPlace(spec, field.base, argvals);
-            // An indexed argument names the whole array field only as a
-            // containing field. The callee's suffix is inside its element.
-            if (!part.base) field = {};
-            else field = { part.base, part.enclosing ? string(part.path) : cat(part.path, field.path) };
-        }
-        return field;
-    };
     // A container the caller can name: its own variables and its lexical
     // parents', a class root, a global. Anything else is the callee's own.
     auto callerside = [&](VarDef *x) {
@@ -2864,7 +2867,8 @@ inline void TypeCheck::ApplyCalleeStores(FnSpec *spec, vector<Val> &argvals, Nod
                 }
                 if (once(t.root, a.root))
                     push(t.root, a, e.pointee, src, classread, e.byteview, e.reached, t.bound,
-                         e.slot, e.sliceref, StoredField(mapfield(e, cr, e.storefield), cr, t.root, t.bound));
+                         e.slot, e.sliceref, StoredField(MapStoreField(spec, argvals, e.container, cr, e.storefield),
+                                                        cr, t.root, t.bound));
             }
             if (e.slot && first)
                 slotstores.push_back({ t.root, t.bound, e,
@@ -3003,7 +3007,8 @@ inline void TypeCheck::ApplyCalleeStores(FnSpec *spec, vector<Val> &argvals, Nod
             }
             auto owners = mapped(e.container, !e.bound);
             RecordLinkStore(owners, e.reached, e.elementlink, at, place,
-                            mapfield(e, owners, e.storefield), mapfield(e, owners, e.linktarget));
+                            MapStoreField(spec, argvals, e.container, owners, e.storefield),
+                            MapStoreField(spec, argvals, e.container, owners, e.linktarget));
         } else {
             applystore(e, mapped(e.root, e.exact), true);
         }
