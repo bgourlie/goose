@@ -2799,6 +2799,9 @@ struct TypeCheck {
     // Builtins (§3.7, §9.3, §11.2) and array members (§3.3, §5.4).
 
     Val CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> &args, Val *precv);
+    enum class SlotRemoval { None, Possible, All };
+    SlotRemoval CountedRemoval(BuiltinKind op, const vector<Node *> &args, const Val &count,
+                               const Val &receiver, TypeExpr *array);
     void CheckByteOut(Call *c, Node *out, const string &form);
     // Later passes walk only the arguments that can execute. Overload
     // resolution on a subsequent check still needs the call as written.
@@ -2825,7 +2828,7 @@ struct TypeCheck {
     const string *EmbedShader(Call *c, vector<Node *> &args);
     const string *EmbedFile(Call *c, vector<Node *> &args);
     void CheckGrowShrink(Node *at, const char *op, Node *recv, const Val &rv,
-                         bool empties);
+                         SlotRemoval removal);
     void GrowOnlyAssignKnown(Assign *a, const Roots &built, bool whole);
     bool RetainsRelativeSlot(TypeExpr *part, TypeExpr *array, TypeExpr *replaced);
     bool LinkMayReachElements(TypeExpr *array, TypeExpr *pointee);
@@ -2876,8 +2879,8 @@ struct TypeCheck {
         return part && TopConstEq(part, LoadType(target));
     }
     bool CallMayWrite(FnSpec *spec, const vector<Val> &argvals, const Kill &k);
-    vector<FnRecord::CallerKill> CallerKills(FnSpec *spec, bool relativeonly = false);
-    void NoteShrinkOrder(VarDef *root, TypeExpr *bound);
+    vector<FnRecord::CallerKill> CallerKills(FnSpec *spec, bool relative);
+    void NoteShrinkOrder(VarDef *root, TypeExpr *bound, bool mayremove);
     // While a callee's shrink is judged at a call: the store events the call
     // replayed from `base` on, each with the index of the callee's class
     // event it came from (-1: none, or no order known), and how many of

@@ -2412,6 +2412,7 @@ struct ShrinkEffect {
     ShrinkBalance balance;
     TypeExpr *replaced;
     TypeExpr *arrayreceiver = nullptr; // A shrink of this array alone preserves its owner's fixed fields.
+    bool mayremove = true; // A grow-only shrink operation can preserve every slot.
     ShrinkEffect(ShrinkBalance b = SB_UNBALANCED, TypeExpr *r = nullptr)
         : balance(b), replaced(r) {}
 };
@@ -2763,17 +2764,8 @@ struct FnRecord {
     static void JoinStores(LinkStores &stores, const LinkStores &other) {
         for (auto &[index, suffix] : other) IncludeStore(stores, index, suffix);
     }
-    struct ShrinkOrder {
-        LinkStores linkstores;     // Relative class stores still live at this shrink.
-        int param = -1;
-        VarDef *external = nullptr;
-        TypeExpr *bound = nullptr;
-        size_t before = 0;
-        vector<CallerKill> kills;
-    };
-    vector<ShrinkOrder> shrinkorders;
-    // Effects on the caller's storage after this activation's defers.
-    // At each destination only common overwrites and possible writes survive.
+    // Relative links in the caller's storage at an exit or a shrink.
+    // Only common overwrites and possible writes survive a join.
     struct ExitLinks {
         vector<CallerKill> overwrites;
         LinkStores stores;
@@ -2783,6 +2775,15 @@ struct FnRecord {
         }
         bool operator==(const ExitLinks &) const = default;
     };
+    struct ShrinkOrder {
+        int param = -1;
+        VarDef *external = nullptr;
+        TypeExpr *bound = nullptr;
+        size_t before = 0;
+        vector<CallerKill> kills; // Ordinary holder overwrites at all shrink operations.
+        std::optional<ExitLinks> atremoval; // Relative links only at operations that may remove slots.
+    };
+    vector<ShrinkOrder> shrinkorders;
     ExitLinks exitlinks;  // Ordinary returns to the immediate caller.
     struct InterruptedAssign {
         Node *lval;

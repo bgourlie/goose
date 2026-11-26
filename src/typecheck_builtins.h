@@ -9,6 +9,39 @@ namespace goose {
 // ------------------------------------------------------------------
 // Builtins (§3.7, §9.3, §11.2) and array members (§3.3, §5.4).
 
+// The count and, for resize, the fill have already been checked in evaluation order.
+inline TypeCheck::SlotRemoval TypeCheck::CountedRemoval(BuiltinKind op, const vector<Node *> &args,
+                                                        const Val &count, const Val &receiver, TypeExpr *array) {
+    assert(op == B_POP_N || op == B_RESIZE);
+    auto len = Is<Dot>(args[1]);
+    if (len && len->member == B_LEN && SamePath(args[0], len->obj)) {
+        if (op == B_POP_N) return SlotRemoval::All;
+        // A fill can change the receiver after its length was read.
+        if (args.size() == 2) return SlotRemoval::None;
+    }
+    int64_t lo, hi;
+    if (!IntConsts(count, lo, hi) || lo != 0 || hi != 0) return SlotRemoval::Possible;
+    auto zero = op == B_POP_N ? SlotRemoval::None : SlotRemoval::All;
+    bool immutable = true;
+    for (auto d = count.constfrom; d; d = d->constfrom) {
+        if (d->refwrite) return SlotRemoval::Possible;
+        if (!d->type->cq) immutable = false;
+    }
+    if (immutable) return zero;
+    // A let can acquire a writable alias later. A resize needs to rely on
+    // its initializer only where the overwrite can discharge a link check.
+    if (op == B_RESIZE && reachable && array->arr->akind != A_GROWSHRINK &&
+        HasRelRefT(array->arr->sub)) {
+        auto owner = receiver.Exact() ? receiver.Root() : nullptr;
+        if (cur.deferring || !owner || !owner->ownerspec || IsClassRoot(owner) ||
+            owner->ownerspec != CurRealFrame().spec || LiveElementLinks(owner)) {
+            RelyOnNamed(count, args[1]);
+            return zero;
+        }
+    }
+    return SlotRemoval::Possible;
+}
+
 // One entry for every builtin (builtins.h), for both spellings — f(a, b)
 // and a.f(b) arrive with a uniform argument list (receiver first). The
 // table drives arity, receiver kind/provenance, simple signatures and the
@@ -476,8 +509,8 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
         return dest;
     };
     // resize has two forms (§3.3); a target below zero is caught at runtime.
-    bool empties = d.kind == B_CLEAR;
-    bool maydropslots = d.flags & BF_SHRINKS;
+    auto removal = SlotRemoval::None;
+    if (d.flags & BF_SHRINKS) removal = d.kind == B_CLEAR ? SlotRemoval::All : SlotRemoval::Possible;
     if (d.kind == B_RESIZE) {
         auto length = CheckIntAny(args[1]);
         if (args.size() == 3) {
@@ -490,22 +523,7 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
                                    "contains self-relative references, is not supported; push "
                                    "the elements, which constructs each in place"));
         }
-        int64_t lo, hi;
-        if ((ak == A_GROW || ak == A_LIMITED) && reachable &&
-            IntConsts(length, lo, hi) && lo == 0 && hi == 0) {
-            empties = !length.constfrom;
-            // The fill has run. A local whose previous links are all dead
-            // needs no promise about the value of the named initializer.
-            auto owner = rv.Exact() ? rv.Root() : nullptr;
-            if (length.constfrom && HasRelRefT(elem) &&
-                (cur.deferring || !owner || !owner->ownerspec || IsClassRoot(owner) ||
-                 owner->ownerspec != CurRealFrame().spec || LiveElementLinks(owner))) {
-                empties = true;
-                for (auto d = length.constfrom; d; d = d->constfrom)
-                    if (d->refwrite) empties = false;
-                if (empties) RelyOnNamed(length, args[1]);
-            }
-        }
+        removal = CountedRemoval(d.kind, args, length, rv, recvarr);
     }
     // index_of recovers the element index a reference stands for (§3.3).
     // The reference must be an element of this very array, which is what
@@ -616,9 +634,7 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
         switch (d.args[i]) {
             case 'i': {
                 auto count = CheckIntAny(an);
-                int64_t lo, hi;
-                if (d.kind == B_POP_N && !count.constfrom && IntConsts(count, lo, hi) && !lo && !hi)
-                    maydropslots = false;
+                if (d.kind == B_POP_N) removal = CountedRemoval(d.kind, args, count, rv, recvarr);
                 break;
             }
             case 'e': {
@@ -698,20 +714,14 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
             default: assert(false);
         }
     }
-    if (d.kind == B_POP_N || d.kind == B_RESIZE) {
-        auto len = Is<Dot>(args[1]);
-        if (len && len->member == B_LEN && SamePath(args[0], len->obj)) {
-            if (d.kind == B_POP_N) empties = true;
-            // A fill expression can change the length after it was read.
-            else if (args.size() == 2) maydropslots = false;
-        }
-    }
     // Record a write even if its count preserves every limited-array slot.
-    if (d.flags & BF_WRITE) NoteStorageWrite(rv, recvarr, rv.refplace, reachable || writesduringargs,
-                                             maydropslots ? StorageWrite::MayDropSlots : StorageWrite::Storage);
+    if (d.flags & BF_WRITE) {
+        auto write = removal == SlotRemoval::None ? StorageWrite::Storage : StorageWrite::MayDropSlots;
+        NoteStorageWrite(rv, recvarr, rv.refplace, reachable || writesduringargs, write);
+    }
     // Emptying a limited array unpublishes its whole live prefix, just as
     // assigning [] does. Existing slot views keep their storage (§5.3).
-    if (empties && ak == A_LIMITED) {
+    if (removal == SlotRemoval::All && ak == A_LIMITED) {
         if (HasRelRefT(elem)) NoteOverwrite(args[0], rv, storeevents.size(), recvarr, &rv.refplace);
         if (HoldsPlainRef(elem)) NoteOverwrite(args[0], rv, storeevents.size(), recvarr, nullptr);
     }
@@ -720,7 +730,7 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
     // find, which a sequential array has not got.
     auto shrink = (d.flags & BF_SHRINKS) != 0;
     if (ak == A_GROW && shrink) {
-        CheckGrowShrink(c, d.name, args[0], rv, empties);
+        CheckGrowShrink(c, d.name, args[0], rv, removal);
         if (d.kind != B_CLEAR && ClassOf(elem) != SC_FIXED)
             Error(c, cat(".", d.name, " needs fixed-size elements: ", TypeStr(rv.type),
                          " is sequential (§3.3)"));
@@ -1387,15 +1397,18 @@ inline const string *TypeCheck::EmbedShader(Call *c, vector<Node *> &args) {
 // reference is what shrinks, or it is a struct's tail field, which shrinks
 // the storage the struct lies in, as a reference to the field would.
 inline void TypeCheck::CheckGrowShrink(Node *at, const char *op, Node *recv, const Val &rv,
-                                       bool empties) {
+                                       SlotRemoval removal) {
     auto at_type = IsPlainRef(rv.type) ? rv.type->ref->sub : rv.type;
     assert(at_type->kind == TY_ARRAY);
     auto roots = rv.AsRoots();
     if (!ShrinkRootsKnown(roots))
         Error(at, cat(op, " through a reference whose array is not known (§5.1)"));
+    auto empties = removal == SlotRemoval::All;
     if (empties && HasRelRefT(at_type))
         NoteOverwrite(recv, roots, storeevents.size(), at_type, &rv.refplace);
-    ShrinkThrough(at, op, ExprStr(recv), roots, at_type, { SB_UNBALANCED, empties ? at_type : nullptr });
+    ShrinkEffect effect { SB_UNBALANCED, empties ? at_type : nullptr };
+    effect.mayremove = removal != SlotRemoval::None;
+    ShrinkThrough(at, op, ExprStr(recv), roots, at_type, effect);
 }
 
 // A whole assignment of a grow-only array, or of a value holding one as its
@@ -2219,14 +2232,17 @@ inline void TypeCheck::CheckLinkShrink(const LinkShrink &s) {
         return;
     }
     set<TypeExpr *> slots;
-    if (LiveElementLinks(s.owner, s.array, s.effect.replaced, !s.viaclass, s.at,
-                         s.owner->isglobal && !s.viaclass ? &slots : nullptr).MayPointForward())
-        Error(s.at, cat(s.operation, ": retained storage may have a self-relative link "
-                        "to a removed element (§5.1)"));
+    if (s.effect.mayremove) {
+        auto links = LiveElementLinks(s.owner, s.array, s.effect.replaced, !s.viaclass, s.at,
+                                      s.owner->isglobal && !s.viaclass ? &slots : nullptr);
+        if (links.MayPointForward())
+            Error(s.at, cat(s.operation, ": retained storage may have a self-relative link "
+                            "to a removed element (§5.1)"));
+    }
     if (s.viaclass) return;
     if (s.owner->isglobal) NoteGlobalShrink(s, std::move(slots));
     NoteShrink(s.owner, s.bound, s.effect);
-    NoteShrinkOrder(s.owner, s.bound);
+    NoteShrinkOrder(s.owner, s.bound, s.effect.mayremove);
 }
 
 // A field or element of a literal that is a reference, slice or holder:
@@ -3156,8 +3172,8 @@ inline void TypeCheck::NoteGlobalShrink(const LinkShrink &s, set<TypeExpr *> slo
     // call. A bound may name another global, and a host can call an export
     // after any preceding export has edited the program's globals.
     auto spec = CurRealFrame().spec;
-    bool incoming = bound || (spec && spec->sf->isexport &&
-        !KilledFor(vd, vd, LoadType(vd->type), ResizableArrayIn(vd->type), since, true, replaced));
+    bool incoming = s.effect.mayremove && (bound || (spec && spec->sf->isexport &&
+        !KilledFor(vd, vd, LoadType(vd->type), ResizableArrayIn(vd->type), since, true, replaced)));
     set<string> fields;
     if (incoming && !bound) {
         for (auto &k : cur.kills)
@@ -3677,7 +3693,12 @@ inline void TypeCheck::NoteShrink(VarDef *root, TypeExpr *bound, ShrinkEffect ef
         prior.balance = std::max(prior.balance, effect.balance);
         if (!prior.arrayreceiver || !effect.arrayreceiver ||
             !TopConstEq(prior.arrayreceiver, effect.arrayreceiver)) prior.arrayreceiver = nullptr;
-        if (!prior.replaced || !effect.replaced) prior.replaced = nullptr;
+        // Only operations that can remove a slot constrain what they all replace.
+        if (!effect.mayremove) return;
+        if (!prior.mayremove) {
+            prior.mayremove = true;
+            prior.replaced = effect.replaced;
+        } else if (!prior.replaced || !effect.replaced) prior.replaced = nullptr;
         else if (!TopConstEq(prior.replaced, effect.replaced)) {
             // Both replace storage on the same resizable tail. Keep only
             // the common part; a partial shrink preserves no such guarantee.
@@ -3709,10 +3730,10 @@ inline void TypeCheck::NoteShrink(VarDef *root, TypeExpr *bound, ShrinkEffect ef
 }
 
 // Express path-sensitive overwrites in terms of the caller's arguments.
-inline vector<FnRecord::CallerKill> TypeCheck::CallerKills(FnSpec *spec, bool relativeonly) {
+inline vector<FnRecord::CallerKill> TypeCheck::CallerKills(FnSpec *spec, bool relative) {
     vector<FnRecord::CallerKill> out;
     if (cur.kills.empty()) return out;
-    for (auto &k : cur.kills) {
+    if (relative) for (auto &k : cur.kills) {
         auto base = k.base;
         if (!k.relative) continue;
         if (base == k.container && base->componentbase && IsClassRoot(base)) {
@@ -3729,7 +3750,7 @@ inline vector<FnRecord::CallerKill> TypeCheck::CallerKills(FnSpec *spec, bool re
         auto param = spec->params[p];
         if (!IsAddressRef(param->type)) continue;
         for (auto &k : cur.kills) {
-            if ((relativeonly && !k.relative) || k.base != param || k.container != RefRootOf(param)) continue;
+            if (k.relative != relative || k.base != param || k.container != RefRootOf(param)) continue;
             FnRecord::CallerKill kill { (int)p, k.path, k.relative };
             kill.prefixonly = k.prefixonly;
             if (!k.relative) {
@@ -3749,7 +3770,7 @@ inline vector<FnRecord::CallerKill> TypeCheck::CallerKills(FnSpec *spec, bool re
 // being checked knows its own kills and class events: a shrink recorded on
 // a lexical parent's record, or in a body whose record a recursive cycle's
 // rounds replace, counts every class event and no kill.
-inline void TypeCheck::NoteShrinkOrder(VarDef *root, TypeExpr *bound) {
+inline void TypeCheck::NoteShrinkOrder(VarDef *root, TypeExpr *bound, bool mayremove) {
     auto current = CurRealFrame().spec;
     auto note = [&](FnSpec *s, int param, VarDef *external) {
         auto known = s == current && !s->isfunval && !s->incycle && !s->sf->isrec;
@@ -3769,9 +3790,10 @@ inline void TypeCheck::NoteShrinkOrder(VarDef *root, TypeExpr *bound) {
                     b = std::max(b, callorder.classbase + k + 1);
             if (o.before <= callorder.classbase + os.size()) o.before = std::min(o.before, b);
         }
-        if (known) {
-            o.kills = CallerKills(s);
-            o.linkstores = cur.links.ClassStores();
+        if (known) o.kills = CallerKills(s, false);
+        if (mayremove) {
+            o.atremoval.emplace();
+            if (known) *o.atremoval = { CallerKills(s, true), cur.links.ClassStores() };
         }
         for (auto &e : s->record.shrinkorders) {
             if (e.param != param || e.external != external || !e.bound != !bound ||
@@ -3779,7 +3801,10 @@ inline void TypeCheck::NoteShrinkOrder(VarDef *root, TypeExpr *bound) {
                 continue;
             e.before = std::max(e.before, o.before);
             FnRecord::IntersectKills(e.kills, o.kills);
-            FnRecord::JoinStores(e.linkstores, o.linkstores);
+            if (o.atremoval) {
+                if (e.atremoval) e.atremoval->Join(*o.atremoval);
+                else e.atremoval = std::move(o.atremoval);
+            }
             return;
         }
         s->record.shrinkorders.push_back(o);
@@ -4623,8 +4648,12 @@ inline void TypeCheck::ApplyCalleeShrinks(Node *at, FnSpec *spec, vector<Val> &a
             if (h.order) {
                 callorder = { storesbase, &origins, h.order->before, &classorigins, classbase };
                 for (auto &k : h.order->kills) argkill(k, false);
+                if (h.order->atremoval)
+                    for (auto &k : h.order->atremoval->overwrites) argkill(k, false);
             }
-            projectlinks(h.order && h.order->before != SIZE_MAX ? &h.order->linkstores : nullptr);
+            if (h.effect.mayremove)
+                projectlinks(h.order && h.order->before != SIZE_MAX && h.order->atremoval
+                                 ? &h.order->atremoval->stores : nullptr);
             GrowOnlyShrinkAt(at, what, h.root, string(h.root->name), h.bound, h.arr,
                              h.viaclass, h.effect);
         } else if (judged == SB_UNBALANCED) {

@@ -1585,6 +1585,8 @@ contain forward links. Removing a suffix of that array could leave a
 retained element pointing into the suffix. Emptying the array with
 `clear()` or `resize(0)` removes all its elements together. Subsequent
 shrinks need only account for links that can still exist after the clear.
+An existing self-relative link also survives `a.pop_n(0)` or
+`a.resize(a.len)`, since every element and its target stay in place.
 Clearing a struct's tail preserves its header, including a link into a
 byte view of the tail. Replacing the whole struct discards that link too.
 
