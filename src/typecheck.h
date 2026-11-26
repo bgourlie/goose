@@ -2408,6 +2408,7 @@ struct TypeCheck {
     Val CheckEarlyBlock(EarlyBlock *x, TypeExpr *expected, bool wantvalue);
     void CheckLoopBody(Block *body);
     Scope CheckLoopPasses(Node *x, FlowState &head, const function<void()> &pass);
+    void CheckElementRuns(Node *at, int64_t mincount, int64_t maxcount, const function<void()> &element);
     Val CheckLoop(LoopExpr *x, TypeExpr *expected, bool wantvalue);
     void CheckWhile(While *x);
     void CheckFor(ForLoop *x);

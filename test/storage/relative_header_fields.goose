@@ -1,6 +1,6 @@
 struct Node { value: i64 }
 struct Header { first: Node&<u32>?, second: Node&<u32>?, untouched: Node&<u32>? }
-struct List { header: Header, nodes: Node[>..] }
+struct List { header: Header, spare: Header = Header {}, nodes: Node[>..] }
 
 fn link(header: Header&, node: Node&, first: bool) {
     if first { header.first .= node; } else { header.second .= node; }
@@ -33,6 +33,15 @@ fn main() {
     list.header = forward(list.nodes[0]);
     assert(list.header.first .== list.nodes[0]);
     reset(list.header);
+    list.nodes.clear();
+    list.nodes.push(Node { value: 5 });
+    list.header.first .= list.nodes[0];
+    {
+        var header .= list.spare;
+        fn select_header() { header .= list.header; }
+        select_header();
+        header.first .= block { header.first .= list.nodes[0]; null };
+    }
     list.nodes.clear();
     for first in [true, false] {
         list.nodes.push(Node { value: 2 });

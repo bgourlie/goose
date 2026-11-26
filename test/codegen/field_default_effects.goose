@@ -16,4 +16,9 @@ fn main() {
     reusable[] var pool: D[>..] = [];
     let run = pool.alloc_slice(2);
     print(run, " ", count);
+    let empty = pool.alloc_slice(0);
+    let one = pool.realloc_slice(run, 1);
+    assert(empty.len == 0 && one.len == 1 && count == 9);
+    let grown = pool.realloc_slice(one, 2);
+    assert(grown[1].n == 10 && count == 10);
 }

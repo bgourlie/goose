@@ -3147,14 +3147,14 @@ inline void TypeCheck::CheckSpecBodyOnce(FnSpec *spec, vector<Val> *argvals, Lin
     BodyExits exits;
     auto lexframe = LexFrame(spec->lexparent, sf);
     EachNamedVar(lexframe, spec, [&](int i) {
-        outernarrowed.push_back({ vars[i], vars[i]->narrowed });
-        if (vars[i]->assigned &&
-            !(hasdefers && vars[i]->isvar && vars[i]->type && IsAddressRef(vars[i]->type))) {
-            outerassigned.push_back({ vars[i], vars[i]->maybeassigned });
+        auto v = vars[i];
+        outernarrowed.push_back({ v, v->narrowed });
+        if (v->assigned && !(v->isvar && v->type && (IsAddressRef(v->type) || v->type->kind == TY_SLICE))) {
+            outerassigned.push_back({ v, v->maybeassigned });
             return;
         }
-        exits.vars.push_back(vars[i]);
-        exits.maybeonentry.push_back(vars[i]->maybeassigned);
+        exits.vars.push_back(v);
+        exits.maybeonentry.push_back(v->maybeassigned);
     });
     exits.assigned.resize(exits.vars.size());
     exits.places.resize(exits.vars.size());

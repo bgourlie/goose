@@ -1056,6 +1056,7 @@ inline bool CodeGen::BulkDefaultLoop(ForLoop *loop) {
 // `first`: one clear where the default is all zero bytes, else each built.
 inline void CodeGen::EmitDefaultElems(const ArrView &v, const string &first,
                                       const string &count, Node *init) {
+    if (!init) return;  // The pool operation adds no elements.
     auto esz = FixedSize(v.elem);
     if (!HasFieldDefaults(v.elem)) {
         L("GS_MEMZERO(", ElemAddr(v, cat("(", first, ")")), ", (size_t)((", count, ") * ", esz,

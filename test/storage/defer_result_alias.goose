@@ -73,6 +73,16 @@ fn moved_on_nonlocal_exit() -> i64[] {
     return out;
 }
 
+fn moved_slice(in_helper: bool) -> i64[] {
+    var out: i64[] = [42];
+    var spare: i64[] = [0];
+    var view: i64[:] = out[..];
+    fn move() { view = spare[..]; }
+    if in_helper { move(); } else { view = spare[..]; }
+    defer { view[0]++; }
+    return out;
+}
+
 fn stop() -> i64 { abort("stop"); }
 fn numbers(n: i64 = stop()) -> i64[] { [n] }
 fn fixed_numbers(n: i64) -> i64[2] { [n, stop()] }
@@ -199,6 +209,7 @@ fn main() {
     assert(moved_during_unwind()[0] == 42);
     assert(skipped_rebind(true)[0] == 42);
     assert(moved_on_nonlocal_exit()[0] == 42);
+    assert(moved_slice(true)[0] == 42 && moved_slice(false)[0] == 42);
     assert(stopped_placed_call(false)[0].n == 42);
     let unchanged = stopped_store(false);
     assert(unchanged[0] == 41);

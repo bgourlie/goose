@@ -315,7 +315,11 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
                 // built at its receiving slot.
                 auto inplace = Is<StructLit>(c->defaultinit) && HasRelRefT(t, true) && !callresultdsts.empty();
                 Saved writing(curdst.construction, inplace ? callresultdsts.front().construction : nullptr);
-                auto v = CheckValue(c->defaultinit, t->kind == TY_ARRAY ? t->arr->sub : t);
+                Val v;
+                if (t->kind == TY_ARRAY) {
+                    auto count = ArraySize(t->arr);
+                    CheckElementRuns(c, count, count, [&] { v = CheckValue(c->defaultinit, t->arr->sub); });
+                } else v = CheckValue(c->defaultinit, t);
                 v.type = t;
                 // An array is filled with its element's default in a
                 // temporary of its own, as a literal is built (§9.2).
@@ -577,16 +581,26 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
             }
         }
         if (d.kind != B_FREE_SLICE) {
-            CheckIntAny(args.back());
+            auto length = CheckIntAny(args.back());
             string why;
             if (!HasDefault(elem, why))
                 Error(c, cat(".", d.name, " fills the elements it adds with default values, "
                              "and ", TypeStr(elem), " has none: ", why, " (§5.4)"));
-            if (!c->defaultinit) c->defaultinit = DefaultCall(elem, c->line);
             auto logbase = cur.growlog.size();
             // The pool claims its slots before constructing their defaults.
             writesduringargs = reachable;
-            ElemArg(c->defaultinit, elem, elementdest());
+            int64_t lo = 0, hi = -1;
+            if (!length.constfrom && IntConsts(length, lo, hi)) {
+                lo = std::max<int64_t>(0, lo);
+                hi = std::max<int64_t>(0, hi);
+            }
+            // Reallocation only defaults the portion beyond the old length.
+            if (d.kind == B_REALLOC_SLICE) lo = 0;
+            if (!hi) c->defaultinit = nullptr;
+            CheckElementRuns(c, lo, hi, [&] {
+                if (!c->defaultinit) c->defaultinit = DefaultCall(elem, c->line);
+                ElemArg(c->defaultinit, elem, elementdest());
+            });
             CheckGrowsSince(logbase, rv, "the default elements allocated in a slice pool",
                             recvarr);
         }
@@ -1063,18 +1077,8 @@ inline void TypeCheck::CheckRenderable(Call *c, const char *what, TypeExpr *t, N
                 c->fmtspecs.resize(base);  // Keep overloads from the settled pass.
                 child(elem, IsRefOrSlice(elem));
             };
-            if (!seen.executes || count == 1) {
-                element();
-            } else {
-                auto head = SaveFlow();
-                auto loop = CheckLoopPasses(at, head, element);
-                // A dynamic sequence can be empty. A nonempty fixed array
-                // leaves with the effects of its last element in force.
-                if (count > 0) {
-                    if (loop.backedges) RestoreFlow(loop.backedge);
-                    else reachable = false;
-                }
-            }
+            if (seen.executes) CheckElementRuns(at, std::max<int64_t>(0, count), count, element);
+            else element();  // Resolve the element's format overloads for codegen.
             return;
         }
         case TY_REF: {
@@ -2061,13 +2065,13 @@ inline void TypeCheck::AddStoreEvent(const StoreEvent &e) {
 inline void TypeCheck::NoteRefPlace(VarDef *vd, const Val &v) {
     // A mutable reference's current binding is flow state. Its lifetime
     // commitment still includes every binding at the committed depth.
-    if (vd->isvar && (!hasdefers || vd->isglobal || !IsAddressRef(vd->type))) return;
+    if (vd->isvar && vd->isglobal) return;
     RefPlace place;
     if (vd->type->kind == TY_SLICE && !vd->isglobal) place = v.sliceplace;
-    else if (IsAddressRef(vd->type) && (hasdefers || HasRelRefT(vd->type->ref->sub))) {
+    else if (IsAddressRef(vd->type)) {
         auto owners = OwnersAtPlace(v, v.refplace);
         place = StoragePlace(owners, vd->type->ref->sub, v.refplace);
-        if (hasdefers && !place.base && owners.Exact()) {
+        if (!place.base && owners.Exact()) {
             auto owner = owners.Root();
             if (owner && owner->type && !IsRefOrSlice(owner->type) && !IsTemp(owner))
                 place = RefPlace { place.location, owner }.Inside();

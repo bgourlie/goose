@@ -1940,6 +1940,28 @@ inline TypeCheck::Scope TypeCheck::CheckLoopPasses(Node *x, FlowState &head,
     return sc;
 }
 
+// Effects of an implicit element loop. A negative maximum denotes an unknown
+// bound. Only a loop that can be empty can leave the incoming state untouched.
+inline void TypeCheck::CheckElementRuns(Node *at, int64_t mincount, int64_t maxcount,
+                                        const function<void()> &element) {
+    if (maxcount == 0) return;
+    if (mincount == 1 && maxcount == 1) {
+        element();
+        return;
+    }
+    auto head = SaveFlow();
+    if (maxcount == 1) {
+        element();
+        MergeFlow(head, SaveFlow());
+        return;
+    }
+    auto loop = CheckLoopPasses(at, head, element);
+    if (mincount > 0) {
+        if (loop.backedges) RestoreFlow(loop.backedge);
+        else reachable = false;
+    }
+}
+
 inline Val TypeCheck::CheckLoop(LoopExpr *x, TypeExpr *expected, bool wantvalue) {
     auto head = SaveFlow();
     auto onpath = argpath == x;
@@ -3292,7 +3314,8 @@ inline void TypeCheck::CheckRebind(Assign *a, LVal &lv) {
     } else {
         // The slot a field path names, rebound to null, holds nothing; a
         // variable rebound holds its binding, which is its provenance.
-        NoteKill(a->lval, lv, target, v, killat);
+        // The null store takes place after any writes in its operand.
+        NoteKill(a->lval, lv, target, v, v.isnull || v.refplace.nullonly ? storeevents.size() : killat);
     }
 }
 
