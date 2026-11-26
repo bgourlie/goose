@@ -304,13 +304,24 @@ struct TypeCheck {
             // An old slot outside a limited array's new live prefix can be
             // reached only through a view. The path is relative to field.base.
             std::optional<string_view> suffix;
+            bool livetarget;
 
             void Include(const Write &other) {
                 at = std::max(at, other.at);
                 if (suffix != other.suffix) suffix.reset();
+                livetarget &= other.livetarget;
             }
         };
         map<Part, Write, std::less<>> live;
+        // Successful index evaluations and immutable reference bindings known
+        // to address a live element of a particular limited array on this path.
+        using Target = variant<Node *, VarDef *>;
+        map<Target, VarDef *> targets;
+        void DropPrefix(VarDef *owner) {
+            erase_if(targets, [&](const auto &p) { return p.second == owner; });
+            auto [first, last] = live.equal_range(owner);
+            for (; first != last; ++first) first->second.livetarget = false;
+        }
         vector<RelativeStore> resultlinks; // Writes into the result under construction on this path.
         // A repeated literal captures its operand before installing any
         // links. Only paths that finish the operand reach those stores.
@@ -333,15 +344,19 @@ struct TypeCheck {
             }
         };
         map<ArrayLit *, FillLinks> fills;
-        void Add(const StoreEvent &e, size_t index, std::optional<string_view> suffix = {}) {
+        void Add(const StoreEvent &e, size_t index, std::optional<string_view> suffix = {}, bool livetarget = false) {
             Part part { e.container, e.elementlink, e.storefield, e.linkclass, e.linktarget, e.boundfield };
-            Write write { index, suffix };
+            Write write { index, suffix, livetarget };
             auto [it, added] = live.try_emplace(std::move(part), write);
             if (!added) it->second.Include(write);
         }
         // Once a binding expires, its outstanding writes still belong to
         // the enclosing field. A fresh iteration can bind a different slot.
         template<typename F> void ForgetBindings(F expired) {
+            erase_if(targets, [&](const auto &p) {
+                auto var = get_if<VarDef *>(&p.first);
+                return expired(p.second) || (var && expired(*var));
+            });
             for (auto it = live.begin(); it != live.end();) {
                 auto field = it->first.boundfield;
                 if (!field || !expired(field->base)) {
@@ -355,6 +370,10 @@ struct TypeCheck {
             }
         }
         void Join(const LinkFlow &other) {
+            erase_if(targets, [&](const auto &p) {
+                auto it = other.targets.find(p.first);
+                return it == other.targets.end() || it->second != p.second;
+            });
             for (auto &link : other.resultlinks) link.AddTo(resultlinks);
             for (auto &[fill, links] : other.fills) fills[fill].Join(links);
             for (auto &[part, write] : other.live) {
@@ -370,11 +389,12 @@ struct TypeCheck {
         }
         // Loop convergence depends on the possible writes, not event numbers.
         bool operator==(const LinkFlow &o) const {
-            return fills == o.fills && RelativeStore::SameSet(resultlinks, o.resultlinks) &&
+            return targets == o.targets && fills == o.fills && RelativeStore::SameSet(resultlinks, o.resultlinks) &&
                    live.size() == o.live.size() &&
                    equal(live.begin(), live.end(), o.live.begin(),
                          [](const auto &a, const auto &b) {
-                             return a.first == b.first && a.second.suffix == b.second.suffix;
+                             return a.first == b.first && a.second.suffix == b.second.suffix &&
+                                    a.second.livetarget == b.second.livetarget;
                          });
         }
     };
@@ -2038,6 +2058,7 @@ struct TypeCheck {
 
     enum class PathUse { Evaluate, ComparisonView, Reread };
     LVal CheckLValue(Node *n, PathUse use = PathUse::Evaluate);
+    VarDef *LivePrefixTarget(Node *n);
     LVal LValueBase(Node *n, PathUse use = PathUse::Evaluate);
     LVal ValueBase(Node *n, const Val &v);
     Val CheckSlice(SliceExpr *se, LVal lv);
@@ -2967,12 +2988,14 @@ struct TypeCheck {
         auto [first, last] = cur.links.live.equal_range(v);
         cur.links.live.erase(first, last);
         erase_if(cur.kills, [&](const Kill &k) { return k.container == v; });
+        cur.links.DropPrefix(v);
+        cur.links.targets.erase(v);
         if (!v->type || v->isvar || !IsAddressRef(v->type)) return;
         cur.links.ForgetBindings([&](VarDef *base) { return base == v; });
         erase_if(cur.kills, [&](const Kill &k) { return k.relative && k.base == v; });
     }
     void ForgetLocal(VarDef *v) {
-        if (cur.links.live.empty() && cur.kills.empty()) return;
+        if (cur.links.live.empty() && cur.links.targets.empty() && cur.kills.empty()) return;
         ForgetOwner(v);
         for (auto c : v->components) if (c) ForgetLocal(c);
     }

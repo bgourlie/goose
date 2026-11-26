@@ -2787,9 +2787,11 @@ inline void TypeCheck::RecordStorageWrite(FnRecord::StorageWrite write, Defer *e
     if (cur.probingtypes) return;
     auto spec = CurRealFrame().spec;
     if (!spec || !write.root || write.root->isglobal || IsTemp(write.root)) return;
-    if (write.effect != StorageWrite::Storage && write.root->intactprefix && write.root->ownerspec == spec &&
-        TopConstEq(write.root->type, write.type))
+    if (write.effect != StorageWrite::Storage && write.root->type && write.root->ownerspec == spec &&
+        IsArrayKind(write.root->type, A_LIMITED) && TopConstEq(write.root->type, write.type)) {
         write.root->intactprefix = false;
+        cur.links.DropPrefix(write.root);
+    }
     if (!cur.deferring && write.root->ownerspec == spec) {
         if (!executing || write.effect == StorageWrite::PrefixOnly) return;
         // A named frame object's fixed prefix is copied before defers run.
@@ -3046,6 +3048,9 @@ inline void TypeCheck::CheckVarDecl(VarDecl *vd, bool global) {
         d->type = t;
         d->intactprefix = !global && IsArrayKind(t, A_LIMITED) && v && v->intactprefix;
         if (IsArrayKind(t, A_LIMITED) && v) d->limitedcapacity = v->extent.capacity;
+        if (v && !global && !d->isvar && IsAddressRef(t) && v->Exact())
+            if (auto owner = LivePrefixTarget(init); owner && owner == v->Root())
+                cur.links.targets[d] = owner;
         if (global) CheckVarExtent(d, vd);
         if (v && IsRefOrSlice(t)) {
             BindRefProvenance(d, *v);

@@ -1009,10 +1009,12 @@ struct ElementLink {
     ElementLinks direction = EL_NONE;
     bool intail = false; // The receiving slot lies in its owner's resizable tail.
     bool suffixonly = false; // In a limited-array value, this slot is outside its live length.
+    bool livetarget = false; // Its target is within this limited-array value's current length.
     explicit operator bool() const { return direction != EL_NONE; }
     auto operator<=>(const ElementLink &) const = default;
     bool SameSlotKind(ElementLink other) const {
-        return pointee == other.pointee && intail == other.intail && suffixonly == other.suffixonly;
+        return pointee == other.pointee && intail == other.intail && suffixonly == other.suffixonly &&
+               livetarget == other.livetarget;
     }
 };
 

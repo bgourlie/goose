@@ -1453,9 +1453,10 @@ inline ValueLinks TypeCheck::LiveElementLinks(VarDef *owner, TypeExpr *target, T
     size_t since = 0;
     bool cleared = t && KilledFor(owner, owner, t, arr, since, true, replaced);
     auto emptiestail = replaced && ResizableArrayIn(replaced);
+    auto limited = !target && t && IsArrayKind(t, A_LIMITED);
     ValueLinks links;
     auto retain = [&](ElementLink link, const LinkField &field, const LinkField &to,
-                      std::optional<string_view> suffix = {}) {
+                      std::optional<string_view> suffix = {}, bool livetarget = false) {
         if (!link || (emptiestail && link.intail) || !LinkMayReachElements(arr, link.pointee)) return;
         if (target && target->kind == TY_ARRAY && InRetainedField(owner, link.pointee, to.base, to.path)) return;
         if (shrink && suffix) {
@@ -1464,7 +1465,8 @@ inline ValueLinks TypeCheck::LiveElementLinks(VarDef *owner, TypeExpr *target, T
             if (array && !MayViewLimitedSlot(part, array, shrink,
                                             link.direction == EL_ANY ? globalSlots : nullptr)) return;
         }
-        link.suffixonly = !target && t && IsArrayKind(t, A_LIMITED) && field.base == owner && suffix && suffix->empty();
+        link.suffixonly = limited && field.base == owner && suffix && suffix->empty();
+        link.livetarget = limited && livetarget;
         // A value read out of its owner carries its field paths with it.
         // Shrink queries only need the types and directions of retained links.
         auto path = [&](const LinkField &part) -> string_view {
@@ -1475,7 +1477,7 @@ inline ValueLinks TypeCheck::LiveElementLinks(VarDef *owner, TypeExpr *target, T
     for (auto &[part, write] : cur.links.live) {
         if (part.owner != owner) continue;
         if (storage && cleared && write.at < since) continue;
-        retain(part.link, part.field, part.target, write.suffix);
+        retain(part.link, part.field, part.target, write.suffix, write.livetarget);
     }
     auto spec = CurRealFrame().spec;
     // A named callee records shrinks of captured owners as external shrinks.
@@ -2273,6 +2275,7 @@ inline void TypeCheck::NoteLitElem(LitDeep &deep, Node *at, const Val &v, TypeEx
             auto link = value;
             link.intail |= IsArrayKind(t, A_GROW);
             link.suffixonly = false; // A nested array's capacity slots belong to the enclosing value.
+            link.livetarget = false;
             auto member = [&](string_view part) -> string_view {
                 return field.empty() ? string_view {} : ast.Intern(cat(".", field, part));
             };
@@ -2432,6 +2435,9 @@ inline LinkField TypeCheck::MapStoreField(FnSpec *spec, const vector<Val> &args,
 inline void TypeCheck::RecordElementLinks(const Dest &dest, TypeExpr *type, const ValueLinks &links, Node *at) {
     for (auto [link, path, target] : links.slots) {
         link.intail |= IsArrayKind(type, A_GROW);
+        // A returned proof describes this whole array's length.
+        link.livetarget &= IsArrayKind(type, A_LIMITED) && dest.fieldsteps && dest.field.base &&
+                           dest.field.path.empty() && dest.field.base == dest.roots.Root();
         auto to = dest.field;
         if (to.base && dest.fieldsteps) to.path += target;
         StoreElementLink(dest, type, link, at, {}, path, to);
@@ -2451,6 +2457,7 @@ inline void TypeCheck::StoreElementLink(const Dest &dest, TypeExpr *type, Elemen
         // arrays may also place a slot within a growable tail.
         assert(!dest.fieldsteps);
         link.intail |= dest.place.intail;
+        link.livetarget = false; // The captured target can outlive its original length during the fill.
         cur.links.fills[dest.repeated].slots[{ reached, link, target }].Add(borrowed);
         return;
     }
@@ -2483,6 +2490,8 @@ inline void TypeCheck::RecordLinkStore(const Roots &owners, TypeExpr *reached,
                                       std::optional<string_view> suffix) {
     if (!reachable || cur.probingtypes || owners.None()) return;
     link.intail |= place.intail;
+    auto livetarget = link.livetarget && owners.Exact();
+    link.livetarget = false;
     for (auto &d : ShrinkTargets(owners, reached, false)) {
         if (IsTemp(d.root)) continue;
         StoreEvent e;
@@ -2500,7 +2509,9 @@ inline void TypeCheck::RecordLinkStore(const Roots &owners, TypeExpr *reached,
         e.at = at->line;
         AddStoreEvent(e);
         auto index = storeevents.size() - 1;
-        cur.links.Add(storeevents.back(), index, e.storefield.base ? suffix : std::nullopt);
+        cur.links.Add(storeevents.back(), index, e.storefield.base ? suffix : std::nullopt,
+                      livetarget && !d.bound && d.root == owners.Root() && !cur.deferring &&
+                      d.root->ownerspec && d.root->ownerspec == CurRealFrame().spec);
     }
 }
 

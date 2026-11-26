@@ -10,6 +10,14 @@ namespace goose {
 // ------------------------------------------------------------------
 // Lvalue paths: names, fields, elements, optionally through references.
 
+inline VarDef *TypeCheck::LivePrefixTarget(Node *n) {
+    if (!n || cur.links.targets.empty()) return nullptr;
+    if (auto u = Is<Unary>(n); u && u->op == T_BITAND) n = u->child;
+    auto id = Is<Ident>(n);
+    auto it = cur.links.targets.find(id ? LinkFlow::Target(id->vdef) : LinkFlow::Target(n));
+    return it == cur.links.targets.end() ? nullptr : it->second;
+}
+
 inline TypeCheck::LVal TypeCheck::CheckLValue(Node *n, PathUse use) {
     DestScope ds(*this, Dest {});
     NodeScope ns(*this, n);
@@ -92,6 +100,14 @@ inline TypeCheck::LVal TypeCheck::CheckLValue(Node *n, PathUse use) {
                          " of variable-size elements cannot be indexed, only iterated; for "
                          "random access, keep your own array of references to them (§3.3)"));
         if (lv.intemp) NoRelRefTempRead(ix->obj, lv.type, elem);
+        // The index checks the captured length. A shrink during evaluation of
+        // the subscript invalidates this evidence just like a later shrink.
+        cur.links.targets.erase(n);
+        auto owner = lv.Exact() ? lv.Root() : nullptr;
+        if (reachable && IsArrayKind(lv.type, A_LIMITED) && !IsRefOrSlice(elem) && owner && owner->type &&
+            owner->ownerspec && owner->ownerspec == CurRealFrame().spec && TopConstEq(owner->type, lv.type) &&
+            lv.place.Base() == owner && lv.place.Path().empty() && !lv.place.Enclosing() && HasRelRefT(elem))
+            cur.links.targets[n] = owner;
         lv.place = lv.place.Inside(ast.places, IsArrayKind(lv.type, A_GROW));
         if (use != PathUse::Reread) CheckIntAny(ix->idx);
         if (lv.type->cq) lv.writable = false;   // An element of a const value.
@@ -743,6 +759,11 @@ inline void TypeCheck::ResolveMemberLValue(LVal &lv, Dot *d) {
             lv.letbound = f.isconst;
             lv.letname = f.name;
             lv.type = (*run.ftypes)[i];
+            if (!cur.links.targets.empty()) {
+                cur.links.targets.erase(d);
+                if (auto owner = LivePrefixTarget(d->obj); owner && !IsRefOrSlice(lv.type))
+                    cur.links.targets[d] = owner;
+            }
             ProjectField(lv, lv.place, t, run, i);
             lv.var = nullptr;
             lv.fromstorage = true;
@@ -1465,7 +1486,8 @@ inline bool TypeCheck::FitsAt(Val &v, TypeExpr *dt, bool delivered) {
                               "reference still names (§5.2)");
                 return false;
             }
-            if (IsArrayKind(t, A_LIMITED) && !v.intactprefix && links.MayPointForward()) {
+            if (IsArrayKind(t, A_LIMITED) && !v.intactprefix &&
+                links.Any([](auto link) { return link.direction == EL_ANY && !link.livetarget; })) {
                 fitfail = cat("cannot construct ", TypeStr(dt), " from ", TypeStr(t),
                               ": a self-relative link may name a slot beyond the live length "
                               "that the conversion would discard (§5.3)");
@@ -1554,8 +1576,9 @@ inline bool TypeCheck::FitsAt(Val &v, TypeExpr *dt, bool delivered) {
                     return false;
                 }
                 if (recordingrelative && !dt->ref->pool && !curdst.result) {
-                    StoreElementLink(curdst, dt, { pointee, curdst.appended ? EL_BACKWARD : EL_ANY },
-                                     fitnode, links, {}, target);
+                    ElementLink link { pointee, curdst.appended ? EL_BACKWARD : EL_ANY };
+                    link.livetarget = have && have == LivePrefixTarget(fitnode) && have == want;
+                    StoreElementLink(curdst, dt, link, fitnode, links, {}, target);
                 }
                 v.type = dt;
                 return true;
