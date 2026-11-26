@@ -1,4 +1,6 @@
 struct Node { next: Node&<u32>? }
+const TWO = 2;
+const CAP = TWO;
 
 fn pair(shrink: bool) -> Node[..] {
     var nodes: Node[..] = [Node {}, Node {}];
@@ -9,10 +11,14 @@ fn pair(shrink: bool) -> Node[..] {
 }
 
 fn reserved() -> Node[..] {
-    var nodes: Node[..] = [..2];
+    var nodes: Node[..] = [..CAP];
+    nodes.push(Node {});
+    nodes.push(Node {});
+    let last .= nodes[1];
+    nodes.clear();
     var alias .= nodes;
-    alias = [Node {}; 2];
-    nodes[0].next .= nodes[1];
+    alias = [Node {}; CAP];
+    nodes[0].next .= last;
     return nodes;
 }
 

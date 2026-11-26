@@ -199,7 +199,8 @@ inline Val ArrayLit::Check(TypeCheck &tc, TypeExpr *expected) {
         v.type = expected;
         v.intactprefix = true; // Reserved slots have never been addressable.
         v.extent.length = 0;
-        if (cap.ck == CK_INT && !cap.uns && !cap.constfrom) v.extent.capacity = cap.ival;
+        if (cap.ck == CK_INT && !cap.uns && tc.ConstantBindings(cap) == TypeCheck::ConstantBinding::Immutable)
+            v.extent.capacity = cap.ival;
         return v;
     }
     // Whether each element adapts as a literal would (Val::litelems).

@@ -2225,6 +2225,15 @@ struct TypeCheck {
     VarDef *RelyOnNonneg(const Val &v, Node *at);
     void RelyOnConstant(ConstUse &use, VarDef *d);
     void RelyOnNamed(const Val &v, Node *at);
+    enum class ConstantBinding { Immutable, Let, Aliased };
+    static ConstantBinding ConstantBindings(const Val &v) {
+        auto result = ConstantBinding::Immutable;
+        for (auto d = v.constfrom; d; d = d->constfrom) {
+            if (d->refwrite) return ConstantBinding::Aliased;
+            if (!d->type->cq) result = ConstantBinding::Let;
+        }
+        return result;
+    }
     bool TypeFixesExtent(VarDef *d, bool cap);
     void RelyOnExtent(ConstUse &use, VarDef *d, bool cap);
     void CheckVarExtent(VarDef *d, Node *at);

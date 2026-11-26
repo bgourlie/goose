@@ -22,12 +22,9 @@ inline TypeCheck::SlotRemoval TypeCheck::CountedRemoval(BuiltinKind op, const ve
     int64_t lo, hi;
     if (!IntConsts(count, lo, hi) || lo != 0 || hi != 0) return SlotRemoval::Possible;
     auto zero = op == B_POP_N ? SlotRemoval::None : SlotRemoval::All;
-    bool immutable = true;
-    for (auto d = count.constfrom; d; d = d->constfrom) {
-        if (d->refwrite) return SlotRemoval::Possible;
-        if (!d->type->cq) immutable = false;
-    }
-    if (immutable) return zero;
+    auto binding = ConstantBindings(count);
+    if (binding == ConstantBinding::Aliased) return SlotRemoval::Possible;
+    if (binding == ConstantBinding::Immutable) return zero;
     // A let can acquire a writable alias later. A resize needs to rely on
     // its initializer only where the overwrite can discharge a link check.
     if (op == B_RESIZE && reachable && array->arr->akind != A_GROWSHRINK &&
