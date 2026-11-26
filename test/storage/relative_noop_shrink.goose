@@ -28,6 +28,16 @@ fn empty(nodes: Node[>..]&) {
     keep(nodes);
 }
 
+fn through_mutable_ref() {
+    var nodes: Node[>..] = [Node {}, Node {}];
+    nodes[0].next .= nodes[1];
+    var alias .= nodes;
+    alias.resize(alias.len);
+    assert(nodes.len == 2 && nodes[0].next .== nodes[1]);
+    alias.pop_n(alias.len);
+    assert(nodes.len == 0);
+}
+
 fn unlink_then_trim(list: List&) {
     list.nodes.resize(list.nodes.len);
     list.head .= null;
@@ -38,6 +48,7 @@ var shared: Node[>..] = [Node {}, Node {}];
 export fn keep_shared() { shared.resize(shared.len); }
 
 fn main() {
+    through_mutable_ref();
     let pair: Node[] = limited_pair();
     assert(pair.len == 2 && pair[0].next .== pair[1]);
     var nodes: Node[>..] = [Node {}, Node {}, Node {}];

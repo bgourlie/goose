@@ -3099,7 +3099,8 @@ struct TypeCheck {
     void ShrinkGrowShrink(Node *at, const string &op, VarDef *root, const string &what,
                           TypeExpr *bound = nullptr, ShrinkBalance balance = SB_UNBALANCED);
     bool ResizesToMark(Node *recv, Node *len);
-    bool SamePath(Node *a, Node *b);
+    enum class PathInterval { ConsecutiveReads, AcrossStatements };
+    bool SamePath(Node *a, Node *b, PathInterval interval);
     // An array a shrink may free (§5.1, §5.2): the one in root's own storage,
     // or, where root cannot hold one, one its storage leads to through the
     // references it holds (`bound`: root only bounds that array's lifetime).

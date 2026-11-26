@@ -14,7 +14,7 @@ inline TypeCheck::SlotRemoval TypeCheck::CountedRemoval(BuiltinKind op, const ve
                                                         const Val &count, const Val &receiver, TypeExpr *array) {
     assert(op == B_POP_N || op == B_RESIZE);
     auto len = Is<Dot>(args[1]);
-    if (len && len->member == B_LEN && SamePath(args[0], len->obj)) {
+    if (len && len->member == B_LEN && SamePath(args[0], len->obj, PathInterval::ConsecutiveReads)) {
         if (op == B_POP_N) return SlotRemoval::All;
         // A fill can change the receiver after its length was read.
         if (args.size() == 2) return SlotRemoval::None;
@@ -3862,29 +3862,29 @@ inline bool TypeCheck::ResizesToMark(Node *recv, Node *len) {
     auto m = id ? LookupVar(id->name, id->ns) : nullptr;
     auto spec = CurRealFrame().spec;
     if (!m || !m->markof || m->isvar || !spec || m->ownerspec != spec || m->refwrite ||
-        !SamePath(m->markof, recv))
+        !SamePath(m->markof, recv, PathInterval::AcrossStatements))
         return false;
     if (!m->markuse) m->markuse = len;
     return true;
 }
 
-// Whether two checked paths name the same storage whenever both run under
-// one binding of the variable they start from: the same variable, which no
-// rebinding can move (a `var` reference can be rebound), then the same
-// fields, none of them a reference or slice, which could be moved.
-inline bool TypeCheck::SamePath(Node *a, Node *b) {
+// Reading the same variable and fields twice without intervening effects
+// observes the same storage. Across statements the path must also survive
+// rebinding of the variable or of any reference-valued field along it.
+inline bool TypeCheck::SamePath(Node *a, Node *b, PathInterval interval) {
     auto da = Is<Dot>(a), db = Is<Dot>(b);
     if (da || db) {
-        auto field = [](Dot *d) {
-            return d && d->fieldidx >= 0 && d->exprtype && !IsRefOrSlice(d->exprtype);
+        auto field = [&](Dot *d) {
+            return d && d->fieldidx >= 0 && d->exprtype &&
+                   (interval == PathInterval::ConsecutiveReads || !IsRefOrSlice(d->exprtype));
         };
         return field(da) && field(db) && da->fieldidx == db->fieldidx && da->name == db->name &&
-               SamePath(da->obj, db->obj);
+               SamePath(da->obj, db->obj, interval);
     }
     auto ia = Is<Ident>(a), ib = Is<Ident>(b);
     if (!ia || !ib || !ia->vdef || ia->vdef != ib->vdef) return false;
     auto v = ia->vdef;
-    return v->type && !(v->isvar && IsRefOrSlice(v->type));
+    return v->type && (interval == PathInterval::ConsecutiveReads || !(v->isvar && IsRefOrSlice(v->type)));
 }
 
 // The arrays a shrink of an `arr` rooted at root may free. An exact root
