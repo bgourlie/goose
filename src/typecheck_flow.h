@@ -3136,6 +3136,23 @@ inline void TypeCheck::CheckVarDecl(VarDecl *vd, bool global) {
         if (v && IsRefOrSlice(t)) {
             BindRefProvenance(d, *v);
             NoteRefPlace(d, *v);
+            if (!global && !d->isvar && IsAddressRef(t)) {
+                auto ref = Is<Unary>(init);
+                auto binding = Is<Ident>(ref && ref->op == T_BITAND ? ref->child : init);
+                if (auto call = Is<Call>(init); call && call->builtin == B_PUSH && call->appendedarray) {
+                    d->elementarray = call->appendedarray;
+                    d->appended = true;
+                } else if (auto ix = Is<Index>(AddressedPath(init)); ix && ix->arrayheader &&
+                           ix->exprtype && !IsRefOrSlice(ix->exprtype)) {
+                    d->elementarray = ix->arrayheader;
+                } else if (binding && binding->vdef) {
+                    d->elementorigin = binding->vdef->elementorigin;
+                }
+                if (d->elementarray) {
+                    d->elementdecl = (int)vars.size();
+                    d->elementorigin = d;
+                }
+            }
             if (t->cq) d->ref.writable = false;
             // An annotated one's binding FitsAt has noted.
             if (global && !ann && !v->isnull)

@@ -64,6 +64,7 @@ inline TypeCheck::SlotRemoval TypeCheck::CountedRemoval(BuiltinKind op, const ve
 // table drives arity, receiver kind/provenance, simple signatures and the
 // growths and shrinks; what it cannot express gets dedicated code below.
 inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> &args, Val *precv) {
+    c->appendedarray = nullptr;
     c->builtin = d.kind;
     // src_file() and src_line() name the call they are checked as. A
     // parameter default is parsed at the declaration; the frame
@@ -822,7 +823,11 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
             v.ClearReads();
             v.writable = rv.writable;
             v.refplace = elementplace;
-            if (d.kind == B_PUSH) NoteLiveElement(c, rv, rv.refplace, recvarr);
+            if (d.kind == B_PUSH) {
+                NoteLiveElement(c, rv, rv.refplace, recvarr);
+                if (ak == A_GROW && ClassOf(elem) == SC_FIXED)
+                    c->appendedarray = ArrayHeader(rv, recvarr);
+            }
             // What a receiver that decays the reference loads through.
             c->rettypes.push_back(v.type);
             break;
@@ -4108,6 +4113,24 @@ inline bool TypeCheck::SameIndexValue(Node *a, Node *b) {
 // an earlier element. Only inline fields stay within the indexed element.
 inline bool TypeCheck::BackwardElementRebind(Node *slot, Node *value) {
     auto u = Is<Unary>(value);
+    // A previously bound element of the same grow-only array precedes the
+    // element returned by push. Follow inline fields only up to that binding.
+    auto field = slot;
+    while (auto d = Is<Dot>(field)) {
+        if (d->fieldidx < 0) break;
+        field = d->obj;
+        if (!field->exprtype || IsRefOrSlice(field->exprtype)) break;
+    }
+    auto source = Is<Ident>(field), targetref = Is<Ident>(u && u->op == T_BITAND ? u->child : value);
+    auto prior = targetref && targetref->vdef ? targetref->vdef->elementorigin : nullptr;
+    if (prior && InScope(prior, prior->elementdecl)) {
+        if (auto call = Is<Call>(field); call && call->builtin == B_PUSH && call->appendedarray == prior->elementarray)
+            return true;
+        auto pushed = source && source->vdef ? source->vdef->elementorigin : nullptr;
+        if (pushed && pushed->appended && prior->elementarray == pushed->elementarray &&
+            prior->elementdecl < pushed->elementdecl &&
+            InScope(pushed, pushed->elementdecl)) return true;
+    }
     if (!u || u->op != T_BITAND) return false;
     auto target = AddressedPath(u);
     auto element = [](Node *n) -> Index * {

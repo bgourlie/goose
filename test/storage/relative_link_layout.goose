@@ -84,7 +84,24 @@ fn backward_link() {
     assert(nodes.len == 1);
 }
 
+fn appended_link(i: i64) {
+    var nodes: Node[>..] = [Node {}, Node {}];
+    let previous .= nodes[i];
+    fn append() {
+        let current .= nodes.push(Node {});
+        let alias = &current;
+        let target .= previous;
+        alias.next .= target;
+        nodes.push(Node {}).next .= previous;
+        assert(current.next .== previous && nodes[3].next .== previous);
+    }
+    append();
+    nodes.pop_n(1);
+    assert(nodes.len == 3 && nodes[2].next .== nodes[i]);
+}
+
 fn main() {
+    appended_link(1);
     backward_link();
     same_element(0);
     same_element(1);

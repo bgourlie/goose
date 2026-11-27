@@ -1669,6 +1669,7 @@ NODE(Call)
     FnSpec *spec = nullptr;             // A direct call to one specialization.
     vector<FnSpec *> dispatch;          // Case-function tag dispatch, per variant.
     int dispatcharg = -1;               //   which argument dispatches.
+    const LinkField *appendedarray = nullptr; // Exact grow-only array whose push returned this element.
     int builtin = -1;                   // BuiltinKind, builtins.h (members included).
     Block *fvbody = nullptr;            // Call of a function value: checked body instance.
     Node *defaultinit = nullptr;        // Per-use default construction, visible to every pass.
@@ -2353,6 +2354,11 @@ struct VarDef {
     // A global's position in ast.globals' definitions (TypeCheck::NoteNarrowed).
     int globalindex = 0;
     bool isparam = false;
+    // An immutable reference selected from a grow-only array at declaration.
+    VarDef *elementorigin = nullptr; // The original binding, including through let aliases.
+    const LinkField *elementarray = nullptr;
+    int elementdecl = -1; // Its position among active locals.
+    bool appended = false; // The initializer appended this element.
     RefPlace refplace;       // Pointee or viewed elements known on this control-flow path.
     RefPlace SlicePlace() const { return slotref ? RefPlace {} : refplace; }
     RefPlace PointeePlace(PlacePool &pool) {
