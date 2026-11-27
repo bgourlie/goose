@@ -55,7 +55,26 @@ fn stored_targets() -> Node[..] {
     return nodes;
 }
 
+fn identity(n: Node&) -> Node& { n }
+fn choose(a: Node&, b: Node&, first: bool) -> Node& { if first { a } else { b } }
+fn store(slot: Node&, target: Node&) { slot.next .= target; }
+fn relay(slot: Node&, target: Node&) { store(slot, target); }
+
+fn through_parameters(first: bool) -> Node[..] {
+    var nodes: Node[..] = [Node {}; 4];
+    nodes.pop_n(1);
+    nodes[0].next .= identity(nodes[1]);
+    relay(nodes[1], choose(nodes[0], nodes[2], first));
+    return nodes;
+}
+
 fn main() {
+    for first in [true, false] {
+        let nodes: Node[] = through_parameters(first);
+        assert(nodes[0].next .== nodes[1]);
+        if first { assert(nodes[1].next .== nodes[0]); }
+        else { assert(nodes[1].next .== nodes[2]); }
+    }
     for how in 4 {
         for present in [false, true] {
             let nodes: Node[] = nullable_binding(how, present);

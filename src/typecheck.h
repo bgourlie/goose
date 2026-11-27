@@ -591,7 +591,8 @@ struct TypeCheck {
     void ExpandInitializers(vector<FieldInit> &inits);
     void ExpandArms(vector<MatchArm> &arms);
     bool IsValuelessTail(const Node *n);
-    bool MentionsName(Node *n, string_view name, set<SFunction *> &seen, span<VarDef *> locals = {});
+    bool MentionsName(Node *n, string_view name, set<SFunction *> &seen, span<VarDef *> locals = {},
+                      span<const string_view> callbackparams = {});
     bool EscapingContinue(Node *n);
     bool UsedAfter(VarDef *v);
 
@@ -2088,8 +2089,9 @@ struct TypeCheck {
     Roots NonNullRefRoots(const Roots &roots, TypeExpr *type, bool writable);
     void BindLiveTarget(VarDef *binding, Node *source, const Val &value, size_t result = 0);
     void NoteLiveElement(LinkFlow::Target key, const Roots &roots, const RefPlace &place, TypeExpr *array);
-    LiveTarget StoredArgumentTarget(FnSpec *spec, span<Node *const> args, VarDef *base, const Roots &source);
-    LiveTarget CallerPrefix(LiveTarget target, FnSpec *spec, span<const Val> args, VarDef *owner);
+    LiveTarget ArgumentLiveTarget(FnSpec *spec, span<Node *const> argnodes, VarDef *base, VarDef *owner);
+    LiveTarget CallerLiveTarget(LiveTarget recorded, const PlacePaths &fields, VarDef *owner, FnSpec *spec,
+                                span<const Val> args, span<Node *const> argnodes);
     static VarDef *PrefixOwner(VarDef *prefix) {
         return prefix->type && IsAddressRef(prefix->type) ? prefix->ref.Root() : prefix;
     }
@@ -2779,7 +2781,7 @@ struct TypeCheck {
     void NamedResultCopyWarning(FnSpec *spec);
     Val RetAltVal(FnSpec *spec, const RootAlt &alt, vector<Val> &argvals, TypeExpr *t, Node *at);
     int HeldParam(FnSpec *spec, const Val &v);
-    Val CallResult(Call *c, FnSpec *spec, vector<Val> &argvals);
+    Val CallResult(Call *c, FnSpec *spec, vector<Val> &argvals, span<Node *const> argnodes);
     RefPlace CallerPlace(RefPlace place, FnSpec *spec, span<const Val> args);
     void ReturnThroughCalls(Val &v, int tf, Return *r);
     void CheckReturn(Return *r);

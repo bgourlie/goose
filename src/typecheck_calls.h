@@ -565,7 +565,7 @@ inline Val TypeCheck::ResolveCall(Call *c, vector<SFunction *> &cands, FnSpec *e
     CheckCalleeRelative(c, spec, argvals, argnodes);
     CalleesReturn({ spec }, argsreach);
     WarnDeprecatedCall(*this, c, name, best.sf);
-    return CallResult(c, spec, argvals);
+    return CallResult(c, spec, argvals, argnodes);
 }
 
 // Only the declared result is needed for the last operand of overload
@@ -1458,7 +1458,7 @@ inline Val TypeCheck::TryDispatch(Call *c, vector<SFunction *> &cands, FnSpec *e
     vector<bool> reached;
     vector<LiveTarget> prefixes;
     for (auto spec : c->dispatch) {
-        CallResult(c, spec, argvals);
+        CallResult(c, spec, argvals, argnodes);
         results.resize(lastcallrets.size());
         reached.resize(lastcallrets.size());
         prefixes.resize(lastcallrets.size());
@@ -3938,7 +3938,7 @@ inline RefPlace TypeCheck::CallerPlace(RefPlace place, FnSpec *spec, span<const 
     return place;
 }
 
-inline Val TypeCheck::CallResult(Call *c, FnSpec *spec, vector<Val> &argvals) {
+inline Val TypeCheck::CallResult(Call *c, FnSpec *spec, vector<Val> &argvals, span<Node *const> argnodes) {
     c->rettypes = spec->rets;
     lastcallrets.clear();
     // The record read: the callee's own, or a back edge's the round before's
@@ -4037,12 +4037,10 @@ inline Val TypeCheck::CallResult(Call *c, FnSpec *spec, vector<Val> &argvals) {
         v.elementlinks = ri.elementlinks;
         if (!spec->inprogress) v.intactprefix = ri.intactprefix.value_or(false);
         LiveTarget prefix;
-        if (!spec->inprogress) {
-            if (ri.liveprefix.NullOnly()) prefix = ri.liveprefix;
-            else if (ri.liveprefix.array) {
-                auto roots = NonNullRefRoots(v, v.type, v.writable);
-                if (roots.Exact()) prefix = CallerPrefix(ri.liveprefix, spec, argvals, roots.Root());
-            }
+        if (!spec->inprogress && IsAddressRef(v.type) && (ri.liveprefix.Known() || ri.place.fields.Known())) {
+            auto roots = NonNullRefRoots(v, v.type, v.writable);
+            prefix = CallerLiveTarget(ri.liveprefix, ri.place.fields, roots.Exact() ? roots.Root() : nullptr,
+                                      spec, argvals, argnodes);
         }
         cur.links.SetTarget(ResultTarget(c, i), prefix);
         lastcallrets.push_back(v);
@@ -4567,20 +4565,6 @@ inline void TypeCheck::CheckCalleeRelative(Call *call, FnSpec *spec, vector<Val>
     }
 }
 
-// An inline field within a fixed pointee is live whenever that particular
-// argument still is. Other parameters may share its root but name another
-// element. Consult the caller's flow after later arguments and callee writes.
-inline LiveTarget TypeCheck::StoredArgumentTarget(FnSpec *spec, span<Node *const> args,
-                                                 VarDef *base, const Roots &source) {
-    if (!base || !base->isparam || base->isvar || !IsAddressRef(base->type) ||
-        spec->inprogress || !source.Exact() || ClassOf(base->type->ref->sub) != SC_FIXED) return {};
-    auto it = find(spec->params.begin(), spec->params.end(), base);
-    auto i = (size_t)(it - spec->params.begin());
-    if (it == spec->params.end() || i >= args.size()) return {};
-    auto target = LivePrefixTarget(args[i]);
-    return target.array && PrefixOwner(target.array) == source.Root() ? target : LiveTarget();
-}
-
 // Check the location of a relative store and project its link onto the
 // receiving slot when the store survives the exit being applied.
 inline void TypeCheck::ApplyRelativeStore(Node *call, FnSpec *spec, vector<Val> &args, span<Node *const> argnodes,
@@ -4624,7 +4608,7 @@ inline void TypeCheck::ApplyRelativeStore(Node *call, FnSpec *spec, vector<Val> 
                         target, " to receiving storage ", receiver));
     }
     if (s.result >= 0 && dest.reached && !dest.result && !dest.discarded && !source.None()) {
-        auto prefix = StoredArgumentTarget(spec, argnodes, s.target.base, source);
+        auto prefix = ArgumentLiveTarget(spec, argnodes, s.target.base, source.Exact() ? source.Root() : nullptr);
         StoreElementLink(dest, dest.reached, { s.pointee, dest.appended ? EL_BACKWARD : EL_ANY },
                          call, source, {}, targetfield, prefix);
     }

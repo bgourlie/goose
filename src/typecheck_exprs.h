@@ -71,12 +71,38 @@ inline void TypeCheck::NoteLiveElement(LinkFlow::Target key, const Roots &roots,
     cur.links.SetTarget(key, prefix);
 }
 
-inline LiveTarget TypeCheck::CallerPrefix(LiveTarget target, FnSpec *spec, span<const Val> args, VarDef *owner) {
-    auto prefix = target.array;
-    if (!prefix || !owner) return nullptr;
-    if (prefix->ownerspec != spec) return PrefixOwner(prefix) == owner ? target : LiveTarget();
-    if (!prefix->isparam || !IsAddressRef(prefix->type)) return nullptr;
-    return { LimitedPrefix(owner, ArgumentPlace(spec, prefix, args), prefix->type->ref->sub), target.proof };
+// A fixed argument's inline storage stays inside its element. Identify the
+// argument by its formal, since several formals may share one array root.
+inline LiveTarget TypeCheck::ArgumentLiveTarget(FnSpec *spec, span<Node *const> argnodes,
+                                               VarDef *base, VarDef *owner) {
+    if (!base || !base->isparam || base->isvar || !IsAddressRef(base->type) || !owner ||
+        spec->inprogress || ClassOf(base->type->ref->sub) != SC_FIXED) return {};
+    auto it = find(spec->params.begin(), spec->params.end(), base);
+    auto i = (size_t)(it - spec->params.begin());
+    if (it == spec->params.end() || i >= argnodes.size()) return {};
+    auto target = LivePrefixTarget(argnodes[i]);
+    return target.NullOnly() || (target.array && PrefixOwner(target.array) == owner) ? target : LiveTarget();
+}
+
+// A callee can establish a live target by indexing an array, or identify
+// the argument(s) containing the target. For the latter, consult the caller's
+// proofs only after applying the callee's effects to the argument expressions.
+inline LiveTarget TypeCheck::CallerLiveTarget(LiveTarget recorded, const PlacePaths &fields, VarDef *owner,
+                                             FnSpec *spec, span<const Val> args, span<Node *const> argnodes) {
+    if (recorded.NullOnly()) return recorded;
+    if (!owner) return {};
+    if (auto prefix = recorded.array) {
+        if (prefix->ownerspec != spec) {
+            if (PrefixOwner(prefix) == owner) return recorded;
+        } else if (prefix->isparam && IsAddressRef(prefix->type)) {
+            auto array = LimitedPrefix(owner, ArgumentPlace(spec, prefix, args), prefix->type->ref->sub);
+            if (array) return { array, recorded.proof };
+        }
+    }
+    if (!fields.Known() || argnodes.empty() || cur.links.targets.empty()) return {};
+    auto common = LiveTarget::Null();
+    fields.Each([&](PlacePath p) { common = common.Common(ArgumentLiveTarget(spec, argnodes, p.base, owner)); });
+    return common;
 }
 
 inline TypeCheck::LVal TypeCheck::CheckLValue(Node *n, PathUse use) {
@@ -3506,8 +3532,9 @@ inline void TypeCheck::CheckStmts(Block *b) {
 
 // Whether the code under n names `name`, including through a nested
 // function called directly or passed as a static function value (§7.6).
-// A shadowing declaration conservatively counts as a mention.
-inline bool TypeCheck::MentionsName(Node *n, string_view name, set<SFunction *> &seen, span<VarDef *> locals) {
+// Unresolved local declarations conservatively count as mentions.
+inline bool TypeCheck::MentionsName(Node *n, string_view name, set<SFunction *> &seen, span<VarDef *> locals,
+                                    span<const string_view> callbackparams) {
     if (!n) return false;
     auto nested = [&](string_view used) {
         for (auto &[si, sf] : localfns)
@@ -3516,6 +3543,7 @@ inline bool TypeCheck::MentionsName(Node *n, string_view name, set<SFunction *> 
         return false;
     };
     if (auto id = Is<Ident>(n)) {
+        if (find(callbackparams.begin(), callbackparams.end(), id->name) != callbackparams.end()) return false;
         if (id->name == name) return true;
         if (id->vdef || localfns.empty()) return false;
         // A bare name can pass a nested function as a static argument.
@@ -3531,9 +3559,15 @@ inline bool TypeCheck::MentionsName(Node *n, string_view name, set<SFunction *> 
     if (auto c = Is<Call>(n)) {
         if (auto d = Is<Dot>(c->callee); d && nested(d->name)) return true;
     }
+    if (auto fv = Is<FunVal>(n); fv && !fv->params.empty()) {
+        // A block captures its lexical variables. Its own parameters shadow
+        // them only inside this body. An implicit it depends on call arity.
+        vector<string_view> params(callbackparams.begin(), callbackparams.end());
+        for (const auto &p : fv->params) params.push_back(p.name);
+        return MentionsName(fv->body, name, seen, locals, params);
+    }
     auto hit = false;
-    if (Is<FunVal>(n)) locals = {};  // The body has its own bindings.
-    n->Children([&](Node *ch) { hit = hit || MentionsName(ch, name, seen, locals); });
+    n->Children([&](Node *ch) { hit = hit || MentionsName(ch, name, seen, locals, callbackparams); });
     return hit;
 }
 

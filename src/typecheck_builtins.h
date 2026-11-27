@@ -4837,7 +4837,7 @@ inline void TypeCheck::ApplyCalleeShrinks(Node *at, FnSpec *spec, vector<Val> &a
     // Link stores and guaranteed overwrites describe two separate effects:
     // clear the incoming state first, then add writes surviving at this exit
     // or shrink. Store order in an alternative branch is immaterial.
-    auto projectlinks = [&](const FnRecord::LinkStores *live) {
+    auto projectlinks = [&](const FnRecord::LinkStores *live, span<Node *const> survivingargs) {
         for (size_t i = 0; i < origins.size(); i++) {
             auto &e = storeevents[storesbase + i];
             if (!e.elementlink) continue;
@@ -4846,9 +4846,11 @@ inline void TypeCheck::ApplyCalleeShrinks(Node *at, FnSpec *spec, vector<Val> &a
                 auto it = live->find(origins[i]);
                 if (it == live->end()) continue;
                 state.cleared = it->second.cleared;
-                if (!e.bound) state.liveprefix = CallerPrefix(it->second.liveprefix, spec, argvals, e.container);
+                auto &from = spec->record.classevents[origins[i]];
+                if (!e.bound)
+                    state.liveprefix = CallerLiveTarget(it->second.liveprefix, { from.linktarget.base },
+                                                        e.container, spec, argvals, survivingargs);
                 if (it->second.suffix && e.storefield.base) {
-                    auto &from = spec->record.classevents[origins[i]];
                     auto base = from.storefield.base;
                     const auto &suffix = *it->second.suffix;
                     FnRecord::CallerKill guard { -1, string(suffix.path), true, from.container, base };
@@ -4893,7 +4895,7 @@ inline void TypeCheck::ApplyCalleeShrinks(Node *at, FnSpec *spec, vector<Val> &a
             }
             if (!h.effect.preserves.Committed())
                 projectlinks(h.order && h.order->before != SIZE_MAX && h.order->atremoval
-                                 ? &h.order->atremoval->stores : nullptr);
+                                 ? &h.order->atremoval->stores : nullptr, {});
             GrowOnlyShrinkAt(at, what, h.root, string(h.root->name), h.bound, h.arr,
                              h.viaclass, h.effect);
         } else if (judged == SB_UNBALANCED) {
@@ -5083,7 +5085,7 @@ inline void TypeCheck::ApplyCalleeShrinks(Node *at, FnSpec *spec, vector<Val> &a
         // A possible shrink invalidates incoming targets. The callee has already
         // judged which of its own writes still have live targets at this exit.
         ApplyCalleeWrites(spec, argvals);
-        if (ordered) projectlinks(&exit.stores);
+        if (ordered) projectlinks(&exit.stores, argnodes);
     };
     for (auto &exit : rec->outerexits) {
         auto tf = FrameOfSpec(exit.target);
