@@ -523,7 +523,7 @@ inline Val Dot::Check(TypeCheck &tc, TypeExpr *) {
             assert(bd->rets[0] == 'i');
             v.type = tc.ast.inttypes[IS_I64];
             v.nonneg = true;   // A length or capacity is in [0, 2^48] (§10.4).
-            if (RecvKindOf(t) & BR_SHRINKABLE) v.measuredarray = tc.ArrayHeader(ov, t);
+            measuredarray = RecvKindOf(t) & BR_SHRINKABLE ? tc.ArrayHeader(ov, t) : nullptr;
             return v;
         }
         if (t->kind == TY_ARRAY || t->kind == TY_SLICE)

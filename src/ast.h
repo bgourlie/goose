@@ -1009,21 +1009,21 @@ struct RefPlace {
     bool operator==(const RefPlace &) const = default;
 };
 
-// A proof can depend on named integer initializers remaining zero. Keep
+// A count proof can depend on named integers retaining their initial values. Keep
 // conditions canonical across flow joins and recursive summary rounds.
-struct ZeroCondition {
+struct CountCondition {
     set<VarDef *> names;
-    set<ZeroCondition> *pool = nullptr;
-    bool operator<(const ZeroCondition &other) const { return names < other.names; }
+    set<CountCondition> *pool = nullptr;
+    bool operator<(const CountCondition &other) const { return names < other.names; }
 };
 
 struct CountProof {
-    const ZeroCondition *condition = nullptr; // No proof. An empty condition is unconditional.
+    const CountCondition *condition = nullptr; // No proof. An empty condition is unconditional.
     CountProof(bool known = false) {
-        static const ZeroCondition always;
+        static const CountCondition always;
         if (known) condition = &always;
     }
-    explicit CountProof(const ZeroCondition *c) : condition(c) {}
+    explicit CountProof(const CountCondition *c) : condition(c) {}
     bool Unconditional() const { return condition && condition->names.empty(); }
     bool Available() const;
     bool Committed() const;
@@ -1034,7 +1034,7 @@ struct CountProof {
         if (other.Available() && other.condition->names.size() < condition->names.size()) return other;
         return *this;
     }
-    static CountProof IfZero(set<ZeroCondition> &pool, VarDef *name) {
+    static CountProof IfUnchanged(set<CountCondition> &pool, VarDef *name) {
         return CountProof(&*pool.insert({ { name }, &pool }).first);
     }
     CountProof Both(CountProof other) const {
@@ -1225,7 +1225,6 @@ struct Val : Prov {
     bool emptyarr = false;       // [] with as yet unknown element type.
     CountProof intactprefix;   // Every previously addressable slot is still live (§5.3).
     ArrayExtent extent;
-    const LinkField *measuredarray = nullptr; // Exact array header read by a direct .len or .cap.
     int64_t ival = 0;
     double fval = 0;
     // Where a value holds self-relative links and which targets may survive
@@ -1627,6 +1626,7 @@ NODE(Binary)
 NODE_END
 
 NODE(Dot)
+    const LinkField *measuredarray = nullptr; // Exact array header read by a direct .len or .cap.
     TypeExpr *accessorowner = nullptr; // The concrete struct declaring a bound selector.
     BCE_MARK
     Node *obj;
@@ -3055,7 +3055,7 @@ struct FnRecord {
         bool exact, indirect;
         RefPlace place;  // A field of the owner or of a particular argument.
         Effect effect;
-        VarDef *zeropop = nullptr; // A limited-array pop preserves the prefix if this count stays zero.
+        CountProof preserves; // When the count guarantees retention of the limited array’s prefix.
     };
     vector<StorageWrite> storagewrites;
     // Storage observed by reading a capture. The place and owner are those
@@ -3589,7 +3589,7 @@ struct Ast {
     map<string_view, Namespace> namespaces;
     deque<string> interned;
     PlacePool places;
-    set<ZeroCondition> zeroconditions;
+    set<CountCondition> countconditions;
 
     // Shared instances of the primitive types.
     TypeExpr *inttypes[IS_VARINT + 1];

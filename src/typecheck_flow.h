@@ -2316,7 +2316,10 @@ inline void TypeCheck::CheckBreak(Break *b) {
         exit.type = v.type;
         if (IntConsts(v, exit.litlo, exit.lithi)) {
             exit.litint = true;
+            // Counting on a named operand's sign also counts on every
+            // binding that established it, even across a value-carrying break.
             exit.nonneg = exit.litlo >= 0;
+            exit.nonnegfrom = v.nonnegfrom ? v.nonnegfrom : v.constfrom;
         }
         exit.litfloat = LitFloat(v);
         exit.constfrom = v.constfrom;
@@ -2861,7 +2864,7 @@ inline void TypeCheck::RecordStorageWrite(FnRecord::StorageWrite write, Defer *e
     auto spec = CurRealFrame().spec;
     if (!spec || !write.root || write.root->isglobal || IsTemp(write.root)) return;
     if (write.effect != StorageWrite::Storage) {
-        auto retained = write.zeropop ? CountProof::IfZero(ast.zeroconditions, write.zeropop) : CountProof();
+        auto retained = write.preserves;
         auto maydrop = [&](VarDef *prefix) {
             auto t = prefix->type;
             if (t && IsAddressRef(t)) t = t->ref->sub;
@@ -2890,7 +2893,7 @@ inline void TypeCheck::RecordStorageWrite(FnRecord::StorageWrite write, Defer *e
 }
 
 inline void TypeCheck::NoteStorageWrite(const Roots &storage, TypeExpr *type, const RefPlace &place,
-                                        bool canwrite, StorageWrite::Effect effect, VarDef *zeropop) {
+                                        bool canwrite, StorageWrite::Effect effect, CountProof preserves) {
     // Writes to a limited-array header can invalidate a live-prefix proof
     // across a call even in a program with no deferred writes.
     if (!type || !IsArrayKind(type, A_LIMITED)) effect = StorageWrite::Storage;
@@ -2898,11 +2901,11 @@ inline void TypeCheck::NoteStorageWrite(const Roots &storage, TypeExpr *type, co
     for (auto &a : OwnersAtPlace(storage, place).alts) {
         if (!a.root || a.root->isglobal) continue; // No global can point into the local result.
         if (a.exact || IsClassRoot(a.root)) {
-            RecordStorageWrite({ a.root, type, a.exact, !a.exact && a.from == a.root, place, effect, zeropop });
+            RecordStorageWrite({ a.root, type, a.exact, !a.exact && a.from == a.root, place, effect, preserves });
         } else {
             // A lifetime bound can cover more than one storage owner.
             auto candidates = RootCandidates(type, Depth(a.root), false, true, true);
-            for (auto &c : candidates.alts) RecordStorageWrite({ c.root, type, c.exact, false, {}, effect, zeropop });
+            for (auto &c : candidates.alts) RecordStorageWrite({ c.root, type, c.exact, false, {}, effect, preserves });
         }
     }
 }
@@ -2949,7 +2952,7 @@ inline void TypeCheck::ApplyCalleeWrites(FnSpec *spec, const vector<Val> &args) 
         // A write through a stored reference follows its pointee. The
         // caller's field holding that reference does not locate the write.
         auto place = w.indirect ? RefPlace {} : CallerPlace(w.place, spec, args);
-        NoteStorageWrite(roots, w.type, place, reachable, w.effect, w.zeropop);
+        NoteStorageWrite(roots, w.type, place, reachable, w.effect, w.preserves);
     }
 }
 

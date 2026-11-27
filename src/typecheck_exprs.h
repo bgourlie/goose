@@ -1949,8 +1949,10 @@ inline void TypeCheck::NoteWritableRef(VarDef *d, Node *at) {
 // which may not have.
 inline VarDef *TypeCheck::RelyOnNonneg(const Val &v, Node *at) {
     for (auto d = v.nonnegfrom; d; d = d->nonnegfrom) {
-        if (d->refwrite) return d;
-        if (!d->nonneguse) d->nonneguse = at;
+        for (auto source = d; source; source = source->constfrom) {
+            if (source->refwrite) return source;
+            if (!unifytrial && !source->nonneguse) source->nonneguse = at;
+        }
     }
     return nullptr;
 }
@@ -2136,12 +2138,8 @@ inline TypeExpr *TypeCheck::UnifyNumeric(Node *at, TType op, Val &lv, Val &rv, T
                     if (sv.nonneg) {
                         // A trial relies on nothing: where a writable reference may
                         // make the signed side negative, it finds no common type.
-                        if (unifytrial) {
-                            for (auto d = sv.nonnegfrom; d; d = d->nonnegfrom)
-                                if (d->refwrite) return nullptr;
-                            return ast.inttypes[IS_U64];
-                        }
                         if (auto w = RelyOnNonneg(sv, at)) {
+                            if (unifytrial) return nullptr;
                             auto d = sv.nonnegfrom;
                             Error(at, cat("comparing ", TypeStr(lt), " with ", TypeStr(rt),
                                           " relies on ", d->name, " being non-negative",

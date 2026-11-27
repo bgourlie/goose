@@ -2901,7 +2901,7 @@ struct TypeCheck {
     static Roots OwnersAtPlace(const Roots &storage, const RefPlace &place);
     bool SameStorageWrite(const FnRecord::StorageWrite &a, const FnRecord::StorageWrite &b) {
         return a.root == b.root && a.exact == b.exact && a.indirect == b.indirect &&
-               a.place == b.place && a.effect == b.effect && a.zeropop == b.zeropop && TypeEq(a.type, b.type);
+               a.place == b.place && a.effect == b.effect && a.preserves == b.preserves && TypeEq(a.type, b.type);
     }
     void RecordStorageWrite(FnRecord::StorageWrite write, Defer *executing = nullptr);
     using StorageWrite = FnRecord::StorageWrite;
@@ -2916,7 +2916,7 @@ struct TypeCheck {
     void ApplyCalleeReads(FnSpec *spec, const vector<Val> &args);
     void CheckDeferredReads(const DeferEffects &effects, const FnRecord::InterruptedAssign &assignment);
     void NoteStorageWrite(const Roots &storage, TypeExpr *type, const RefPlace &place, bool canwrite,
-                          StorageWrite::Effect effect = StorageWrite::MayDropSlots, VarDef *zeropop = nullptr);
+                          StorageWrite::Effect effect = StorageWrite::MayDropSlots, CountProof preserves = false);
     void NoteStorageWrite(const Roots &storage, TypeExpr *type, const RefPlace &place = {}) {
         NoteStorageWrite(storage, type, place, reachable);
     }
@@ -2979,13 +2979,13 @@ struct TypeCheck {
     // Builtins (§3.7, §9.3, §11.2) and array members (§3.3, §5.4).
 
     Val CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> &args, Val *precv);
-    enum class SlotRemoval { None, ToCapacity, Possible, All, NamedZeroPop, NamedZeroResize };
+    enum class SlotRemoval { None, ToCapacity, Possible, All, PreservesIfUnchanged, NamedZeroResize };
     const LinkField *ArrayHeader(const RefPlace &place, TypeExpr *array);
     const LinkField *ArrayHeader(const Val &value, TypeExpr *array) {
         return value.lvalue || IsPlainRef(value.type) ? ArrayHeader(value.refplace, array) : nullptr;
     }
     SlotRemoval CountedRemoval(BuiltinKind op, const vector<Node *> &args, const Val &count,
-                               TypeExpr *array, const Val &receiver);
+                               TypeExpr *array, const Val &receiver, CountProof &condition);
     void CheckByteOut(Call *c, Node *out, const string &form);
     // Later passes walk only the arguments that can execute. Overload
     // resolution on a subsequent check still needs the call as written.
@@ -3012,7 +3012,7 @@ struct TypeCheck {
     const string *EmbedShader(Call *c, vector<Node *> &args);
     const string *EmbedFile(Call *c, vector<Node *> &args);
     void CheckGrowShrink(Node *at, const char *op, Node *recv, const Val &rv,
-                         SlotRemoval removal, VarDef *zerocount);
+                         SlotRemoval removal, CountProof condition);
     bool RelyOnCountProof(CountProof proof, Node *at, const char *use);
     bool LiveConversionTargets(const ValueLinks &links, CountProof whole, Node *at);
     void GrowOnlyAssignKnown(Assign *a, const Roots &built, bool whole);

@@ -24,18 +24,50 @@ inline const LinkField *TypeCheck::ArrayHeader(const RefPlace &place, TypeExpr *
 
 // The count and, for resize, the fill have already been checked in evaluation order.
 inline TypeCheck::SlotRemoval TypeCheck::CountedRemoval(BuiltinKind op, const vector<Node *> &args,
-                                                        const Val &count, TypeExpr *array, const Val &receiver) {
+                                                        const Val &count, TypeExpr *array, const Val &receiver,
+                                                        CountProof &condition) {
     assert(op == B_POP_N || op == B_RESIZE);
-    auto countprop = Is<Dot>(args[1]);
-    bool capacity = countprop && countprop->member == B_CAP && op == B_RESIZE && IsArrayKind(array, A_LIMITED);
-    if (countprop && (countprop->member == B_LEN || capacity) &&
-        (SamePath(args[0], countprop->obj, PathInterval::ConsecutiveReads) ||
-         (count.measuredarray && count.measuredarray == ArrayHeader(receiver, array)))) {
-        if (op == B_POP_N) return SlotRemoval::All;
-        if (capacity) return SlotRemoval::ToCapacity;
-        // A fill can change the receiver's length after the count was read.
-        if (args.size() == 2 || ReadOnlyExpr(args[2], EvalRequirement::ReadOnly))
-            return SlotRemoval::None;
+    auto matches = [&](Dot *d) {
+        return SamePath(args[0], d->obj, PathInterval::ConsecutiveReads) ||
+               (d->measuredarray && d->measuredarray == ArrayHeader(receiver, array));
+    };
+    auto unmodified = [&] { return args.size() == 2 || ReadOnlyExpr(args[2], EvalRequirement::ReadOnly); };
+    if (auto d = Is<Dot>(args[1]); d && matches(d)) {
+        if (d->member == B_CAP && op == B_RESIZE && IsArrayKind(array, A_LIMITED)) return SlotRemoval::ToCapacity;
+        if (d->member == B_LEN) {
+            if (op == B_POP_N) return SlotRemoval::All;
+            if (unmodified()) return SlotRemoval::None;
+        }
+    }
+    // On successful resize, adding a nonnegative i64 to .len cannot shrink:
+    // any signed overflow gives a negative count, rejected before the write.
+    if (auto sum = Is<Binary>(args[1]); op == B_RESIZE && sum && sum->op == T_PLUS &&
+        count.type->intstorage == IS_I64) {
+        auto growth = [&](Node *prop, Node *offset) -> CountProof {
+            auto d = Is<Dot>(prop);
+            if (!d || d->member != B_LEN || !matches(d)) return false;
+            if (auto k = Is<IntLit>(offset)) return !k->uns && k->val >= 0;
+            if (auto k = Is<Dot>(offset); k && (k->member == B_LEN || k->member == B_CAP))
+                return ReadOnlyExpr(k->obj, EvalRequirement::ReadOnly);
+            if (auto id = Is<Ident>(offset); id && id->vdef) {
+                auto v = id->vdef;
+                if (v->constantindex >= 0 || (IsIntT(v->type) && IsUnsigned(v->type->intstorage) &&
+                                              IntBits(v->type->intstorage) < 64)) return true;
+                if (!v->nonneg) return false;
+                CountProof proof = true;
+                for (; v; v = v->nonnegfrom)
+                    if (!v->type->cq || v->constfrom)
+                        proof = proof.Both(CountProof::IfUnchanged(ast.countconditions, v));
+                return proof;
+            }
+            return false;
+        };
+        auto proof = growth(sum->left, sum->right).Prefer(growth(sum->right, sum->left));
+        if (proof.Available() && unmodified()) {
+            if (proof.Unconditional()) return SlotRemoval::None;
+            condition = proof;
+            return SlotRemoval::PreservesIfUnchanged;
+        }
     }
     int64_t lo, hi;
     if (!IntConsts(count, lo, hi) || lo != hi || lo < 0) return SlotRemoval::Possible;
@@ -50,7 +82,8 @@ inline TypeCheck::SlotRemoval TypeCheck::CountedRemoval(BuiltinKind op, const ve
     if (binding == ConstantBinding::Immutable) return zero;
     // A helper may not know whether its caller retains a link. Keep the
     // zero count conditional until a shrink or conversion needs it.
-    if (op == B_POP_N && array->arr->akind != A_GROWSHRINK) return SlotRemoval::NamedZeroPop;
+    condition = CountProof::IfUnchanged(ast.countconditions, count.constfrom);
+    if (op == B_POP_N && array->arr->akind != A_GROWSHRINK) return SlotRemoval::PreservesIfUnchanged;
     auto ak = array->arr->akind;
     auto elem = array->arr->sub;
     if (op == B_RESIZE && ((ak == A_GROW && HasRelRefT(elem)) ||
@@ -528,7 +561,7 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
     };
     // resize has two forms (§3.3); a target below zero is caught at runtime.
     auto removal = SlotRemoval::None;
-    VarDef *zerocount = nullptr;
+    CountProof countcondition;
     if (d.flags & BF_SHRINKS) removal = d.kind == B_CLEAR ? SlotRemoval::All : SlotRemoval::Possible;
     if (d.kind == B_RESIZE) {
         auto length = CheckIntAny(args[1]);
@@ -542,8 +575,7 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
                                    "contains self-relative references, is not supported; push "
                                    "the elements, which constructs each in place"));
         }
-        removal = CountedRemoval(d.kind, args, length, recvarr, rv);
-        if (removal == SlotRemoval::NamedZeroResize) zerocount = length.constfrom;
+        removal = CountedRemoval(d.kind, args, length, recvarr, rv, countcondition);
     }
     // index_of recovers the element index a reference stands for (§3.3).
     // The reference must be an element of this very array, which is what
@@ -655,8 +687,7 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
             case 'i': {
                 auto count = CheckIntAny(an);
                 if (d.kind == B_POP_N) {
-                    removal = CountedRemoval(d.kind, args, count, recvarr, rv);
-                    if (removal == SlotRemoval::NamedZeroPop) zerocount = count.constfrom;
+                    removal = CountedRemoval(d.kind, args, count, recvarr, rv, countcondition);
                 }
                 break;
             }
@@ -742,7 +773,7 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
         auto preserves = removal == SlotRemoval::None || removal == SlotRemoval::ToCapacity;
         auto write = preserves ? StorageWrite::Storage : StorageWrite::MayDropSlots;
         NoteStorageWrite(rv, recvarr, rv.refplace, reachable || writesduringargs, write,
-                         removal == SlotRemoval::NamedZeroPop && ak == A_LIMITED ? zerocount : nullptr);
+                         removal == SlotRemoval::PreservesIfUnchanged && ak == A_LIMITED ? countcondition : CountProof());
     }
     // On successful completion every slot of this particular limited array
     // is live, even if an earlier shrink discarded its original prefix proof.
@@ -750,7 +781,7 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
     // Emptying a limited array unpublishes its whole live prefix, just as
     // assigning [] does. Existing slot views keep their storage (§5.3).
     if (ak == A_LIMITED && (removal == SlotRemoval::All || removal == SlotRemoval::NamedZeroResize)) {
-        auto empty = zerocount ? CountProof::IfZero(ast.zeroconditions, zerocount) : CountProof(true);
+        auto empty = removal == SlotRemoval::NamedZeroResize ? countcondition : CountProof(true);
         if (HasRelRefT(elem)) NoteOverwrite(args[0], rv, storeevents.size(), recvarr, &rv.refplace, nullptr, empty);
         if (HoldsPlainRef(elem)) NoteOverwrite(args[0], rv, storeevents.size(), recvarr, nullptr, nullptr, empty);
     }
@@ -759,7 +790,7 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
     // find, which a sequential array has not got.
     auto shrink = (d.flags & BF_SHRINKS) != 0;
     if (ak == A_GROW && shrink) {
-        CheckGrowShrink(c, d.name, args[0], rv, removal, zerocount);
+        CheckGrowShrink(c, d.name, args[0], rv, removal, countcondition);
         if (d.kind != B_CLEAR && ClassOf(elem) != SC_FIXED)
             Error(c, cat(".", d.name, " needs fixed-size elements: ", TypeStr(rv.type),
                          " is sequential (§3.3)"));
@@ -1431,7 +1462,7 @@ inline const string *TypeCheck::EmbedShader(Call *c, vector<Node *> &args) {
 // reference is what shrinks, or it is a struct's tail field, which shrinks
 // the storage the struct lies in, as a reference to the field would.
 inline void TypeCheck::CheckGrowShrink(Node *at, const char *op, Node *recv, const Val &rv,
-                                       SlotRemoval removal, VarDef *zerocount) {
+                                       SlotRemoval removal, CountProof condition) {
     auto at_type = IsPlainRef(rv.type) ? rv.type->ref->sub : rv.type;
     assert(at_type->kind == TY_ARRAY);
     auto roots = rv.AsRoots();
@@ -1439,12 +1470,11 @@ inline void TypeCheck::CheckGrowShrink(Node *at, const char *op, Node *recv, con
         Error(at, cat(op, " through a reference whose array is not known (§5.1)"));
     auto namedresize = removal == SlotRemoval::NamedZeroResize;
     auto empties = removal == SlotRemoval::All || namedresize;
-    auto zero = zerocount ? CountProof::IfZero(ast.zeroconditions, zerocount) : CountProof(false);
-    auto replacesif = namedresize ? zero : CountProof(true);
+    auto replacesif = namedresize ? condition : CountProof(true);
     if (empties && HasRelRefT(at_type))
         NoteOverwrite(recv, roots, storeevents.size(), at_type, &rv.refplace, nullptr, replacesif);
     ShrinkEffect effect { SB_UNBALANCED, empties ? at_type : nullptr };
-    effect.preserves = removal == SlotRemoval::NamedZeroPop ? zero : CountProof(removal == SlotRemoval::None);
+    effect.preserves = removal == SlotRemoval::PreservesIfUnchanged ? condition : CountProof(removal == SlotRemoval::None);
     effect.replacesif = replacesif;
     ShrinkThrough(at, op, ExprStr(recv), roots, at_type, effect);
 }

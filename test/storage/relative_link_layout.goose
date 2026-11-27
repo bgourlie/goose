@@ -100,7 +100,28 @@ fn appended_link(i: i64) {
     assert(nodes.len == 3 && nodes[2].next .== nodes[i]);
 }
 
+const TWO = 1 + 1;
+struct NumberList { focus: i64&<u32>?, values: i64[>..] }
+
+fn extend() {
+    var list = NumberList { values: [11, 22] };
+    list.focus .= list.values[1];
+    let alias .= list;
+    alias.values.resize(list.values.len + 1, 33);
+    const extra: i64 = 2;
+    list.values.resize(extra + alias.values.len, 44);
+    const runtime: i64 = list.values.len;
+    list.values.resize(list.values.len + runtime, 55);
+    let delta = 1;
+    list.values.resize(delta + list.values.len, 66);
+    list.values.resize(list.values.len + list.values.len, 77);
+    let two = block { break TWO; };
+    list.values.resize(list.values.len + two, 88);
+    assert(list.values.len == 24 && list.values[2] == 33 && list.focus .== list.values[1]);
+}
+
 fn main() {
+    extend();
     appended_link(1);
     backward_link();
     same_element(0);
