@@ -5,6 +5,25 @@ fn increment(counter: i64&) { counter++; }
 fn increment_first(view: i64[:]) { view[0]++; }
 fn update(items: Item[]&) { increment(items[0].counter); }
 
+fn prepare_in_inner_scopes() -> i64[] {
+    var out: i64[] = [1];
+    let first .= out[0];
+    { defer { first++; } }
+    for i in 3 {
+        defer increment(first);
+        if i == 0 { continue; }
+        break;
+    }
+    assert(out[0] == 4);
+    return out;
+}
+
+fn prepare_later_result() -> i64, i64[>..] {
+    var out: i64[>..] = [1];
+    let alias .= out;
+    return block { defer { alias.push(2); } 7 }, out;
+}
+
 fn build(counter: i64&) -> Item[] {
     var items: Item[] = [Item { counter: counter }];
     let alias .= items;
@@ -294,6 +313,9 @@ inline fn read_before_store() -> i64 {
 }
 
 fn main() {
+    assert(prepare_in_inner_scopes()[0] == 4);
+    let n, prepared = prepare_later_result();
+    assert(n == 7 && prepared.len == 2 && prepared[1] == 2);
     var counter = 41;
     let items: Item[] = build(counter);
     assert(items[0].counter == 42 && counter == 42);

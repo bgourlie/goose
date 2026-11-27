@@ -2562,12 +2562,15 @@ inline void TypeCheck::ApplyLinkEffects(const LinkEffects &effects) {
     for (auto &[v, fact] : effects.writes.prefixes.arrays) cur.links.prefixes.Establish(v, fact);
 }
 
-inline void TypeCheck::RunExitDefers(int first, span<const FnRecord::InterruptedAssign> interrupted) {
+inline void TypeCheck::RunExitDefers(int first, ScopeExit exit, span<const FnRecord::InterruptedAssign> interrupted) {
     if (!reachable) return;
     for (auto i = (int)scopes.size(); i-- > first;) {
         for (auto it = scopes[i].defers.rbegin(); it != scopes[i].defers.rend(); ++it) {
             RefreshDeferredBody(*it);
-            for (auto &write : it->writes) RecordStorageWrite(write, it->statement);
+            // A nonlocal return can unwind a frame using the same result stack.
+            // On a local exit only channels reached by a return operand are in use.
+            auto channels = exit == ScopeExit::Local ? cur.delivering : SIZE_MAX;
+            for (auto &write : it->writes) RecordStorageWrite(write, it->statement, channels);
             for (auto &a : interrupted) CheckDeferredReads(*it, a);
             for (auto &read : it->reads) RecordStorageRead(read);
             for (auto &[shrink, before] : it->shrinks) {
@@ -2594,19 +2597,19 @@ inline void TypeCheck::RunExitDefers(int first, span<const FnRecord::Interrupted
 // only with its owner. Defers run first. A long-distance return may still
 // discard a caller's owner, so carry it to the next activation for checking.
 inline vector<FnRecord::InterruptedAssign> TypeCheck::CheckExitScopes(
-        int first, Node *at, bool outer, vector<FnRecord::InterruptedAssign> interrupted) {
+        int first, Node *at, ScopeExit exit, vector<FnRecord::InterruptedAssign> interrupted) {
     if (!reachable) return {};
     for (auto r = cur.rebuild; r && first < r->depth; r = r->outer) {
         auto place = StoragePlace(r->receiver, r->type, r->receiver.place);
         FnRecord::InterruptedAssign { r->lval, r->type, r->receiver, place }.AddTo(interrupted, ast.places);
     }
-    RunExitDefers(first, interrupted);
+    RunExitDefers(first, exit, interrupted);
     if (!reachable) return {};
     for (auto &a : interrupted) {
         erase_if(a.owners.alts, [&](const RootAlt &owner) {
             return owner.exact && !IsClassRoot(owner.root) && Depth(owner.root) > first;
         });
-        if (!outer && (!a.owners.None() || a.owners.unknown))
+        if (exit != ScopeExit::OuterReturn && (!a.owners.None() || a.owners.unknown))
             Error(at, cat("this exit can leave ", ExprStr(a.lval), " partially rebuilt (§4.4); "
                           "evaluate the computation that can exit before assigning to ", ExprStr(a.lval),
                           " at ", Where(a.lval->line)));
@@ -2871,7 +2874,7 @@ inline void TypeCheck::ApplyCalleeReads(FnSpec *spec, const vector<Val> &args) {
 
 // Collect a deferred write while checking the body. Publish it when that
 // defer runs, either to an enclosing defer or to the executing function.
-inline void TypeCheck::RecordStorageWrite(FnRecord::StorageWrite write, Defer *executing) {
+inline void TypeCheck::RecordStorageWrite(FnRecord::StorageWrite write, Defer *executing, size_t channels) {
     if (cur.probingtypes) return;
     auto spec = CurRealFrame().spec;
     if (!spec || !write.root || write.root->isglobal || IsTemp(write.root)) return;
@@ -2890,12 +2893,13 @@ inline void TypeCheck::RecordStorageWrite(FnRecord::StorageWrite write, Defer *e
         cur.links.DropPrefixes(maydrop, retained);
     }
     if (!cur.deferring && write.root->ownerspec == spec) {
-        if (!executing || write.effect == StorageWrite::PrefixOnly) return;
+        if (!channels || write.effect == StorageWrite::PrefixOnly) return;
         // A named frame object's fixed prefix is copied before defers run.
         auto t = write.root->type;
         auto region = write.place.regions.Find(write.root);
         if (region && region->copied && t && t->kind == TY_STRUCT && GetStructInst(t)->frameobj) return;
-        deferwrites[executing].insert(write.root);
+        auto &delivered = deferwrites[executing][write.root];
+        delivered = std::max(delivered, channels);
         return;
     }
     auto &writes = cur.deferring ? cur.deferring->writes : spec->record.storagewrites;
@@ -3032,12 +3036,13 @@ inline void TypeCheck::CheckDefers() {
     }
     for (auto sp : withdefers) {
         // A fixed-size result is copied out at the return (CodeGen::DetectNrvo).
-        vector<const VarDef *> named, inresult;
+        vector<const VarDef *> named;
+        map<const VarDef *, size_t> inresult;
         for (size_t j = 0; j < sp->rets.size(); j++)
             if (ClassOf(sp->rets[j]) != SC_FIXED)
                 if (auto v = goose::NamedResultOf(sp->body, sp->sf, sp->rets.size(), j)) {
                     named.push_back(v);
-                    if (ResultPlacement(v, sp->rets[j]) != NamedLayout::Copy) inresult.push_back(v);
+                    if (ResultPlacement(v, sp->rets[j]) != NamedLayout::Copy) inresult.try_emplace(v, j);
                 }
         function<void(Node *)> walk = [&](Node *n) {
             if (!n) return;
@@ -3061,7 +3066,7 @@ inline void TypeCheck::CheckDefers() {
                         return find(named.begin(), named.end(), v) != named.end();
                     };
                     auto why = [&](const VarDef *v) {
-                        if (find(inresult.begin(), inresult.end(), v) == inresult.end())
+                        if (!inresult.count(v))
                             return cat(v->name, ", which ", sp->sf->qname,
                                        " returns by name: a defer body cannot name the returned local (§6.6)");
                         return cat(v->name, ", which ", sp->sf->qname, " returns by name and so "
@@ -3077,8 +3082,8 @@ inline void TypeCheck::CheckDefers() {
                                 Error(d, cat("defer body calls ", k->sf->qname, ", which names ",
                                              why(r.var)));
                     if (auto it = deferwrites.find(d); it != deferwrites.end())
-                        for (auto v : inresult)
-                            if (it->second.count(v))
+                        for (auto [v, channels] : it->second)
+                            if (auto dest = inresult.find(v); dest != inresult.end() && dest->second < channels)
                                 Error(d, cat("defer body writes through an alias to ", why(v)));
                 });
             }

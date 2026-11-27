@@ -2904,7 +2904,8 @@ struct TypeCheck {
     int deferbodies = 0;
     bool hasdefers = false;
     unordered_map<Defer *, vector<VarDef *>> defermentions;
-    unordered_map<Defer *, set<const VarDef *>> deferwrites;
+    // Number of result channels already being delivered when an alias wrote the local.
+    unordered_map<Defer *, map<const VarDef *, size_t>> deferwrites;
     RefPlace OwnedPlace(VarDef *owner, LinkLocation location = {}) {
         RefPlace place { location, { owner } };
         if (hasdefers && owner && owner->type && !IsRefOrSlice(owner->type))
@@ -2918,7 +2919,7 @@ struct TypeCheck {
         return a.root == b.root && a.exact == b.exact && a.indirect == b.indirect &&
                a.place == b.place && a.effect == b.effect && a.preserves == b.preserves && TypeEq(a.type, b.type);
     }
-    void RecordStorageWrite(FnRecord::StorageWrite write, Defer *executing = nullptr);
+    void RecordStorageWrite(FnRecord::StorageWrite write, Defer *executing = nullptr, size_t channels = 0);
     using StorageWrite = FnRecord::StorageWrite;
     using StorageRead = FnRecord::StorageRead;
     bool SameStorageRead(const StorageRead &a, const StorageRead &b) {
@@ -2945,8 +2946,9 @@ struct TypeCheck {
     LinkEffects CurrentLinkEffects();
     void ApplyLinkEffects(const LinkEffects &effects);
     void CheckLinkShrink(const LinkShrink &shrink);
-    void RunExitDefers(int first, span<const FnRecord::InterruptedAssign> interrupted = {});
-    vector<FnRecord::InterruptedAssign> CheckExitScopes(int first, Node *at, bool outer = false,
+    enum class ScopeExit { Local, Return, OuterReturn };
+    void RunExitDefers(int first, ScopeExit exit = ScopeExit::Local, span<const FnRecord::InterruptedAssign> interrupted = {});
+    vector<FnRecord::InterruptedAssign> CheckExitScopes(int first, Node *at, ScopeExit exit = ScopeExit::Local,
             vector<FnRecord::InterruptedAssign> interrupted = {});
     bool InDeferBody();
     void NoteDeferMention(VarDef *v);
@@ -3413,6 +3415,7 @@ struct TypeCheck {
         // A newly specialized callee still checks and records its own body.
         std::optional<int> probingtypes; // Last scope serial before the innermost probe.
         map<int, Construction> resultconstruction;
+        size_t delivering = 0; // Result operands evaluated or being evaluated, in source order.
         Rebuild *rebuild = nullptr;
         // The node being checked and every node it is nested in (PathEntry).
         vector<PathEntry> nodepath;

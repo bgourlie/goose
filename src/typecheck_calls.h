@@ -2088,7 +2088,7 @@ inline void TypeCheck::NoteExit(int tf, Node *at, vector<RetRoot> results,
     if (cur.probingtypes) return;
     auto current = RealFrameIndex();
     interrupted = CheckExitScopes(std::max(frames[tf].scopebase, frames[current].scopebase), at,
-                                  current != tf, std::move(interrupted));
+                                  current == tf ? ScopeExit::Return : ScopeExit::OuterReturn, std::move(interrupted));
     auto e = frames[tf].exits;
     if (!reachable || !e) return;
     // The reference or slice was computed before the defers. Only promise
@@ -3634,6 +3634,7 @@ inline void TypeCheck::CheckSpecBodyOnce(FnSpec *spec, vector<Val> *argvals, Lin
                     Saved links(cur.links.resultlinks, vector<RelativeStore> {});
                     {
                         FlagScope ret(inreturn, true);
+                        Saved delivery(cur.delivering, SIZE_MAX);
                         RetValScope rv(*this, spec->body->tail);
                         DestScope rd(*this, ResultDest(spec));
                         Saved<Node *> mn(multidestnode, spec->body->tail);
@@ -4187,6 +4188,7 @@ inline void TypeCheck::CheckReturn(Return *r) {
     {
         FlagScope rs(inreturn, true);
         if (r->vals.size() == 1) {
+            Saved delivery(cur.delivering, SIZE_MAX);
             auto one = tspec->retsknown && tspec->rets.size() == 1 ? tspec->rets[0] : nullptr;
             Val v;
             {
@@ -4223,6 +4225,7 @@ inline void TypeCheck::CheckReturn(Return *r) {
             }
         } else {
             for (size_t i = 0; i < r->vals.size(); i++) {
+                Saved delivery(cur.delivering, tf == RealFrameIndex() ? std::max(cur.delivering, i + 1) : SIZE_MAX);
                 DestScope rd(*this, ResultDest(tspec, (int)i));
                 auto v = tspec->retsknown ? CheckValue(r->vals[i], expectone(i))
                                           : CheckInferredResult(r->vals[i], tspec);
