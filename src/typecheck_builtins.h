@@ -4214,8 +4214,7 @@ inline bool TypeCheck::SameIndexValue(Node *a, Node *b) {
 // an earlier element. Only inline fields stay within the indexed element.
 inline bool TypeCheck::BackwardElementRebind(Node *slot, Node *value) {
     auto u = Is<Unary>(value);
-    // A previously bound element of the same grow-only array precedes the
-    // element returned by push. Follow inline fields only up to that binding.
+    // Follow inline fields to the bound element that contains the link.
     auto field = slot;
     while (auto d = Is<Dot>(field)) {
         if (d->fieldidx < 0) break;
@@ -4227,10 +4226,11 @@ inline bool TypeCheck::BackwardElementRebind(Node *slot, Node *value) {
     if (prior && InScope(prior, prior->elementdecl)) {
         if (auto call = Is<Call>(field); call && call->builtin == B_PUSH && call->appendedarray == prior->elementarray)
             return true;
-        auto pushed = source && source->vdef ? source->vdef->elementorigin : nullptr;
-        if (pushed && pushed->appended && prior->elementarray == pushed->elementarray &&
-            prior->elementdecl < pushed->elementdecl &&
-            InScope(pushed, pushed->elementdecl)) return true;
+        auto origin = source && source->vdef ? source->vdef->elementorigin : nullptr;
+        if (origin == prior) return true;
+        if (origin && origin->appended && prior->elementarray == origin->elementarray &&
+            prior->elementdecl < origin->elementdecl &&
+            InScope(origin, origin->elementdecl)) return true;
     }
     if (!u || u->op != T_BITAND) return false;
     auto target = AddressedPath(u);
