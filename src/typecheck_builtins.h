@@ -12,9 +12,7 @@ namespace goose {
 // A header is an exact array location, including a field or an immutable
 // reference's pointee. A containing array or a shared lifetime root cannot
 // distinguish two headers. A slice has its own length.
-inline const LinkField *TypeCheck::ArrayHeader(const Val &value, TypeExpr *array) {
-    if (!value.lvalue && !IsPlainRef(value.type)) return nullptr;
-    const auto &place = value.refplace;
+inline const LinkField *TypeCheck::ArrayHeader(const RefPlace &place, TypeExpr *array) {
     auto field = place.fields.Cover();
     if ((!field.base || field.enclosing) && place.bound && !place.boundenclosing)
         field = ast.places.PathOf(*place.bound);
@@ -36,8 +34,7 @@ inline TypeCheck::SlotRemoval TypeCheck::CountedRemoval(BuiltinKind op, const ve
         if (op == B_POP_N) return SlotRemoval::All;
         if (capacity) return SlotRemoval::ToCapacity;
         // A fill can change the receiver's length after the count was read.
-        set<FnSpec *> visiting;
-        if (args.size() == 2 || ReadOnlyExpr(args[2], EvalRequirement::ReadOnly, visiting))
+        if (args.size() == 2 || ReadOnlyExpr(args[2], EvalRequirement::ReadOnly))
             return SlotRemoval::None;
     }
     int64_t lo, hi;
@@ -4107,9 +4104,9 @@ inline bool TypeCheck::SameIndexValue(Node *a, Node *b) {
     return SamePath(a, b, PathInterval::ConsecutiveReads);
 }
 
-// Both ends of a rebind lie in one element if only inline field selections
-// separate them from the same pure subscript. A load of a stored reference
-// follows its pointee out of the element.
+// Both ends of a rebind lie in one element when their inline field paths
+// start at the same sequence and index. Loading a stored reference can
+// lead outside that element.
 inline bool TypeCheck::SameElementRebind(Node *slot, Node *value) {
     auto u = Is<Unary>(value);
     if (!u || u->op != T_BITAND) return false;
@@ -4122,7 +4119,13 @@ inline bool TypeCheck::SameElementRebind(Node *slot, Node *value) {
         return Is<Index>(n);
     };
     auto a = element(slot), b = element(target);
-    return a && b && SamePath(a, b, PathInterval::ConsecutiveReads);
+    if (!a || !b) return false;
+    if (SamePath(a, b, PathInterval::ConsecutiveReads)) return true;
+    if (!a->arrayheader || a->arrayheader != b->arrayheader) return false;
+    if (a->constantindex >= 0 && a->constantindex == b->constantindex) return true;
+    // The right-hand base runs between the two subscript evaluations. It
+    // can return the same array while changing a variable the index reads.
+    return SameIndexValue(a->idx, b->idx) && ReadOnlyExpr(b->obj, EvalRequirement::ReadOnly);
 }
 
 // Consecutive reads can follow the same subscript when evaluating the path

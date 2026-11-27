@@ -2867,7 +2867,11 @@ struct TypeCheck {
     };
     bool InitOrderStoreSafe(Node *n, TypeExpr *dest);
     enum class EvalRequirement { ReadOnly, Reorderable };
-    bool ReadOnlyExpr(Node *n, EvalRequirement requirement, set<FnSpec *> &visiting, FnSpec *callee = nullptr);
+    bool ReadOnlyExpr(Node *n, EvalRequirement requirement) {
+        map<FnSpec *, bool> bodies;
+        return ReadOnlyExpr(n, requirement, bodies, nullptr);
+    }
+    bool ReadOnlyExpr(Node *n, EvalRequirement requirement, map<FnSpec *, bool> &bodies, FnSpec *callee);
     LitDeep CheckInits(StructLit *sl, vector<Field> &fields, vector<TypeExpr *> &ftypes,
                        string_view what, TypeExpr *selft);
     void CheckSelfInit(Node *n, TypeExpr *ft, TypeExpr *selft);
@@ -2976,7 +2980,10 @@ struct TypeCheck {
 
     Val CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> &args, Val *precv);
     enum class SlotRemoval { None, ToCapacity, Possible, All, NamedZeroPop, NamedZeroResize };
-    const LinkField *ArrayHeader(const Val &value, TypeExpr *array);
+    const LinkField *ArrayHeader(const RefPlace &place, TypeExpr *array);
+    const LinkField *ArrayHeader(const Val &value, TypeExpr *array) {
+        return value.lvalue || IsPlainRef(value.type) ? ArrayHeader(value.refplace, array) : nullptr;
+    }
     SlotRemoval CountedRemoval(BuiltinKind op, const vector<Node *> &args, const Val &count,
                                TypeExpr *array, const Val &receiver);
     void CheckByteOut(Call *c, Node *out, const string &form);

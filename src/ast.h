@@ -1765,6 +1765,7 @@ NODE(Index)
     BCE_WALK
     BCE_MARK
     Node *obj, *idx;
+    const LinkField *arrayheader = nullptr; // Exact array selected before evaluating the subscript.
     int64_t constantindex = -1; // Known subscript, saved so rereading a path needn't evaluate it again.
     bool nobc = false;          // Bounds check proven redundant (bce.h); codegen omits it.
     Index(Line l, Node *_obj, Node *_idx) : Node(l, NKind), obj(_obj), idx(_idx) {}

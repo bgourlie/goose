@@ -302,7 +302,10 @@ inline TypeCheck::LVal TypeCheck::CheckLValue(Node *n, PathUse use) {
         // The index checks the captured length. A shrink during evaluation of
         // the subscript invalidates this evidence just like a later shrink.
         NoteSequenceElement(n, ix->obj, lv, lv.place, lv.type);
-        if (use != PathUse::Reread) ix->constantindex = KnownIndex(ix->idx, CheckIntAny(ix->idx));
+        if (use != PathUse::Reread) {
+            ix->arrayheader = lv.type->kind == TY_ARRAY && !lv.intemp ? ArrayHeader(lv.place, lv.type) : nullptr;
+            ix->constantindex = KnownIndex(ix->idx, CheckIntAny(ix->idx));
+        }
         lv.place = IndexedPlace(lv.place, lv.type, ix);
         if (lv.type->cq) lv.writable = false;   // An element of a const value.
         lv.letbound = false;
@@ -3376,10 +3379,10 @@ inline bool TypeCheck::InitOrderStoreSafe(Node *n, TypeExpr *dest) {
 
 // A resize fill must leave storage unchanged on paths reaching the resize.
 // Reordering initializers also requires that no runtime check can abort.
-inline bool TypeCheck::ReadOnlyExpr(Node *n, EvalRequirement requirement, set<FnSpec *> &visiting, FnSpec *callee) {
+inline bool TypeCheck::ReadOnlyExpr(Node *n, EvalRequirement requirement, map<FnSpec *, bool> &bodies, FnSpec *callee) {
     if (!n) return true;
     auto reorder = requirement == EvalRequirement::Reorderable;
-    auto safe = [&](Node *child) { return ReadOnlyExpr(child, requirement, visiting, callee); };
+    auto safe = [&](Node *child) { return ReadOnlyExpr(child, requirement, bodies, callee); };
     auto store = [&](Node *value, TypeExpr *dest) { return !reorder || InitOrderStoreSafe(value, dest); };
     if (Is<IntLit>(n) || Is<FltLit>(n) || Is<BoolLit>(n) || Is<StrLit>(n) ||
         Is<NullLit>(n) || Is<SelfRef>(n) || Is<Ident>(n)) return true;
@@ -3425,15 +3428,18 @@ inline bool TypeCheck::ReadOnlyExpr(Node *n, EvalRequirement requirement, set<Fn
         if (c->builtin == B_DEFAULT) return (c->defaultinit || !reorder) && safe(c->defaultinit);
         if (c->builtin >= 0) return false;
         auto sp = c->spec;
-        if (!sp || !sp->body || sp->inprogress || !visiting.insert(sp).second) return false;
+        if (!sp || !sp->body || sp->inprogress || sp->rets.size() > 1) return false;
         auto args = c->ArgNodes();
-        bool ok = args.size() == sp->argtypes.size() && sp->rets.size() <= 1;
-        for (size_t i = 0; ok && i < args.size(); i++)
-            ok = store(args[i], sp->argtypes[i]) && safe(args[i]);
-        if (!sp->rets.empty()) ok = ok && store(sp->body, sp->rets[0]);
-        ok = ok && ReadOnlyExpr(sp->body, requirement, visiting, sp);
-        visiting.erase(sp);
-        return ok;
+        if (args.size() != sp->argtypes.size()) return false;
+        for (size_t i = 0; i < args.size(); i++)
+            if (!store(args[i], sp->argtypes[i]) || !safe(args[i])) return false;
+        // Arguments belong to this call site. The specialized body is shared.
+        // Until its proof succeeds, a recursive visit sees false.
+        auto [body, first] = bodies.try_emplace(sp, false);
+        if (first)
+            body->second = (sp->rets.empty() || store(sp->body, sp->rets[0])) &&
+                           ReadOnlyExpr(sp->body, requirement, bodies, sp);
+        return body->second;
     }
     if (auto r = Is<Return>(n)) {
         if (!callee || r->target != callee->sf) return false;
@@ -3579,10 +3585,9 @@ inline TypeCheck::LitDeep TypeCheck::CheckInits(StructLit *sl, vector<Field> &fi
         vector<int> reorderable(fields.size(), -1);
         auto safe = [&](int idx) {
             if (reorderable[idx] < 0) {
-                set<FnSpec *> visiting;
                 auto init = sl->InitFor(idx);
                 reorderable[idx] = InitOrderStoreSafe(init, ftypes[idx]) &&
-                                   ReadOnlyExpr(init, EvalRequirement::Reorderable, visiting);
+                                   ReadOnlyExpr(init, EvalRequirement::Reorderable);
             }
             return reorderable[idx] != 0;
         };
