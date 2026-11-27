@@ -577,6 +577,7 @@ inline Val TypeCheck::CheckSlice(SliceExpr *se, LVal lv) {
     }
     // A comparison's view reads no link out of what it compares (§4.5).
     if (lv.intemp && !se->cmpview) NoRelRefTempRead(se->obj, lv.type, elem);
+    NoteSequenceElement(SliceElements { se }, se->obj, lv, lv.place, lv.type);
     if (se->lo) CheckIntAny(se->lo);
     if (se->hi) CheckIntAny(se->hi);
     Val v;

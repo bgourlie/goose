@@ -1481,7 +1481,7 @@ inline Val TypeCheck::CheckIf(IfExpr *x, TypeExpr *expected, bool wantvalue) {
         JoinPathScope js(*this, onjoin ? x->thenb : nullptr);
         tv = CheckBlockVal(x->thenb, expected, wantvalue);
     }
-    ForwardLiveTarget(x, x->thenb);
+    ForwardLiveTarget(x, x->thenb, &tv);
     auto aflow = SaveFlow();
     RestoreFlow(entry);
     Val ev = VoidVal();
@@ -1501,7 +1501,7 @@ inline Val TypeCheck::CheckIf(IfExpr *x, TypeExpr *expected, bool wantvalue) {
     // A nested else-if is checked here rather than through its own Check,
     // so its type is settled here too, void where it never produces.
     if (x->elseb) x->elseb->exprtype = ev.type ? ev.type : ast.voidtype;
-    ForwardLiveTarget(x, x->elseb);
+    ForwardLiveTarget(x, x->elseb, &ev);
     auto bflow = SaveFlow();
     Node *last = nullptr;
     if (!blockpos.empty()) {
@@ -2214,9 +2214,9 @@ inline void TypeCheck::CheckFor(ForLoop *x) {
         if (IsRefOrSlice(bindtype)) {
             BindProv(vd, iterprov);
             vd->refplace = readback ? RefPlace {} : sequence.ElementPlace(ast.places);
-            if (!readback && byref && x->iterkind == IK_ARRAY) {
+            if (!readback && byref && (x->iterkind == IK_ARRAY || x->iterkind == IK_SLICE)) {
                 auto array = IsPlainRef(sequence.type) ? sequence.type->ref->sub : sequence.type;
-                NoteLiveElement(vd, sequence, sequence.refplace, array);
+                NoteSequenceElement(vd, x->iter, sequence, sequence.refplace, array);
             }
         }
         x->vdef = vd;
@@ -3538,6 +3538,8 @@ inline void TypeCheck::CheckAssign(Assign *a) {
         NoLetReassign(a, lv.var, "assign to", "assigned");
         // Slice variables carry their value's provenance (refs use .=).
         if (target->kind == TY_SLICE) {
+            ForgetReboundTarget(lv.var);
+            BindLiveTarget(lv.var, a->rhs, v);
             if (!lv.var->refrootknown || lv.var->ref.Unknown()) BindRefProvenance(lv.var, v);
             else CheckRefRebindRoot(a, lv.var, v);
             NoteRefPlace(lv.var, v);

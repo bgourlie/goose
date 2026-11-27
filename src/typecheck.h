@@ -286,6 +286,12 @@ struct TypeCheck {
         VarFlow state;
         bool operator==(const FlowEntry &) const = default;
     };
+    // The elements in a slice may lie in a live prefix independently of
+    // where the slice descriptor itself is stored.
+    struct SliceElements {
+        variant<Node *, VarDef *> of;
+        auto operator<=>(const SliceElements &) const = default;
+    };
     // A may-write fact is local to a control-flow path. Keep the latest
     // occurrence for assignment (whose RHS may install a fresh link) and
     // the class-store index so a caller can project the surviving writes.
@@ -309,9 +315,8 @@ struct TypeCheck {
             }
         };
         map<Part, Write, std::less<>> live;
-        // Successful index evaluations and reference bindings known
-        // to address a live element of a particular limited array on this path.
-        using Target = variant<Node *, VarDef *, pair<Node *, size_t>>;
+        // Evaluated references, reference bindings and ranges of slice elements.
+        using Target = variant<Node *, VarDef *, pair<Node *, size_t>, SliceElements>;
         map<Target, LiveTarget> targets;
         LiveTarget GetTarget(Target key) const {
             auto it = targets.find(key);
@@ -380,6 +385,7 @@ struct TypeCheck {
         template<typename F> void ForgetBindings(F expired) {
             erase_if(targets, [&](const auto &p) {
                 auto var = get_if<VarDef *>(&p.first);
+                if (auto slice = get_if<SliceElements>(&p.first)) var = get_if<VarDef *>(&slice->of);
                 return var && expired(*var);
             });
             for (auto it = live.begin(); it != live.end();) {
@@ -608,11 +614,14 @@ struct TypeCheck {
             span<VarDef *const> locals; // Already visible at this point in the checked frame.
             small_vector<string_view, 4> introduced; // Variables that can hide nested functions.
             bool hidesvar = false;
+            SFunction *owner = nullptr; // Lexical function containing the call being scanned.
         };
         Bindings At(int frame, size_t varcount) const;
         void Bind(Bindings &scope, string_view name, VarDef *definition = nullptr) const;
         void Bind(Bindings &scope, VarDecl *decl, size_t i) const;
         bool Reads(Node *n, const Bindings &scope, bool callable = false);
+        bool MayPassFunction(Call *call, size_t index, SFunction *owner) const;
+        bool ReadsArgument(Call *call, Node *arg, size_t index, const Bindings &scope);
         bool Statements(span<Node *const> stmts, Node *tail, Bindings scope);
         bool Function(SFunction *sf, Bindings scope);
         bool Nested(string_view name);
@@ -2118,6 +2127,8 @@ struct TypeCheck {
     void ForgetReboundTarget(VarDef *binding);
     void BindLiveTarget(VarDef *binding, Node *source, const Val &value, size_t result = 0);
     void NoteLiveElement(LinkFlow::Target key, const Roots &roots, const RefPlace &place, TypeExpr *array);
+    void NoteSequenceElement(LinkFlow::Target key, Node *sequence, const Roots &roots,
+                             const RefPlace &place, TypeExpr *type);
     LiveTarget ArgumentLiveTarget(FnSpec *spec, span<Node *const> argnodes, VarDef *base, VarDef *owner);
     LiveTarget CallerLiveTarget(LiveTarget recorded, const PlacePaths &fields, VarDef *owner, FnSpec *spec,
                                 span<const Val> args, span<Node *const> argnodes);
@@ -3063,6 +3074,7 @@ struct TypeCheck {
         erase_if(cur.kills, [&](const Kill &k) { return k.container == v; });
         cur.links.DropPrefixes([&](VarDef *prefix) { return prefix == v; });
         cur.links.targets.erase(v);
+        cur.links.targets.erase(SliceElements { v });
         if (!v->type || v->isvar || !IsAddressRef(v->type)) return;
         cur.links.ForgetBindings([&](VarDef *base) { return base == v; });
         erase_if(cur.kills, [&](const Kill &k) { return k.relative && k.base == v; });

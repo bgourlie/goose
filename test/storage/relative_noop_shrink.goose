@@ -40,6 +40,8 @@ fn indexed_receiver(i: i64) -> Node[..] {
     var nodes: Node[..] = [Node {}, Node {}];
     nodes[0].next .= nodes[1];
     var views: (Node[..]&)[2] = [nodes, nodes];
+    (&nodes).resize((&nodes).len);
+    resize(&nodes, nodes.len);
     views[0].resize(views[0].len);
     views[i].resize(views[i].len);
     views[i + 1].resize(views[i + 1].len);

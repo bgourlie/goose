@@ -20,6 +20,9 @@ fn later_bindings() {
     let token: Token = Token.Num { n: 17 };
     match block { nodes.clear(); token } { Num value => expect(value) }
     take(17) { assert(it == 17); };
+    take(17) { expect(it); };
+    take(17) { it.expect(); };
+    take(17) { assert(str(it) == "17"); };
     let value = 17;
     expect(value);
 }

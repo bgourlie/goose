@@ -1912,7 +1912,7 @@ inline bool TypeCheck::HasLimitedSlotView(VarDef *owner, const LinkField &part, 
         if (!shrink || UsedAfter(v)) return true;
         // The operation itself may pass the view to a callee. A registered
         // defer can also read it after its last use in the enclosing block.
-        if (LaterUse { *this, v }.Reads(shrink, {})) return true;
+        if (LaterUse { *this, v }.Reads(shrink, { .owner = frames.back().sf })) return true;
         for (auto &scope : scopes) for (auto &d : scope.defers)
             if (d.env && any_of(d.env->bindings.begin(), d.env->bindings.end(),
                                 [&](const EnvRead &r) { return r.var == v; })) return true;
@@ -4106,6 +4106,8 @@ inline bool TypeCheck::SameElementRebind(Node *slot, Node *value) {
 // survive rebinding, including replacement of a reference in an array slot.
 inline bool TypeCheck::SamePath(Node *a, Node *b, PathInterval interval) {
     if (interval == PathInterval::ConsecutiveReads) {
+        a = AddressedPath(a);
+        b = AddressedPath(b);
         if (auto ix = Is<Index>(a)) {
             auto iy = Is<Index>(b);
             return iy && SamePath(ix->obj, iy->obj, interval) && SameIndexValue(ix->idx, iy->idx);

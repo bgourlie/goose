@@ -33,6 +33,11 @@ inline LiveTarget TypeCheck::LivePrefixTarget(Node *n, size_t result) {
 // The result denotes the same storage as its source on this path. Record it
 // before later operands or exit defers run so their effects reach both.
 inline void TypeCheck::ForwardLiveTarget(Node *result, Node *source, const Val *value) {
+    if (!cur.links.targets.empty()) {
+        auto elements = value && value->type && value->type->kind == TY_SLICE
+                            ? cur.links.GetTarget(SliceElements { source }) : LiveTarget();
+        cur.links.SetTarget(SliceElements { result }, elements);
+    }
     if (source && value && (value->isnull || value->refplace.nullonly))
         cur.links.SetTarget(result, LiveTarget::Null());
     else if (!cur.links.targets.empty())
@@ -56,18 +61,28 @@ inline Roots TypeCheck::NonNullRefRoots(const Roots &roots, TypeExpr *type, bool
 // while a shrink of the array must still invalidate both proofs.
 inline void TypeCheck::ReadBindingTarget(Ident *id) {
     auto v = id->vdef;
-    if (!cur.links.targets.empty() && v->isvar && v->type && IsAddressRef(v->type))
+    if (cur.links.targets.empty()) return;
+    if (SliceVarOf(v)) {
+        auto prefix = v->slotref ? LiveTarget() : cur.links.GetTarget(SliceElements { v });
+        cur.links.SetTarget(SliceElements { id }, prefix);
+    } else if (v->isvar && v->type && IsAddressRef(v->type)) {
         cur.links.SetTarget(id, cur.links.GetTarget(v));
+    }
 }
 
 inline void TypeCheck::ForgetReboundTarget(VarDef *binding) {
-    if (!binding->isvar || binding->isglobal || !IsAddressRef(binding->type)) return;
-    cur.links.targets.erase(binding);
+    if (!binding->isvar || binding->isglobal) return;
+    if (SliceVarOf(binding)) cur.links.targets.erase(SliceElements { binding });
+    else if (IsAddressRef(binding->type)) cur.links.targets.erase(binding);
+    else return;
     if (cur.deferring && reachable && !cur.probingtypes) cur.deferring->reboundtargets.insert(binding);
 }
 
 inline void TypeCheck::BindLiveTarget(VarDef *binding, Node *source, const Val &value, size_t result) {
-    if (binding->isglobal || !IsAddressRef(binding->type)) return;
+    if (binding->isglobal) return;
+    if (binding->type->kind == TY_SLICE && !binding->slotref && !result)
+        cur.links.SetTarget(SliceElements { binding }, cur.links.GetTarget(SliceElements { source }));
+    if (!IsAddressRef(binding->type)) return;
     auto prefix = value.isnull || value.refplace.nullonly ? LiveTarget::Null() : LivePrefixTarget(source, result);
     if (prefix.array) {
         auto roots = NonNullRefRoots(value, binding->type, value.writable);
@@ -83,6 +98,19 @@ inline void TypeCheck::NoteLiveElement(LinkFlow::Target key, const Roots &roots,
         !IsRefOrSlice(array->arr->sub) && HasRelRefT(array->arr->sub))
         prefix = LimitedPrefix(roots.Root(), place, array);
     cur.links.SetTarget(key, prefix);
+}
+
+// A subscript, reslice, or iteration selects from the elements the sequence
+// currently covers. Fixed arrays lie inline, slices retain a captured range,
+// and indexing a limited array checks its current length.
+inline void TypeCheck::NoteSequenceElement(LinkFlow::Target key, Node *sequence, const Roots &roots,
+                                           const RefPlace &place, TypeExpr *type) {
+    if (type->kind == TY_SLICE)
+        cur.links.SetTarget(key, cur.links.GetTarget(SliceElements { sequence }));
+    else if (IsArrayKind(type, A_FIXED) && !IsRefOrSlice(type->arr->sub))
+        cur.links.SetTarget(key, LivePrefixTarget(sequence));
+    else
+        NoteLiveElement(key, roots, place, type);
 }
 
 // A fixed argument's inline storage stays inside its element. Identify the
@@ -204,10 +232,7 @@ inline TypeCheck::LVal TypeCheck::CheckLValue(Node *n, PathUse use) {
         if (lv.intemp) NoRelRefTempRead(ix->obj, lv.type, elem);
         // The index checks the captured length. A shrink during evaluation of
         // the subscript invalidates this evidence just like a later shrink.
-        if (IsArrayKind(lv.type, A_FIXED) && !IsRefOrSlice(elem))
-            ForwardLiveTarget(n, ix->obj);
-        else
-            NoteLiveElement(n, lv, lv.place, lv.type);
+        NoteSequenceElement(n, ix->obj, lv, lv.place, lv.type);
         lv.place = lv.place.Inside(ast.places, IsArrayKind(lv.type, A_GROW));
         if (use != PathUse::Reread) CheckIntAny(ix->idx);
         if (lv.type->cq) lv.writable = false;   // An element of a const value.
@@ -780,8 +805,10 @@ inline bool TypeCheck::LaterUse::RemainingOperands(int varframe) {
         auto i = 0;
         tc.ForOperands(e.node, [&](Node *ch, HoldKind) {
             auto at = i++;
-            if (at > e.pos || (last && at == e.pos))
-                hit = hit || Reads(ch, scope, Is<Call>(e.node));
+            if (at > e.pos || (last && at == e.pos)) {
+                auto c = Is<Call>(e.node);
+                hit = hit || (c ? ReadsArgument(c, ch, at, scope) : Reads(ch, scope));
+            }
             if (auto vd = Is<VarDecl>(e.node); vd && at < (int)vd->names.size())
                 Bind(scope, vd, at);
         });
@@ -3555,6 +3582,7 @@ inline void TypeCheck::CheckStmts(Block *b) {
 inline TypeCheck::LaterUse::Bindings TypeCheck::LaterUse::At(int frame, size_t varcount) const {
     auto first = (size_t)tc.frames[frame].varbase;
     Bindings scope;
+    scope.owner = tc.frames[frame].sf;
     if (varcount > first) scope.locals = span(tc.vars).subspan(first, varcount - first);
     // Checked locals are in declaration order. The last matching one wins.
     for (auto v : scope.locals) if (v->name == var->name) scope.hidesvar = v != var;
@@ -3591,6 +3619,7 @@ inline bool TypeCheck::LaterUse::Nested(string_view name) {
 }
 
 inline bool TypeCheck::LaterUse::Function(SFunction *sf, Bindings scope) {
+    scope.owner = sf;
     for (const auto &p : sf->params) Bind(scope, p.name);
     for (const auto &g : sf->generics) Bind(scope, g.name);
     Saved countAnyRead(exposed, false);
@@ -3622,6 +3651,55 @@ inline bool TypeCheck::LaterUse::Statements(span<Node *const> stmts, Node *tail,
     return Reads(tail, scope);
 }
 
+// A bare function name can bind a remaining generic after the required
+// value parameters (§7.6). Check candidate signatures without evaluating
+// the call: its arguments and even nested declarations can still be ahead
+// of the checker. A function-valued callee can have any signature.
+inline bool TypeCheck::LaterUse::MayPassFunction(Call *call, size_t index, SFunction *owner) const {
+    auto callee = Is<Ident>(call->callee);
+    auto method = Is<Dot>(call->callee);
+    if (!callee && !method) return true;
+    auto name = callee ? callee->name : method->name;
+    auto builtin = LookupBuiltin(GlobalLeaf(name));
+    // A spawn takes a worker name. Other builtin arguments are values.
+    if (builtin && index == 0 && (builtin->kind == B_THREAD_SPAWN || builtin->kind == B_THREAD_SPAWN_CONTAINED))
+        return true;
+    for (auto sf = owner; sf; sf = sf->outer)
+        for (const auto &g : sf->generics) if (g.name == name) return true;
+
+    bool known = builtin != nullptr;
+    auto bound = call->tyargs.size() + (call->trailing ? 1 : 0);
+    auto possible = [&](SFunction *sf) {
+        known = true;
+        return index >= sf->RequiredParams() && sf->generics.size() > bound;
+    };
+    if (callee) {
+        const auto &fns = tc.ast.LookupFunctions(name, callee->ns);
+        if (any_of(fns.begin(), fns.end(), possible)) return true;
+    }
+    // A nested body can see later declarations in its enclosing blocks.
+    // A method can select the namespace of its as-yet unchecked receiver.
+    for (auto sf : tc.ast.functions) {
+        if (sf->name != name) continue;
+        if (!sf->isnested) {
+            if (method && possible(sf)) return true;
+            continue;
+        }
+        for (auto outer = owner; ; outer = outer->outer) {
+            if (sf->outer == outer && possible(sf)) return true;
+            if (!outer) break;
+        }
+    }
+    return !known;
+}
+
+inline bool TypeCheck::LaterUse::ReadsArgument(Call *call, Node *arg, size_t index, const Bindings &scope) {
+    auto id = Is<Ident>(arg);
+    auto nested = id && !id->vdef && id->name != var->name &&
+                  any_of(tc.localfns.begin(), tc.localfns.end(), [&](const auto &f) { return f.second->name == id->name; });
+    return Reads(arg, scope, nested && MayPassFunction(call, index, scope.owner));
+}
+
 inline bool TypeCheck::LaterUse::Reads(Node *n, const Bindings &scope, bool callable) {
     if (!n) return false;
     if (auto id = Is<Ident>(n)) {
@@ -3635,11 +3713,12 @@ inline bool TypeCheck::LaterUse::Reads(Node *n, const Bindings &scope, bool call
     if (auto c = Is<Call>(n)) {
         // Only a callee or a direct argument can denote a static function
         // (§7.6). Reading an implicit it in arithmetic cannot call an outer
-        // function named it; passing it to another call can.
+        // function named it; passing it as a function value can.
+        size_t index = 0;
         if (auto d = Is<Dot>(c->callee)) {
-            if (Nested(d->name) || Reads(d->obj, scope, true)) return true;
+            if (Nested(d->name) || ReadsArgument(c, d->obj, index++, scope)) return true;
         } else if (Reads(c->callee, scope, true)) return true;
-        for (auto arg : c->args) if (Reads(arg, scope, true)) return true;
+        for (auto arg : c->args) if (ReadsArgument(c, arg, index++, scope)) return true;
         return Reads(c->trailing, scope);
     }
     if (auto b = Is<Block>(n)) return Statements(b->stmts, b->tail, scope);
@@ -3762,7 +3841,8 @@ inline bool TypeCheck::UsedAfter(VarDef *v) {
         // A `for` binding is rebound by the loop itself at every iteration.
         if (auto fl = Is<ForLoop>(scopes[i].node); fl && (fl->vdef == v || fl->idxdef == v))
             return true;
-        if (Depth(v) <= i && NamesFrame(FrameOfScope(i), vframe) && scan.Reads(scopes[i].node, {}))
+        auto fi = FrameOfScope(i);
+        if (Depth(v) <= i && NamesFrame(fi, vframe) && scan.Reads(scopes[i].node, { .owner = frames[fi].sf }))
             return true;
     }
     for (auto &bp : blockpos) {
@@ -3772,7 +3852,7 @@ inline bool TypeCheck::UsedAfter(VarDef *v) {
         auto &fr = frames[fi];
         // A function value's body, whole.
         if (fr.isfunval && !fr.isdefault && bp.scopeidx == fr.scopebase &&
-            Depth(v) - 1 < bp.scopeidx && scan.Reads(bp.block, {}))
+            Depth(v) - 1 < bp.scopeidx && scan.Reads(bp.block, { .owner = fr.sf }))
             return true;
         auto &stmts = bp.block->stmts;
         auto exits = &bp == &blockpos.back() && exitat != SIZE_MAX;

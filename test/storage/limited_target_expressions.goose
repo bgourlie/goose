@@ -13,6 +13,18 @@ fn selected(form: i64, i: i64) -> Node[..] {
     return nodes;
 }
 
+fn slice_targets(use_first: bool) -> Node[..] {
+    var nodes: Node[..] = [Node {}; 4];
+    nodes.pop_n(1);
+    nodes[0].next .= nodes[..][1];
+    let tail = nodes[1..];
+    nodes[1].next .= tail[..][1];
+    var view = tail;
+    view = if use_first { nodes[..1] } else { tail[..1] };
+    for &selected in view { nodes[2].next .= selected; }
+    return nodes;
+}
+
 fn field_element() -> Cell[..] {
     var cells: Cell[..] = [Cell {}; 3];
     cells.pop_n(1);
@@ -88,6 +100,12 @@ fn evaluated_target() -> Node[..] {
 }
 
 fn main() {
+    for first in [false, true] {
+        let sliced: Node[] = slice_targets(first);
+        assert(sliced[0].next .== sliced[1] && sliced[1].next .== sliced[2]);
+        if first { assert(sliced[2].next .== sliced[0]); }
+        else { assert(sliced[2].next .== sliced[1]); }
+    }
     let evaluated: Node[] = evaluated_target();
     assert(evaluated[0].next .== evaluated[1]);
     for rebind in [false, true] {
