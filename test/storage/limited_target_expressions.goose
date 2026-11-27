@@ -99,6 +99,19 @@ fn through_parameters(first: bool) -> Node[..] {
     return nodes;
 }
 
+fn from_view(view: Node[:]) -> Node { Node { next: view[0] } }
+fn store_view(slot: Node&, view: Node[:]) { slot.next .= view[0]; }
+fn relay_view(slot: Node&, view: Node[:]) { store_view(slot, view); }
+fn relay_result(view: Node[:]) -> Node { from_view(view) }
+
+fn stored_slice_targets() -> Node[..] {
+    var nodes: Node[..] = [Node {}; 3];
+    nodes.pop_n(1);
+    nodes[1] = relay_result(nodes[..]);
+    relay_view(nodes[0], nodes[1..]);
+    return nodes;
+}
+
 fn mutable_target(rebind: bool) -> Node[..] {
     var nodes: Node[..] = [Node {}; 4];
     nodes.pop_n(1);
@@ -119,6 +132,8 @@ fn evaluated_target() -> Node[..] {
 }
 
 fn main() {
+    let linked: Node[] = stored_slice_targets();
+    assert(linked[1].next .== linked[0] && linked[0].next .== linked[1]);
     let views: Node[] = returned_slices();
     assert(views[0].next .== views[1] && views[1].next .== views[2] && views[2].next .== views[0]);
     assert(views[3].next .== views[1]);

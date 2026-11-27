@@ -776,6 +776,7 @@ struct WriteRegions {
 struct LinkField {
     VarDef *base = nullptr;
     string path;  // Dot-separated fields of this variable or stable parameter's pointee.
+    bool enclosing = false; // The path names storage containing the target, e.g. viewed elements.
     bool Within(VarDef *owner, string_view enclosing) const {
         return base && base == owner && FieldPathWithin(path, enclosing);
     }
@@ -818,6 +819,7 @@ struct PlacePool {
     const string *Path(string path) {
         return path.empty() ? nullptr : &*paths.insert(std::move(path)).first;
     }
+    PlacePath PathOf(const LinkField &field) { return { field.base, Path(field.path), field.enclosing }; }
     PlacePath CommonField(PlacePath a, PlacePath b) {
         if (a.base != b.base) return {};
         a.enclosing |= b.enclosing || a.path != b.path;

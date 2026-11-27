@@ -4613,7 +4613,8 @@ inline void TypeCheck::ApplyRelativeStore(Node *call, FnSpec *spec, vector<Val> 
                         target, " to receiving storage ", receiver));
     }
     if (s.result >= 0 && dest.reached && !dest.result && !dest.discarded && !source.None()) {
-        auto prefix = ArgumentLiveTarget(spec, argnodes, { s.target.base }, source.Exact() ? source.Root() : nullptr);
+        auto prefix = ArgumentLiveTarget(spec, argnodes, ast.places.PathOf(s.target),
+                                         source.Exact() ? source.Root() : nullptr);
         StoreElementLink(dest, dest.reached, { s.pointee, dest.appended ? EL_BACKWARD : EL_ANY },
                          call, source, {}, targetfield, prefix);
     }

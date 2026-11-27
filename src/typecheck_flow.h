@@ -2415,13 +2415,13 @@ inline void TypeCheck::CheckDefer(Defer *d) {
 
 // Only a reference binding or holder the defer reads can give an existing
 // access a new destination. Follow aliases to their holders as well.
-inline vector<EnvRead> TypeCheck::DeferBindings(Defer *d) {
+inline vector<TypeCheck::DeferBinding> TypeCheck::DeferBindings(Defer *d) {
     set<VarDef *> seen;
-    vector<EnvRead> bindings;
+    vector<DeferBinding> bindings;
     auto visit = [&](auto &&self, VarDef *v) -> void {
         if (!v || v->isglobal || !seen.insert(v).second) return;
         if (v->type && HoldsPlainRef(v->type))
-            bindings.push_back(EnvReadOf(v));
+            bindings.push_back({ EnvReadOf(v), cur.links.GetTarget(LinkFlow::BindingKey(v)) });
         self(self, v->heldholder);
         self(self, v->heldslice);
         for (auto &a : v->ref.alts) self(self, a.root);
@@ -2452,6 +2452,9 @@ inline TypeCheck::DeferEffects TypeCheck::CheckDeferredBody(Defer *d) {
         Saved collecting(cur.deferring, &effects);
         Saved<Rebuild *> active(cur.rebuild, nullptr); // Checked now, executed on scope exit.
         cur.links = {};
+        // A defer starts with its captured bindings. Its summary contains
+        // only stores made by the body, even when earlier stores reach it.
+        for (auto &e : saved.locals) cur.links.CopyBindingTarget(e.var, saved.links);
         erase_if(cur.kills, [](const Kill &k) { return k.relative; });
         deferbodies++;
         CheckBlockVal(d->body, nullptr, false);
@@ -2472,9 +2475,11 @@ inline TypeCheck::DeferEffects TypeCheck::CheckDeferredBody(Defer *d) {
 // lifetime roots has stayed the same.
 inline void TypeCheck::RefreshDeferredBody(DeferEffects &effects) {
     auto env = effects.env;
-    if (!env || none_of(env->bindings.begin(), env->bindings.end(), [](const EnvRead &r) {
+    if (!env || none_of(env->bindings.begin(), env->bindings.end(), [&](const DeferBinding &binding) {
+            auto &r = binding.read;
             return r.ref != r.var->ref || r.contents != r.var->contents ||
-                   r.slotref != r.var->slotref || r.refplace != r.var->refplace;
+                   r.slotref != r.var->slotref || r.refplace != r.var->refplace ||
+                   binding.target != cur.links.GetTarget(LinkFlow::BindingKey(r.var));
         })) return;
     auto exit = SaveFlow();
     {
@@ -2491,8 +2496,11 @@ inline void TypeCheck::RefreshDeferredBody(DeferEffects &effects) {
         RestoreFlow(env->entry);
         // The declarations and narrowing are those at registration. The
         // references those declarations hold are the ones on this exit.
-        for (auto &e : exit.locals)
-            if (InScope(e.var, e.index)) e.var->refplace = e.state.refplace;
+        for (auto &e : exit.locals) {
+            if (!InScope(e.var, e.index)) continue;
+            e.var->refplace = e.state.refplace;
+            cur.links.CopyBindingTarget(e.var, exit.links);
+        }
         effects = CheckDeferredBody(env->body);
         // The new binding may itself lead to a holder whose contents can change.
         effects.env = make_shared<DeferEnv>(*env);
@@ -2543,7 +2551,10 @@ inline void TypeCheck::RunExitDefers(int first, span<const FnRecord::Interrupted
                 reachable = false;
                 return;
             }
-            for (auto v : it->reboundtargets) ForgetReboundTarget(v);
+            for (auto v : it->reboundtargets) {
+                ForgetReboundTarget(v);
+                cur.links.CopyBindingTarget(v, it->exit.writes);
+            }
             for (auto &[v, place] : it->bindings) v->refplace = place;
             ApplyLinkEffects(it->exit);
         }

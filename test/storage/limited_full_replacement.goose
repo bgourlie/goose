@@ -42,7 +42,20 @@ fn constant_capacity() -> Node[..] {
     return nodes;
 }
 
+fn fill(calls: i64&) -> Node { calls = calls + 1; return Node {}; }
+fn filled_to_capacity(calls: i64&) -> Node[..] {
+    var nodes: Node[..] = [Node {}; 3];
+    let last .= nodes[2];
+    nodes.pop_n(1);
+    nodes.resize(nodes.cap, fill(calls));
+    nodes[0].next .= last;
+    return nodes;
+}
+
 fn main() {
+    var calls = 0;
+    let filled: Node[] = filled_to_capacity(calls);
+    assert(calls == 1 && filled.len == 3 && filled[0].next .== filled[2]);
     let restored: Node[] = constant_capacity();
     assert(restored.len == 3 && restored[0].next .== restored[2]);
     let full: Node[] = full_again();

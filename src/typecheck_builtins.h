@@ -18,10 +18,11 @@ inline TypeCheck::SlotRemoval TypeCheck::CountedRemoval(BuiltinKind op, const ve
     if (countprop && (countprop->member == B_LEN || capacity) &&
         SamePath(args[0], countprop->obj, PathInterval::ConsecutiveReads)) {
         if (op == B_POP_N) return SlotRemoval::All;
-        // A fill can change the receiver after its length was read.
+        if (capacity) return SlotRemoval::ToCapacity;
+        // A fill can change the receiver's length after the count was read.
         set<FnSpec *> visiting;
         if (args.size() == 2 || ReadOnlyExpr(args[2], EvalRequirement::ReadOnly, visiting))
-            return capacity ? SlotRemoval::ToCapacity : SlotRemoval::None;
+            return SlotRemoval::None;
     }
     int64_t lo, hi;
     if (!IntConsts(count, lo, hi) || lo != hi || lo < 0) return SlotRemoval::Possible;
@@ -1702,14 +1703,18 @@ inline bool TypeCheck::KillPath(Node *n, VarDef *&base, string &path) {
 // owner. Record that identity even if the reference used to reach it is
 // rebound later. For a subobject we still need a stable field path.
 inline RefPlace TypeCheck::StoragePlace(const Roots &roots, TypeExpr *target, RefPlace place) {
+    auto stable = [](const RefPlace &part) {
+        auto base = part.Base();
+        return base && base->type && !base->isvar && base->ref.Exact() &&
+               (IsAddressRef(base->type) || InSliceParameter(part.fields.Cover()));
+    };
     if (place.fields.Multiple())
         return place.MapPaths(ast.places, [&](RefPlace part) {
             // The roots cover every branch. This base can name its owner
-            // directly or through an immutable reference into that owner.
+            // directly or through a stable reference or slice into that owner.
             auto storage = OwnersAtPlace(roots, part);
             auto base = part.Base();
-            if (!storage.Exact() && base && base->type && IsAddressRef(base->type) && !base->isvar &&
-                base->ref.Exact()) {
+            if (!storage.Exact() && stable(part)) {
                 for (auto &a : storage.alts) if (a.root == base->ref.Root() && a.exact)
                     return StoragePlace(base->ref, target, part);
             }
@@ -1725,8 +1730,7 @@ inline RefPlace TypeCheck::StoragePlace(const Roots &roots, TypeExpr *target, Re
                 return whole;
             }
             auto base = place.Base();
-            if (base == owner || (base && base->type && IsAddressRef(base->type) && !base->isvar &&
-                                  base->ref.Exact() && base->ref.Root() == owner))
+            if (base == owner || (stable(place) && base->ref.Root() == owner))
                 return place;
         }
     }
@@ -1889,7 +1893,7 @@ inline bool TypeCheck::HasLimitedSlotView(VarDef *owner, const LinkField &part, 
         if (LaterUse { *this, v }.Reads(shrink, { .owner = frames.back().sf })) return true;
         for (auto &scope : scopes) for (auto &d : scope.defers)
             if (d.env && any_of(d.env->bindings.begin(), d.env->bindings.end(),
-                                [&](const EnvRead &r) { return r.var == v; })) return true;
+                                [&](const DeferBinding &b) { return b.read.var == v; })) return true;
         return false;
     };
     bool viewed = false;
@@ -2547,7 +2551,8 @@ inline LinkField TypeCheck::MapStoreField(FnSpec *spec, const vector<Val> &args,
         // An indexed argument identifies the enclosing array. The callee's
         // remaining path is inside its element.
         if (!part.Base()) return {};
-        field = { part.Base(), part.Enclosing() ? string(part.Path()) : cat(part.Path(), field.path) };
+        field = { part.Base(), part.Enclosing() ? string(part.Path()) : cat(part.Path(), field.path),
+                  part.Enclosing() || field.enclosing };
     }
     return field;
 }
@@ -4857,9 +4862,11 @@ inline void TypeCheck::ApplyCalleeShrinks(Node *at, FnSpec *spec, vector<Val> &a
                 if (it == live->end()) continue;
                 state.cleared = it->second.cleared;
                 auto &from = spec->record.classevents[origins[i]];
-                if (!e.bound)
-                    state.liveprefix = CallerLiveTarget(it->second.liveprefix, { from.linktarget.base },
+                if (!e.bound) {
+                    auto fields = PlacePaths::Of(ast.places.PathOf(from.linktarget), ast.places);
+                    state.liveprefix = CallerLiveTarget(it->second.liveprefix, fields,
                                                         e.container, spec, argvals, survivingargs);
+                }
                 if (it->second.suffix && e.storefield.base) {
                     auto base = from.storefield.base;
                     const auto &suffix = *it->second.suffix;

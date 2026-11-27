@@ -319,6 +319,10 @@ struct TypeCheck {
         // Evaluated references, reference bindings and ranges of slice elements.
         using Target = variant<Node *, VarDef *, pair<Node *, size_t>, SliceElements>;
         map<Target, LiveTarget> targets;
+        static Target BindingKey(VarDef *v) {
+            if (v->type && v->type->kind == TY_SLICE) return SliceElements { v };
+            return v;
+        }
         LiveTarget GetTarget(Target key) const {
             auto it = targets.find(key);
             return it == targets.end() ? LiveTarget() : it->second;
@@ -326,6 +330,10 @@ struct TypeCheck {
         void SetTarget(Target key, LiveTarget prefix) {
             if (prefix.Known()) targets[key] = prefix;
             else targets.erase(key);
+        }
+        void CopyBindingTarget(VarDef *v, const LinkFlow &from) {
+            auto key = BindingKey(v);
+            SetTarget(key, from.GetTarget(key));
         }
         template<typename F> void DropPrefixes(F matches, CountProof retained = false) {
             auto weaken = [&](LiveTarget &target) {
@@ -658,15 +666,18 @@ struct TypeCheck {
         int frame = 0;
         size_t varcount = 0;  // Bindings visible to this node, before entering any operand's block.
     };
-    // A defer still sees the declarations at registration when a mutable
-    // binding it uses acquires another possible target before scope exit.
+    struct DeferBinding {
+        EnvRead read;
+        LiveTarget target;
+    };
+    // A defer sees its original declarations and the bindings at execution.
     struct DeferEnv {
         Defer *body;
         size_t nframes, nscopes, nvars, nfns, ndefers;
         vector<BlockPos> blocks;
         vector<PathEntry> path;
         FlowState entry;
-        vector<EnvRead> bindings;
+        vector<DeferBinding> bindings;
     };
     struct Discovering {
         TypeCheck &tc;
@@ -2869,7 +2880,7 @@ struct TypeCheck {
             place.regions = { { owner } };
         return place;
     }
-    vector<EnvRead> DeferBindings(Defer *d);
+    vector<DeferBinding> DeferBindings(Defer *d);
     static void CalledSpecs(Node *n, vector<FnSpec *> &to);
     static Roots OwnersAtPlace(const Roots &storage, const RefPlace &place);
     bool SameStorageWrite(const FnRecord::StorageWrite &a, const FnRecord::StorageWrite &b) {
@@ -3014,6 +3025,10 @@ struct TypeCheck {
     std::optional<Kill> OverwrittenPart(Node *n, const Roots &loc, TypeExpr *target,
                                         size_t at, const RefPlace *place);
     RefPlace StoragePlace(const Roots &roots, TypeExpr *target, RefPlace place);
+    static bool InSliceParameter(PlacePath path) {
+        auto v = path.base;
+        return path.enclosing && v && v->isparam && !v->isvar && v->type->kind == TY_SLICE;
+    }
     Dest AssignmentDest(const LVal &lv, TypeExpr *target);
     std::optional<Kill> ArgumentKill(Node *arg, const Val &v, TypeExpr *pointee, bool relative, size_t at);
     std::optional<Kill> MapParamPart(FnSpec *spec, const vector<Node *> &args, const vector<Val> &vals,

@@ -73,9 +73,8 @@ inline void TypeCheck::ReadBindingTarget(Ident *id) {
 
 inline void TypeCheck::ForgetReboundTarget(VarDef *binding) {
     if (!binding->isvar || binding->isglobal) return;
-    if (SliceVarOf(binding)) cur.links.targets.erase(SliceElements { binding });
-    else if (IsAddressRef(binding->type)) cur.links.targets.erase(binding);
-    else return;
+    if (!SliceVarOf(binding) && !IsAddressRef(binding->type)) return;
+    cur.links.targets.erase(LinkFlow::BindingKey(binding));
     if (cur.deferring && reachable && !cur.probingtypes) cur.deferring->reboundtargets.insert(binding);
 }
 
@@ -120,8 +119,8 @@ inline LiveTarget TypeCheck::ArgumentLiveTarget(FnSpec *spec, span<Node *const> 
                                                PlacePath path, VarDef *owner) {
     auto base = path.base;
     if (!base || !base->isparam || base->isvar || !owner || spec->inprogress) return {};
-    if (base->type->kind == TY_SLICE) {
-        if (!path.enclosing || IsRefOrSlice(base->type->sub)) return {};
+    if (InSliceParameter(path)) {
+        if (IsRefOrSlice(base->type->sub)) return {};
     } else if (!IsAddressRef(base->type) || ClassOf(base->type->ref->sub) != SC_FIXED) return {};
     auto it = find(spec->params.begin(), spec->params.end(), base);
     auto i = (size_t)(it - spec->params.begin());
@@ -1675,9 +1674,13 @@ inline bool TypeCheck::FitsAt(Val &v, TypeExpr *dt, bool delivered, Node *conver
                 LinkField target;
                 if (recordingrelative && !dt->ref->pool) {
                     pointee = LinkPointee(pointee);
-                    auto &place = v.refplace;
-                    auto part = place.Base() ? FieldPathType(place.Base(), place.Path()) : nullptr;
-                    if (CanContainLinkTarget(part, pointee)) target = { place.Base(), string(place.Path()) };
+                    auto path = v.refplace.fields.Cover();
+                    // A slice formal's enclosing place denotes its viewed
+                    // elements, whose storage can contain the target.
+                    auto part = InSliceParameter(path) ? path.base->type->sub
+                              : path.base ? FieldPathType(path.base, path.Path()) : nullptr;
+                    if (CanContainLinkTarget(part, pointee))
+                        target = { path.base, string(path.Path()), path.enclosing };
                 }
                 auto fits = dt->ref->pool ? want && links.Exact() && have == want
                     : RelativeDestination(links, curdst, pointee, fitnode, recordingrelative, target);
