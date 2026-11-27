@@ -22,6 +22,16 @@ inline VarDef *TypeCheck::LimitedPrefix(VarDef *owner, const RefPlace &place, Ty
     return nullptr;
 }
 
+// A full array restores the same guarantee on a local and on the whole
+// array identified by a reference parameter. The latter survives in the exit summary.
+inline void TypeCheck::RestoreLimitedPrefix(const Roots &roots, const RefPlace &place, TypeExpr *array,
+                                            CountProof proof) {
+    if (!reachable || !roots.Exact()) return;
+    auto prefix = LimitedPrefix(roots.Root(), place, array);
+    if (prefix && prefix->ownerspec == CurRealFrame().spec)
+        prefix->intactprefix = prefix->intactprefix.Prefer(proof);
+}
+
 inline LiveTarget TypeCheck::LivePrefixTarget(Node *n, size_t result, TypeExpr *type) {
     if (!n || cur.links.targets.empty()) return nullptr;
     if (type && type->kind == TY_SLICE) return cur.links.GetTarget(SliceElements { n, result });

@@ -732,11 +732,7 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
     }
     // On successful completion every slot of this particular limited array
     // is live, even if an earlier shrink discarded its original prefix proof.
-    if (reachable && removal == SlotRemoval::ToCapacity && rv.Exact()) {
-        auto owner = rv.Root();
-        if (owner && owner->ownerspec == CurRealFrame().spec && LimitedPrefix(owner, rv.refplace, recvarr) == owner)
-            owner->intactprefix = true;
-    }
+    if (removal == SlotRemoval::ToCapacity) RestoreLimitedPrefix(rv, rv.refplace, recvarr);
     // Emptying a limited array unpublishes its whole live prefix, just as
     // assigning [] does. Existing slot views keep their storage (§5.3).
     if (ak == A_LIMITED && (removal == SlotRemoval::All || removal == SlotRemoval::NamedZeroResize)) {
@@ -5103,6 +5099,10 @@ inline void TypeCheck::ApplyCalleeShrinks(Node *at, FnSpec *spec, vector<Val> &a
         // judged which of its own writes still have live targets at this exit.
         ApplyCalleeWrites(spec, argvals);
         if (ordered) projectlinks(&exit.stores, argnodes);
+        if (!spec->inprogress) for (auto [i, proof] : exit.intactparams) {
+            auto param = spec->params[i];
+            RestoreLimitedPrefix(argvals[i], ArgumentPlace(spec, param, argvals), param->type->ref->sub, proof);
+        }
     };
     for (auto &exit : rec->outerexits) {
         auto tf = FrameOfSpec(exit.target);

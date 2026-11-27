@@ -52,7 +52,33 @@ fn filled_to_capacity(calls: i64&) -> Node[..] {
     return nodes;
 }
 
+fn fresh() -> Node { Node {} }
+fn restore(nodes: Node[..]&) { nodes.resize(nodes.cap, fresh()); }
+fn forward(nodes: Node[..]&, early: bool) {
+    if early {
+        nodes.pop_n(1);
+        restore(nodes);
+        return;
+    }
+    defer { restore(nodes); }
+}
+
+fn restored_by_helper(direct: bool, early: bool) -> Node[..] {
+    var nodes: Node[..] = [Node {}; 3];
+    let last .= nodes[2];
+    nodes.pop_n(1);
+    if direct { restore(nodes); } else { forward(nodes, early); }
+    nodes[0].next .= last;
+    return nodes;
+}
+
 fn main() {
+    for direct in [true, false] {
+        for early in [true, false] {
+            let live: Node[] = restored_by_helper(direct, early);
+            assert(live.len == 3 && live[0].next .== live[2]);
+        }
+    }
     var calls = 0;
     let filled: Node[] = filled_to_capacity(calls);
     assert(calls == 1 && filled.len == 3 && filled[0].next .== filled[2]);

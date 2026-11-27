@@ -2113,7 +2113,13 @@ inline void TypeCheck::NoteExit(int tf, Node *at, vector<RetRoot> results,
     };
     auto target = frames[tf].spec;
     auto exitlinks = [&] {
-        return FnRecord::ExitLinks { CallerKills(frames[current].spec, true), cur.links.ClassStores() };
+        auto spec = frames[current].spec;
+        FnRecord::ExitLinks exit { CallerKills(spec, true), cur.links.ClassStores() };
+        for (size_t i = 0; i < spec->params.size(); i++) {
+            auto p = spec->params[i];
+            if (IsAddressRef(p->type) && p->intactprefix.condition) exit.intactparams.emplace(i, p->intactprefix);
+        }
+        return exit;
     };
     // The caller replays this exit after applying the callee's stores. Each
     // activation unwinds its own defers before passing the result on.

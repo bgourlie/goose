@@ -544,6 +544,7 @@ struct TypeCheck {
         vector<FnRecord::StorageRead> reads;
         vector<FnRecord::StorageWrite> writes;
         vector<pair<VarDef *, RefPlace>> bindings; // Captures rebound on normal completion.
+        vector<pair<VarDef *, CountProof>> intactprefixes; // Re-established by the deferred body.
         set<VarDef *> reboundtargets; // A rebind can change the element even at the same field path.
         vector<pair<LinkShrink, LinkEffects>> shrinks;
         LinkEffects exit;
@@ -2152,6 +2153,7 @@ struct TypeCheck {
         return prefix->type && IsAddressRef(prefix->type) ? prefix->ref.Root() : prefix;
     }
     VarDef *LimitedPrefix(VarDef *owner, const RefPlace &place, TypeExpr *array);
+    void RestoreLimitedPrefix(const Roots &roots, const RefPlace &place, TypeExpr *array, CountProof proof = true);
     LVal LValueBase(Node *n, PathUse use = PathUse::Evaluate);
     LVal ValueBase(Node *n, const Val &v);
     Val CheckSlice(SliceExpr *se, LVal lv);

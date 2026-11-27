@@ -2461,9 +2461,11 @@ inline TypeCheck::DeferEffects TypeCheck::CheckDeferredBody(Defer *d) {
         deferbodies--;
         effects.exit = CurrentLinkEffects();
         effects.completes = reachable;
-        if (reachable) for (auto &e : saved.locals)
+        if (reachable) for (auto &e : saved.locals) {
             if (e.state.refplace != e.var->refplace)
                 effects.bindings.emplace_back(e.var, e.var->refplace);
+            if (e.var->intactprefix.condition) effects.intactprefixes.emplace_back(e.var, e.var->intactprefix);
+        }
     }
     PopScope();
     RestoreFlow(saved);
@@ -2556,6 +2558,7 @@ inline void TypeCheck::RunExitDefers(int first, span<const FnRecord::Interrupted
                 cur.links.CopyBindingTarget(v, it->exit.writes);
             }
             for (auto &[v, place] : it->bindings) v->refplace = place;
+            for (auto &[v, proof] : it->intactprefixes) v->intactprefix = v->intactprefix.Prefer(proof);
             ApplyLinkEffects(it->exit);
         }
     }
@@ -2843,12 +2846,16 @@ inline void TypeCheck::RecordStorageWrite(FnRecord::StorageWrite write, Defer *e
         auto retained = write.zeropop ? CountProof::IfZero(ast.zeroconditions, write.zeropop) : CountProof();
         if (write.root->type && write.root->ownerspec == spec && TopConstEq(write.root->type, write.type))
             write.root->intactprefix = write.root->intactprefix.Both(retained);
-        cur.links.DropPrefixes([&](VarDef *prefix) {
+        auto maydrop = [&](VarDef *prefix) {
             auto t = prefix->type;
             if (t && IsAddressRef(t)) t = t->ref->sub;
             return (!t || TopConstEq(t, write.type)) &&
                    MayAliasRoots(PrefixOwner(prefix), true, write.root, write.exact) != AL_NO;
-        }, retained);
+        };
+        for (auto param : spec->params)
+            if (param->intactprefix.condition && IsAddressRef(param->type) && maydrop(param))
+                param->intactprefix = param->intactprefix.Both(retained);
+        cur.links.DropPrefixes(maydrop, retained);
     }
     if (!cur.deferring && write.root->ownerspec == spec) {
         if (!executing || write.effect == StorageWrite::PrefixOnly) return;
@@ -3416,7 +3423,7 @@ inline Val TypeCheck::CheckAssignedValue(Assign *a, TypeExpr *target, TypeExpr *
         bool whole = owner && owner->type && TopConstEq(owner->type, target);
         auto capacity = LimitedCapacity(target, whole ? owner : nullptr);
         full = v.extent.length == capacity;
-        if (full && whole && owner->ownerspec == CurRealFrame().spec) owner->intactprefix = true;
+        if (full) RestoreLimitedPrefix(built, built.place, target);
     }
     NoteStorageWrite(built, target, built.place, reachable || construction.started,
                      full ? StorageWrite::Storage : StorageWrite::MayDropSlots);

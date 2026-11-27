@@ -3093,9 +3093,18 @@ struct FnRecord {
     struct ExitLinks {
         vector<CallerKill> overwrites;
         LinkStores stores;
+        map<size_t, CountProof> intactparams; // Previously addressable slots are live in this argument at exit.
         void Join(const ExitLinks &other) {
             IntersectKills(overwrites, other.overwrites);
             JoinStores(stores, other.stores);
+            for (auto it = intactparams.begin(); it != intactparams.end();) {
+                auto found = other.intactparams.find(it->first);
+                if (found == other.intactparams.end()) it = intactparams.erase(it);
+                else {
+                    it->second = it->second.Both(found->second);
+                    ++it;
+                }
+            }
         }
         bool operator==(const ExitLinks &) const = default;
     };
