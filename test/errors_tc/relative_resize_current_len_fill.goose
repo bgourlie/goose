@@ -9,5 +9,6 @@ fn fill(nodes: Node[>..]&) -> Node {
 fn main() {
     var nodes: Node[>..] = [Node {}, Node {}];
     nodes[0].next .= nodes[1];
-    nodes.resize(nodes.len, fill(nodes));
+    let other .= nodes;
+    nodes.resize(other.len, fill(nodes));
 }

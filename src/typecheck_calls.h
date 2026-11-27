@@ -3932,10 +3932,6 @@ inline RefPlace TypeCheck::CallerPlace(RefPlace place, FnSpec *spec, span<const 
     }
     if (place.Base() && place.Base()->ownerspec == spec) {
         auto actual = ArgumentPlace(spec, place.Base(), args);
-        if (!actual.fields.Known()) {
-            place.nullonly = actual.nullonly;
-            return place.WithoutPath();
-        }
         if (!actual.boundenclosing) actual.bound = ast.places.Project(actual.bound, place.Path());
         actual.boundenclosing |= actual.bound && place.Enclosing();
         actual.fields = actual.fields.Project(ast.places, place.Path(), place.Enclosing());

@@ -27,7 +27,8 @@ fn full_again() -> Node[..] {
     let last .= nodes[1];
     nodes.pop_n(1);
     nodes.push(Node {});
-    nodes.resize(nodes.cap);
+    let alias .= nodes;
+    nodes.resize(alias.cap);
     nodes[0].next .= last;
     return nodes;
 }

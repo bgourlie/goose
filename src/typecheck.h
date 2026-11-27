@@ -553,6 +553,7 @@ struct TypeCheck {
     };
     struct Scope {
         vector<DeferEffects> defers;
+        vector<VarDef *> outeraliases; // Bindings using an immutable name declared in this scope.
         int kind = SK_PLAIN;
         int serial = 0;              // Unique per scope opened: tells a later one at its index apart.
         int varbase = 0;
@@ -2975,6 +2976,7 @@ struct TypeCheck {
 
     Val CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> &args, Val *precv);
     enum class SlotRemoval { None, ToCapacity, Possible, All, NamedZeroPop, NamedZeroResize };
+    const LinkField *ArrayHeader(const Val &value, TypeExpr *array);
     SlotRemoval CountedRemoval(BuiltinKind op, const vector<Node *> &args, const Val &count,
                                TypeExpr *array, const Val &receiver);
     void CheckByteOut(Call *c, Node *out, const string &form);
@@ -3131,7 +3133,9 @@ struct TypeCheck {
     void HolderFromLit(Val &v, const LitDeep &deep);
     void AddStoreEvent(const StoreEvent &e);
     void NoteRefPlace(VarDef *vd, const Val &v);
-    static RefPlace BindingPlace(const VarDef *vd, RefPlace place);
+    static bool OutlivesBinding(const VarDef *base, const VarDef *vd);
+    RefPlace FlowBinding(VarDef *vd, RefPlace place);
+    RefPlace BindingPlace(VarDef *vd, RefPlace place);
     RefPlace ArgumentPlace(FnSpec *spec, VarDef *param, span<const Val> args);
     LinkField MapStoreField(FnSpec *spec, const vector<Val> &args, VarDef *owner,
                             const Roots &mapped, LinkField field, const LinkField **bound = nullptr);

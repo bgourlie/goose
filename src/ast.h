@@ -955,12 +955,6 @@ struct RefPlace {
         fields = fields.Project(pool, step, false, ".");
         if (!boundenclosing) bound = pool.Project(bound, step, ".");
     }
-    RefPlace WithoutPath() const {
-        auto part = *this;
-        part.fields = {};
-        part.ForgetBound();
-        return part;
-    }
     RefPlace Inside(PlacePool &pool, bool intail = false) const {
         auto part = *this;
         part.fields = fields.Project(pool, {}, true);
@@ -971,14 +965,18 @@ struct RefPlace {
 
     // Keep only the names still meaningful in the frame or scope receiving
     // this place. Region alternatives prove a fact only as a complete set.
-    template<typename F> RefPlace InScope(F keep) const {
+    template<typename F> RefPlace StorageInScope(F keep) const {
         auto part = *this;
         if (location.param && !keep(location.param)) part.location.param = nullptr;
         for (auto r : regions.All()) if (!keep(r.owner)) {
             part.regions = {};
             break;
         }
-        if (fields.AnyBase([&](VarDef *base) { return !keep(base); })) part = part.WithoutPath();
+        if (fields.AnyBase([&](VarDef *base) { return !keep(base); })) part.fields = {};
+        return part;
+    }
+    template<typename F> RefPlace InScope(F keep) const {
+        auto part = StorageInScope(keep);
         if (part.bound && !keep(part.bound->base)) part.ForgetBound();
         return part;
     }
@@ -1227,6 +1225,7 @@ struct Val : Prov {
     bool emptyarr = false;       // [] with as yet unknown element type.
     CountProof intactprefix;   // Every previously addressable slot is still live (§5.3).
     ArrayExtent extent;
+    const LinkField *measuredarray = nullptr; // Exact array header read by a direct .len or .cap.
     int64_t ival = 0;
     double fval = 0;
     // Where a value holds self-relative links and which targets may survive
@@ -2357,13 +2356,17 @@ struct VarDef {
     RefPlace SlicePlace() const { return slotref ? RefPlace {} : refplace; }
     RefPlace PointeePlace(PlacePool &pool) {
         auto place = refplace;
-        if (!isvar && !istemp && !place.fields.Known() && !place.nullonly) place.fields = { this };
-        // Even when an index names only the enclosing array, a let names
-        // its particular pointee for as long as this binding is in scope.
-        if (place.Enclosing() && (!place.bound || place.boundenclosing) &&
-            !isvar && !istemp && !isglobal && IsAddressRef(type) && ref.Exact()) {
+        if (isvar || istemp || place.nullonly) return place;
+        // A let names the particular pointee selected at initialization,
+        // even when its storage path is inexact or has several possible owners.
+        if ((!place.Base() || place.Enclosing()) && (!place.bound || place.boundenclosing) &&
+            !isglobal && IsAddressRef(type)) {
             place.bound = pool.Bound(this);
             place.boundenclosing = false;
+        }
+        if (!place.fields.Known()) {
+            if (place.bound && !place.boundenclosing) place.fields = PlacePaths::Of(pool.PathOf(*place.bound), pool);
+            else place.fields = { this };
         }
         return place;
     }

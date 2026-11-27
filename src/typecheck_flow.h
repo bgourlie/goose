@@ -23,6 +23,10 @@ inline void TypeCheck::PushScope(int kind, Node *node) {
 inline void TypeCheck::PopScope() {
     if (reachable) RunExitDefers((int)scopes.size() - 1);
     auto &s = scopes.back();
+    for (auto vd : s.outeraliases) {
+        auto &place = vd->refplace;
+        if (place.bound && Depth(place.bound->base) == CurDepth()) place.ForgetBound();
+    }
     // A `var x = []` that nothing ever pushed into has no type to give
     // codegen; the scope ending is the last chance to say so.
     for (auto i = s.varbase; i < (int)vars.size(); i++) {
@@ -985,7 +989,7 @@ inline void TypeCheck::RestoreFlow(const FlowState &f) {
         e.var->assigned = e.state.assigned;
         e.var->maybeassigned = e.state.maybeassigned;
         e.var->narrowed = e.state.narrowed;
-        e.var->refplace = e.state.refplace;
+        e.var->refplace = FlowBinding(e.var, e.state.refplace);
     }
     for (auto v : narrowedglobals) v->narrowed = nullptr;
     for (auto [v, narrowed] : f.globals) v->narrowed = narrowed;
@@ -1014,6 +1018,7 @@ inline TypeCheck::FlowState TypeCheck::JoinFlow(const FlowState &a, const FlowSt
                     narrow(aa.narrowed, bb.narrowed),
                     !a.reachable ? bb.refplace : !b.reachable ? aa.refplace
                                                               : aa.refplace.Common(bb.refplace, ast.places, backedge) };
+        e.state.refplace = FlowBinding(e.var, e.state.refplace);
     }
     // A global stays narrowed where every reachable side narrowed it.
     if (!a.reachable) joined.globals = b.globals;
@@ -2506,7 +2511,7 @@ inline void TypeCheck::RefreshDeferredBody(DeferEffects &effects) {
         // references those declarations hold are the ones on this exit.
         for (auto &e : exit.locals) {
             if (!InScope(e.var, e.index)) continue;
-            e.var->refplace = e.state.refplace;
+            e.var->refplace = FlowBinding(e.var, e.state.refplace);
             cur.links.CopyBindingTarget(e.var, exit.links);
         }
         effects = CheckDeferredBody(env->body);
@@ -2564,7 +2569,7 @@ inline void TypeCheck::RunExitDefers(int first, span<const FnRecord::Interrupted
                 ForgetReboundTarget(v);
                 cur.links.CopyBindingTarget(v, it->exit.writes);
             }
-            for (auto &[v, place] : it->bindings) v->refplace = place;
+            for (auto &[v, place] : it->bindings) v->refplace = FlowBinding(v, place);
             ApplyLinkEffects(it->exit);
         }
     }

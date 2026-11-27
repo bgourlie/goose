@@ -27,6 +27,39 @@ fn keep(nodes: Node[>..]&) {
     defer { nodes.pop_n(ALSO_ZERO); }
 }
 
+fn keep_through_alias(nodes: Node[>..]&) {
+    let other .= nodes;
+    nodes.resize(other.len);
+    let alias .= other;
+    resize(alias, nodes.len);
+}
+
+fn forward_array(nodes: Node[>..]&) -> Node[>..]& { nodes }
+
+fn keep_selection(first: bool) {
+    var a: Node[>..] = [Node {}, Node {}];
+    var b: Node[>..] = [Node {}, Node {}, Node {}];
+    a[0].next .= a[1];
+    b[0].next .= b[2];
+    let copy: Node[>..]&;
+    {
+        let selected: Node[>..]& = if first { a } else { b };
+        let other .= selected;
+        copy .= other;
+        selected.resize(copy.len);
+        other.resize(selected.len);
+        defer { copy.resize(selected.len); }
+    }
+    assert(copy.len == (if first { 2 } else { 3 }));
+
+    let views: (Node[>..]&)[2] = [a, b];
+    let from_slot .= views[if first { 0 } else { 1 }];
+    let forwarded .= forward_array(from_slot);
+    from_slot.resize(forwarded.len);
+    assert(a.len == 2 && a[0].next .== a[1]);
+    assert(b.len == 3 && b[0].next .== b[2]);
+}
+
 fn limited_pair() -> Node[..] {
     var nodes: Node[..] = [Node {}, Node {}];
     nodes[0].next .= nodes[1];
@@ -80,7 +113,7 @@ fn through_mutable_ref() {
     var alias .= nodes;
     alias.resize(alias.len);
     assert(nodes.len == 2 && nodes[0].next .== nodes[1]);
-    alias.pop_n(alias.len);
+    alias.pop_n(nodes.len);
     assert(nodes.len == 0);
 }
 
@@ -113,6 +146,9 @@ fn main() {
     assert(unlinked.len == 0);
     var cells = Cells { data: [1, 2] };
     cells.head .= cells.data[1];
+    let cell_alias .= cells;
+    cells.data.resize(cell_alias.data.len, 0);
+    cell_alias.data.resize(cells.data.len);
     cells.data.pop_n(zero_count);
     cells.data.resize(cells.data.len, 0);
     cells.data.resize(cells.data.len, zero());
@@ -126,6 +162,8 @@ fn main() {
     let indexed: Node[] = indexed_receiver(0);
     assert(indexed.len == 2 && indexed[0].next .== indexed[1]);
     through_mutable_ref();
+    keep_selection(true);
+    keep_selection(false);
     let pair: Node[] = limited_pair();
     assert(pair.len == 2 && pair[0].next .== pair[1]);
     let shortened: Node[] = shortened_pair();
@@ -137,6 +175,9 @@ fn main() {
     nodes.pop_n(0);
     nodes.resize(nodes.len);
     keep(nodes);
+    let alias .= nodes;
+    nodes.resize(alias.len);
+    keep_through_alias(nodes);
     assert(nodes.len == 2 && nodes[0].next .== nodes[1]);
     empty(nodes);
     assert(nodes.len == 0);

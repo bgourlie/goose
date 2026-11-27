@@ -9,6 +9,21 @@ namespace goose {
 // ------------------------------------------------------------------
 // Builtins (§3.7, §9.3, §11.2) and array members (§3.3, §5.4).
 
+// A header is an exact array location, including a field or an immutable
+// reference's pointee. A containing array or a shared lifetime root cannot
+// distinguish two headers. A slice has its own length.
+inline const LinkField *TypeCheck::ArrayHeader(const Val &value, TypeExpr *array) {
+    if (!value.lvalue && !IsPlainRef(value.type)) return nullptr;
+    const auto &place = value.refplace;
+    auto field = place.fields.Cover();
+    if ((!field.base || field.enclosing) && place.bound && !place.boundenclosing)
+        field = ast.places.PathOf(*place.bound);
+    if (!field.base || field.enclosing) return nullptr;
+    if (field.base->type && IsRefOrSlice(field.base->type) && field.base->isvar) return nullptr;
+    auto type = FieldPathType(field.base, field.Path());
+    return type && TopConstEq(type, array) ? ast.places.Bound(field.base, string(field.Path())) : nullptr;
+}
+
 // The count and, for resize, the fill have already been checked in evaluation order.
 inline TypeCheck::SlotRemoval TypeCheck::CountedRemoval(BuiltinKind op, const vector<Node *> &args,
                                                         const Val &count, TypeExpr *array, const Val &receiver) {
@@ -16,7 +31,8 @@ inline TypeCheck::SlotRemoval TypeCheck::CountedRemoval(BuiltinKind op, const ve
     auto countprop = Is<Dot>(args[1]);
     bool capacity = countprop && countprop->member == B_CAP && op == B_RESIZE && IsArrayKind(array, A_LIMITED);
     if (countprop && (countprop->member == B_LEN || capacity) &&
-        SamePath(args[0], countprop->obj, PathInterval::ConsecutiveReads)) {
+        (SamePath(args[0], countprop->obj, PathInterval::ConsecutiveReads) ||
+         (count.measuredarray && count.measuredarray == ArrayHeader(receiver, array)))) {
         if (op == B_POP_N) return SlotRemoval::All;
         if (capacity) return SlotRemoval::ToCapacity;
         // A fill can change the receiver's length after the count was read.
@@ -1722,15 +1738,19 @@ inline RefPlace TypeCheck::StoragePlace(const Roots &roots, TypeExpr *target, Re
             auto t = OwnerType(owner);
             if (t && !IsRefOrSlice(t) && TopConstEq(t, target)) {
                 auto whole = OwnedPlace(owner, place.location);
-                if (IsClassRoot(owner)) whole.regions = place.regions;
-                return whole;
+                place.fields = whole.fields;
+                if (!IsClassRoot(owner)) place.regions = whole.regions;
+                return place;
             }
             auto base = place.Base();
             if (base == owner || (stable(place) && base->ref.Root() == owner))
                 return place;
         }
     }
-    return place.WithoutPath();
+    // Normalizing the storage owner does not change the pointee of an
+    // immutable binding carried by this reference.
+    place.fields = {};
+    return place;
 }
 
 inline std::optional<TypeCheck::Kill> TypeCheck::OverwrittenPart(Node *n, const Roots &loc,
@@ -2509,10 +2529,9 @@ inline void TypeCheck::NoteRefPlace(VarDef *vd, const Val &v) {
         if (!place.fields.Known() && owners.Exact()) {
             auto owner = owners.Root();
             if (owner && owner->type && !IsRefOrSlice(owner->type) && !IsTemp(owner)) {
-                place.fields = { owner };
+                place.fields = PlacePaths::Of({ owner, nullptr, true }, ast.places);
                 if (place.regions.All().empty()) place.regions = OwnedPlace(owner).regions;
                 place.nullonly = false;
-                place = place.Inside(ast.places);
             }
         }
     } else return;
@@ -2521,12 +2540,36 @@ inline void TypeCheck::NoteRefPlace(VarDef *vd, const Val &v) {
 
 // An immutable reference or slice parameter names its argument throughout
 // the call. CallerPlace substitutes that argument before the capture leaves
-// the activation. Other shorter-lived bindings cannot name the capture's place.
-inline RefPlace TypeCheck::BindingPlace(const VarDef *vd, RefPlace place) {
-    return place.InScope([&](const VarDef *base) {
-        return !vd->isglobal && (Depth(base) <= Depth(vd) ||
-               (base->isparam && !base->isvar && (IsAddressRef(base->type) || base->type->kind == TY_SLICE)));
-    });
+// the activation.
+inline bool TypeCheck::OutlivesBinding(const VarDef *base, const VarDef *vd) {
+    return !vd->isglobal && (Depth(base) <= Depth(vd) ||
+           (base->isparam && !base->isvar && (IsAddressRef(base->type) || base->type->kind == TY_SLICE)));
+}
+
+// An outer binding can share an inner let's pointee until that instance of
+// the let goes out of scope. A break or continue may restore the assignment
+// from a snapshot after the inner scope has already closed.
+inline RefPlace TypeCheck::FlowBinding(VarDef *vd, RefPlace place) {
+    if (!place.bound) return place;
+    auto base = place.bound->base;
+    if (OutlivesBinding(base, vd)) return place;
+    auto depth = Depth(base);
+    if (!vd->isglobal && vd->ownerspec == base->ownerspec && depth > 0 && depth <= CurDepth()) {
+        auto &scope = scopes[depth - 1];
+        auto first = vars.begin() + scope.varbase;
+        auto last = depth < CurDepth() ? vars.begin() + scopes[depth].varbase : vars.end();
+        if (find(first, last, base) != last) {
+            auto &aliases = scope.outeraliases;
+            if (find(aliases.begin(), aliases.end(), vd) == aliases.end()) aliases.push_back(vd);
+            return place;
+        }
+    }
+    place.ForgetBound();
+    return place;
+}
+
+inline RefPlace TypeCheck::BindingPlace(VarDef *vd, RefPlace place) {
+    return FlowBinding(vd, place.StorageInScope([&](const VarDef *base) { return OutlivesBinding(base, vd); }));
 }
 
 // Map a parameter's pointee (or viewed elements) to the storage passed at
