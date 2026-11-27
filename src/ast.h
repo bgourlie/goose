@@ -1209,6 +1209,7 @@ struct ArrayExtent {
     ArrayExtent Common(ArrayExtent other) const {
         return { length == other.length ? length : -1, capacity == other.capacity ? capacity : -1 };
     }
+    bool operator==(const ArrayExtent &) const = default;
 };
 struct Val : Prov {
     // Storage denoted by an lvalue, or by a reference when non-null. A
@@ -2953,6 +2954,7 @@ struct RetRoot {
     bool byteview = false;
     bool freshview = false;    // Prov::freshview.
     std::optional<CountProof> intactprefix; // Whether all completing limited-array results preserve their slots.
+    std::optional<ArrayExtent> extent; // Absent until a completing return supplies an array.
     ValueLinks elementlinks; // Any return may give an array with Val::elementlinks.
     vector<RelativeStore> resultlinks; // Links written into a result that reaches its caller.
     bool set = false;          // A return supplied provenance, including a known null.
@@ -2967,13 +2969,14 @@ struct RetRoot {
                writable == other.writable && byteview == other.byteview &&
                freshview == other.freshview &&
                heldparam == other.heldparam && elementlinks == other.elementlinks &&
-               intactprefix == other.intactprefix && liveprefix == other.liveprefix &&
+               intactprefix == other.intactprefix && extent == other.extent && liveprefix == other.liveprefix &&
                RelativeStore::SameSet(resultlinks, other.resultlinks, how);
     }
 
     void Include(const RetRoot &other, PlacePool &pool) {
         elementlinks.Include(other.elementlinks);
         if (other.intactprefix) intactprefix = intactprefix.value_or(true).Both(*other.intactprefix);
+        if (other.extent) extent = extent ? extent->Common(*other.extent) : *other.extent;
         for (auto &link : other.resultlinks) link.AddTo(resultlinks);
         if (!other.set) return;
         liveprefix = set ? liveprefix.Common(other.liveprefix) : other.liveprefix;

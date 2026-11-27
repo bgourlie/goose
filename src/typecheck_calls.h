@@ -1451,27 +1451,27 @@ inline Val TypeCheck::TryDispatch(Call *c, vector<SFunction *> &cands, FnSpec *e
     RestoreFlow(exits.reachable ? exits : entry);
     CalleesReturn(c->dispatch, argsreach);
     // The cases are alternatives of one call, like a match's arms: the result
-    // is only as long-lived, exact and writable as every case's result. A case
-    // with neither a recorded root nor links between result elements adds
-    // no provenance to the result.
+    // keeps only the guarantees shared by every case that can return.
     vector<Val> results;
-    vector<bool> reached;
+    bool reached = false;
     vector<LiveTarget> prefixes;
     for (auto spec : c->dispatch) {
         CallResult(c, spec, argvals, argnodes);
+        auto rec = RecordOf(spec);
+        auto reaches = spec->inprogress || !rec || rec->mayreturn;
         results.resize(lastcallrets.size());
-        reached.resize(lastcallrets.size());
         prefixes.resize(lastcallrets.size());
         for (size_t r = 0; r < lastcallrets.size(); r++) {
-            auto reaches = spec->inprogress || lastcallrets[r].elementlinks ||
-                           (r < spec->record.retroots.size() && spec->record.retroots[r].set);
             auto prefix = LivePrefixTarget(c, r, lastcallrets[r].type);
-            if (!reached[r]) prefixes[r] = prefix;
-            else if (reaches) prefixes[r] = prefixes[r].Common(prefix);
-            if (!reached[r]) results[r] = lastcallrets[r];
-            else if (reaches) results[r] = MergeVals(results[r], true, lastcallrets[r], true, c, true);
-            reached[r] = reached[r] || reaches;
+            if (!reached) {
+                prefixes[r] = prefix;
+                results[r] = lastcallrets[r];
+            } else if (reaches) {
+                prefixes[r] = prefixes[r].Common(prefix);
+                results[r] = MergeVals(results[r], true, lastcallrets[r], true, c, true);
+            }
         }
+        reached |= reaches;
     }
     lastcallrets = results;
     for (size_t r = 0; r < prefixes.size(); r++)
@@ -3791,6 +3791,7 @@ inline void TypeCheck::FinishReturn(int tf, const vector<Val> &vals, Node *at) {
         auto &rr = results[i];
         rr.elementlinks = vals[i].elementlinks;
         if (IsArrayKind(rt, A_LIMITED)) rr.intactprefix = vals[i].intactprefix;
+        if (rt->kind == TY_ARRAY) rr.extent = vals[i].extent;
         auto isrs = IsRefOrSlice(rt);
         auto holder = !isrs && HoldsPlainRef(rt);
         if (!isrs && !holder) continue;
@@ -4042,7 +4043,10 @@ inline Val TypeCheck::CallResult(Call *c, FnSpec *spec, vector<Val> &argvals, sp
             v.writable = false;
         }
         v.elementlinks = ri.elementlinks;
-        if (!spec->inprogress) v.intactprefix = ri.intactprefix.value_or(false);
+        if (!spec->inprogress) {
+            v.intactprefix = ri.intactprefix.value_or(false);
+            if (ri.extent) v.extent = *ri.extent;
+        }
         LiveTarget prefix;
         if (!spec->inprogress && (IsAddressRef(v.type) || v.type->kind == TY_SLICE) &&
             (ri.liveprefix.Known() || ri.place.fields.Known())) {

@@ -114,7 +114,10 @@ inline Val Ident::Check(TypeCheck &tc, TypeExpr *) {
             if (!vd->istemp) v.refplace = tc.OwnedPlace(vd);
             v.byteview = vd->contentbyteview;
             v.elementlinks = tc.LiveElementLinks(vd);
-            if (IsArrayKind(t, A_LIMITED)) v.intactprefix = tc.cur.links.prefixes.Guaranteed(vd);
+            if (IsArrayKind(t, A_LIMITED)) {
+                v.intactprefix = tc.cur.links.prefixes.Guaranteed(vd);
+                v.extent.capacity = tc.LimitedCapacity(t, vd);
+            }
             v.writable = !vd->copybind && !(vd->type && vd->type->cq);
             v.reusable = vd->reusable;
             v.nonneg = vd->nonneg;
