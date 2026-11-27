@@ -1046,6 +1046,79 @@ struct CountProof {
     auto operator<=>(const CountProof &) const = default;
 };
 
+// A limited array's previously addressable slots are live if the count
+// proof holds. A later write matters only if its storage can alias the array.
+// Keep the whole-array name when known, otherwise its exact storage owner.
+struct PrefixGuarantee {
+    CountProof proof;
+    map<VarDef *, CountProof> writers; // Later writer -> proof required if it aliases.
+    CountProof Guaranteed() const {
+        auto result = proof;
+        for (auto &[writer, retained] : writers) result = result.Both(retained);
+        return result;
+    }
+    void IncludeWriter(VarDef *writer, CountProof retained) {
+        auto [it, added] = writers.emplace(writer, retained);
+        if (!added) it->second = it->second.Both(retained);
+    }
+    void AfterWrite(VarDef *array, VarDef *writer, CountProof retained) {
+        if (!writer || writer == array) proof = proof.Both(retained);
+        else IncludeWriter(writer, retained);
+    }
+    bool operator==(const PrefixGuarantee &) const = default;
+};
+
+struct LimitedPrefixes {
+    map<VarDef *, PrefixGuarantee> arrays;
+    CountProof Guaranteed(VarDef *v) const {
+        auto it = arrays.find(v);
+        return it == arrays.end() ? CountProof() : it->second.Guaranteed();
+    }
+    void Establish(VarDef *v, PrefixGuarantee fact) {
+        if (!v || !fact.proof.condition) return;
+        // A surviving independent proof also suffices when a write aliases.
+        auto prior = Guaranteed(v);
+        fact.proof = fact.proof.Prefer(prior);
+        for (auto &[writer, retained] : fact.writers) retained = retained.Prefer(prior);
+        erase_if(fact.writers, [](const auto &entry) { return entry.second.Unconditional(); });
+        arrays.insert_or_assign(v, std::move(fact));
+    }
+    template<typename F> void AfterWrite(VarDef *writer, CountProof retained, F maydrop) {
+        for (auto it = arrays.begin(); it != arrays.end();) {
+            if (maydrop(it->first)) it->second.AfterWrite(it->first, writer, retained);
+            if (!it->second.proof.condition) it = arrays.erase(it);
+            else ++it;
+        }
+    }
+    void Join(const LimitedPrefixes &other) {
+        for (auto it = arrays.begin(); it != arrays.end();) {
+            auto found = other.arrays.find(it->first);
+            if (found == other.arrays.end()) it = arrays.erase(it);
+            else {
+                auto &fact = it->second;
+                fact.proof = fact.proof.Both(found->second.proof);
+                for (auto &[writer, retained] : found->second.writers) fact.IncludeWriter(writer, retained);
+                ++it;
+            }
+        }
+    }
+    template<typename F> void Forget(F expired) {
+        for (auto it = arrays.begin(); it != arrays.end();) {
+            auto &fact = it->second;
+            if (!expired(it->first)) {
+                erase_if(fact.writers, [&](const auto &d) {
+                    if (!expired(d.first)) return false;
+                    fact.proof = fact.proof.Both(d.second);
+                    return true;
+                });
+                if (fact.proof.condition) { ++it; continue; }
+            }
+            it = arrays.erase(it);
+        }
+    }
+    bool operator==(const LimitedPrefixes &) const = default;
+};
+
 struct LiveTarget {
     VarDef *array = nullptr;
     CountProof proof;
@@ -2399,7 +2472,6 @@ struct VarDef {
     bool assigned = false;
     bool maybeassigned = false;
     TypeExpr *narrowed = nullptr;  // T? narrowed to T& in the current region.
-    CountProof intactprefix;      // Every previously addressable limited-array slot is currently live.
     int64_t limitedcapacity = -1;   // Set at construction and independent of subsequent length changes.
     bool captured = false;         // Accessed from a nested fn / function value.
     // The first comparison relying on the variable being non-negative
@@ -3093,18 +3165,11 @@ struct FnRecord {
     struct ExitLinks {
         vector<CallerKill> overwrites;
         LinkStores stores;
-        map<size_t, CountProof> intactparams; // Previously addressable slots are live in this argument at exit.
+        LimitedPrefixes prefixes; // Whole arrays in caller-visible storage, including captures.
         void Join(const ExitLinks &other) {
             IntersectKills(overwrites, other.overwrites);
             JoinStores(stores, other.stores);
-            for (auto it = intactparams.begin(); it != intactparams.end();) {
-                auto found = other.intactparams.find(it->first);
-                if (found == other.intactparams.end()) it = intactparams.erase(it);
-                else {
-                    it->second = it->second.Both(found->second);
-                    ++it;
-                }
-            }
+            prefixes.Join(other.prefixes);
         }
         bool operator==(const ExitLinks &) const = default;
     };

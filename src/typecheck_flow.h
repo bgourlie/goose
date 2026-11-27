@@ -951,7 +951,7 @@ inline TypeCheck::FlowState TypeCheck::SaveFlow() {
     FlowState f;
     EachNamedVar((int)frames.size() - 1, CurRealFrame().spec, [&](int i) {
         auto v = vars[i];
-        f.locals.push_back({ i, v, { v->assigned, v->maybeassigned, v->narrowed, v->refplace, v->intactprefix } });
+        f.locals.push_back({ i, v, { v->assigned, v->maybeassigned, v->narrowed, v->refplace } });
     });
     // Globals' narrowing participates too (assignment in branches).
     for (auto v : narrowedglobals)
@@ -975,7 +975,6 @@ inline void TypeCheck::RestoreFlow(const FlowState &f) {
         e.var->maybeassigned = e.state.maybeassigned;
         e.var->narrowed = e.state.narrowed;
         e.var->refplace = e.state.refplace;
-        e.var->intactprefix = e.state.intactprefix;
     }
     for (auto v : narrowedglobals) v->narrowed = nullptr;
     for (auto [v, narrowed] : f.globals) v->narrowed = narrowed;
@@ -1003,9 +1002,7 @@ inline TypeCheck::FlowState TypeCheck::JoinFlow(const FlowState &a, const FlowSt
                     (a.reachable && aa.maybeassigned) || (b.reachable && bb.maybeassigned),
                     narrow(aa.narrowed, bb.narrowed),
                     !a.reachable ? bb.refplace : !b.reachable ? aa.refplace
-                                                              : aa.refplace.Common(bb.refplace, ast.places, backedge),
-                    !a.reachable ? bb.intactprefix : !b.reachable ? aa.intactprefix
-                                                                  : aa.intactprefix.Both(bb.intactprefix) };
+                                                              : aa.refplace.Common(bb.refplace, ast.places, backedge) };
     }
     // A global stays narrowed where every reachable side narrowed it.
     if (!a.reachable) joined.globals = b.globals;
@@ -1026,6 +1023,7 @@ inline TypeCheck::FlowState TypeCheck::JoinFlow(const FlowState &a, const FlowSt
     auto expired = [&](VarDef *v) { return Depth(v) > CurDepth(); };
     erase_if(joined.links.live, [&](const auto &entry) { return expired(entry.first.owner); });
     joined.links.DropPrefixes(expired);
+    joined.links.prefixes.Forget(expired);
     joined.links.ForgetBindings(expired);
     erase_if(joined.kills, [&](const Kill &k) {
         return expired(k.container) || (k.relative && expired(k.base));
@@ -2438,10 +2436,8 @@ inline vector<TypeCheck::DeferBinding> TypeCheck::DeferBindings(Defer *d) {
 
 inline TypeCheck::DeferEffects TypeCheck::CheckDeferredBody(Defer *d) {
     auto saved = SaveFlow();
-    for (auto &e : saved.locals) {
+    for (auto &e : saved.locals)
         if (e.var->isvar) e.var->narrowed = nullptr;
-        e.var->intactprefix = false; // Its count can change between registration and execution.
-    }
     for (auto g : ast.globals)
         for (auto v : g->defs)
             if (v->isvar) v->narrowed = nullptr;
@@ -2464,7 +2460,6 @@ inline TypeCheck::DeferEffects TypeCheck::CheckDeferredBody(Defer *d) {
         if (reachable) for (auto &e : saved.locals) {
             if (e.state.refplace != e.var->refplace)
                 effects.bindings.emplace_back(e.var, e.var->refplace);
-            if (e.var->intactprefix.condition) effects.intactprefixes.emplace_back(e.var, e.var->intactprefix);
         }
     }
     PopScope();
@@ -2533,6 +2528,7 @@ inline void TypeCheck::ApplyLinkEffects(const LinkEffects &effects) {
         storeevents.back().boundfield = part.boundfield;
         cur.links.Add(storeevents.back(), storeevents.size() - 1, write);
     }
+    for (auto &[v, fact] : effects.writes.prefixes.arrays) cur.links.prefixes.Establish(v, fact);
 }
 
 inline void TypeCheck::RunExitDefers(int first, span<const FnRecord::InterruptedAssign> interrupted) {
@@ -2558,7 +2554,6 @@ inline void TypeCheck::RunExitDefers(int first, span<const FnRecord::Interrupted
                 cur.links.CopyBindingTarget(v, it->exit.writes);
             }
             for (auto &[v, place] : it->bindings) v->refplace = place;
-            for (auto &[v, proof] : it->intactprefixes) v->intactprefix = v->intactprefix.Prefer(proof);
             ApplyLinkEffects(it->exit);
         }
     }
@@ -2844,17 +2839,16 @@ inline void TypeCheck::RecordStorageWrite(FnRecord::StorageWrite write, Defer *e
     if (!spec || !write.root || write.root->isglobal || IsTemp(write.root)) return;
     if (write.effect != StorageWrite::Storage) {
         auto retained = write.zeropop ? CountProof::IfZero(ast.zeroconditions, write.zeropop) : CountProof();
-        if (write.root->type && write.root->ownerspec == spec && TopConstEq(write.root->type, write.type))
-            write.root->intactprefix = write.root->intactprefix.Both(retained);
         auto maydrop = [&](VarDef *prefix) {
             auto t = prefix->type;
             if (t && IsAddressRef(t)) t = t->ref->sub;
             return (!t || TopConstEq(t, write.type)) &&
                    MayAliasRoots(PrefixOwner(prefix), true, write.root, write.exact) != AL_NO;
         };
-        for (auto param : spec->params)
-            if (param->intactprefix.condition && IsAddressRef(param->type) && maydrop(param))
-                param->intactprefix = param->intactprefix.Both(retained);
+        VarDef *writer = nullptr;
+        if (write.exact && !write.indirect)
+            writer = PrefixWriter(write.root, LimitedPrefix(write.root, write.place, write.type));
+        cur.links.prefixes.AfterWrite(writer, retained, maydrop);
         cur.links.DropPrefixes(maydrop, retained);
     }
     if (!cur.deferring && write.root->ownerspec == spec) {
@@ -3112,7 +3106,7 @@ inline void TypeCheck::CheckVarDecl(VarDecl *vd, bool global) {
         if (t->kind == TY_FN)
             Error(vd, "function values are compile-time only and cannot be stored (§7.6)");
         d->type = t;
-        d->intactprefix = !global && IsArrayKind(t, A_LIMITED) && v ? v->intactprefix : CountProof();
+        if (!global && IsArrayKind(t, A_LIMITED) && v) cur.links.prefixes.Establish(d, { v->intactprefix });
         if (IsArrayKind(t, A_LIMITED) && v) d->limitedcapacity = v->extent.capacity;
         if (v && !global) BindLiveTarget(d, init, *v, result);
         if (global) CheckVarExtent(d, vd);

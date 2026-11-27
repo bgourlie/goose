@@ -277,7 +277,6 @@ struct TypeCheck {
         bool maybeassigned = false;
         TypeExpr *narrowed = nullptr;
         RefPlace refplace;
-        CountProof intactprefix;
         bool operator==(const VarFlow &) const = default;
     };
     struct FlowEntry {
@@ -316,6 +315,7 @@ struct TypeCheck {
             }
         };
         map<Part, Write, std::less<>> live;
+        LimitedPrefixes prefixes;
         // Evaluated references, reference bindings and ranges of slice elements.
         using Target = variant<Node *, VarDef *, pair<Node *, size_t>, SliceElements>;
         map<Target, LiveTarget> targets;
@@ -410,6 +410,7 @@ struct TypeCheck {
             }
         }
         void Join(const LinkFlow &other) {
+            prefixes.Join(other.prefixes);
             for (auto it = targets.begin(); it != targets.end();) {
                 auto p = other.targets.find(it->first);
                 auto common = p == other.targets.end() ? LiveTarget() : it->second.Common(p->second);
@@ -431,8 +432,8 @@ struct TypeCheck {
         }
         // Loop convergence depends on the possible writes, not event numbers.
         bool operator==(const LinkFlow &o) const {
-            return targets == o.targets && fills == o.fills && RelativeStore::SameSet(resultlinks, o.resultlinks) &&
-                   live.size() == o.live.size() &&
+            return prefixes == o.prefixes && targets == o.targets && fills == o.fills &&
+                   RelativeStore::SameSet(resultlinks, o.resultlinks) && live.size() == o.live.size() &&
                    equal(live.begin(), live.end(), o.live.begin(),
                          [](const auto &a, const auto &b) {
                              return a.first == b.first && a.second == b.second;
@@ -544,7 +545,6 @@ struct TypeCheck {
         vector<FnRecord::StorageRead> reads;
         vector<FnRecord::StorageWrite> writes;
         vector<pair<VarDef *, RefPlace>> bindings; // Captures rebound on normal completion.
-        vector<pair<VarDef *, CountProof>> intactprefixes; // Re-established by the deferred body.
         set<VarDef *> reboundtargets; // A rebind can change the element even at the same field path.
         vector<pair<LinkShrink, LinkEffects>> shrinks;
         LinkEffects exit;
@@ -2153,7 +2153,10 @@ struct TypeCheck {
         return prefix->type && IsAddressRef(prefix->type) ? prefix->ref.Root() : prefix;
     }
     VarDef *LimitedPrefix(VarDef *owner, const RefPlace &place, TypeExpr *array);
-    void RestoreLimitedPrefix(const Roots &roots, const RefPlace &place, TypeExpr *array, CountProof proof = true);
+    VarDef *PrefixWriter(VarDef *owner, VarDef *array);
+    Roots PrefixWriterOwners(VarDef *owner, FnSpec *spec, span<const Val> args);
+    void RestoreLimitedPrefix(const Roots &roots, const RefPlace &place, TypeExpr *array);
+    void ApplyCalleePrefixes(const LimitedPrefixes &prefixes, FnSpec *spec, span<const Val> args);
     LVal LValueBase(Node *n, PathUse use = PathUse::Evaluate);
     LVal ValueBase(Node *n, const Val &v);
     Val CheckSlice(SliceExpr *se, LVal lv);
@@ -3096,6 +3099,7 @@ struct TypeCheck {
         cur.links.live.erase(first, last);
         erase_if(cur.kills, [&](const Kill &k) { return k.container == v; });
         cur.links.DropPrefixes([&](VarDef *prefix) { return prefix == v; });
+        cur.links.prefixes.Forget([&](VarDef *prefix) { return prefix == v; });
         cur.links.targets.erase(v);
         cur.links.targets.erase(SliceElements { v });
         if (!v->type || v->isvar || !IsAddressRef(v->type)) return;
@@ -3103,7 +3107,8 @@ struct TypeCheck {
         erase_if(cur.kills, [&](const Kill &k) { return k.relative && k.base == v; });
     }
     void ForgetLocal(VarDef *v) {
-        if (cur.links.live.empty() && cur.links.targets.empty() && cur.links.fills.empty() && cur.kills.empty()) return;
+        if (cur.links.live.empty() && cur.links.targets.empty() && cur.links.prefixes.arrays.empty() &&
+            cur.links.fills.empty() && cur.kills.empty()) return;
         ForgetOwner(v);
         for (auto c : v->components) if (c) ForgetLocal(c);
     }

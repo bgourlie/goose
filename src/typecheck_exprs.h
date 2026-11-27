@@ -22,14 +22,73 @@ inline VarDef *TypeCheck::LimitedPrefix(VarDef *owner, const RefPlace &place, Ty
     return nullptr;
 }
 
-// A full array restores the same guarantee on a local and on the whole
-// array identified by a reference parameter. The latter survives in the exit summary.
-inline void TypeCheck::RestoreLimitedPrefix(const Roots &roots, const RefPlace &place, TypeExpr *array,
-                                            CountProof proof) {
+// A shrink through a field can still be distinguished from writes to other
+// owners. Only a whole-array reference formal stands for its pointee by name.
+inline VarDef *TypeCheck::PrefixWriter(VarDef *owner, VarDef *array) {
+    if (array) return array;
+    if (IsClassRoot(owner) || (owner && owner->type && !IsRefOrSlice(owner->type) && !IsTemp(owner))) return owner;
+    return nullptr;
+}
+
+// A class can represent several formals. A write known only by its owner
+// must be disjoint for every argument that can supply that class.
+inline Roots TypeCheck::PrefixWriterOwners(VarDef *owner, FnSpec *spec, span<const Val> args) {
+    Roots owners;
+    bool mapped = false;
+    for (size_t i = 0; i < spec->roots.size(); ++i) {
+        auto include = [&](VarDef *base, bool view) {
+            if (!ProjectedFrom(owner, base)) return;
+            mapped = true;
+            if (i >= args.size()) { owners.unknown = true; return; }
+            auto actual = ProjectClass(owner, base, view ? args[i].held.AsRoots() : ClassArgRoots(spec->argtypes[i], args[i]));
+            if (actual.None()) owners.unknown = true;
+            owners.Add(actual);
+        };
+        auto cls = spec->roots[i].cls;
+        if (cls > 0) include(spec->classroots[cls], false);
+        include(ViewClassOf(spec, i), true);
+    }
+    return mapped ? owners : RootsOf(owner); // A captured class belongs to an enclosing call.
+}
+
+inline void TypeCheck::RestoreLimitedPrefix(const Roots &roots, const RefPlace &place, TypeExpr *array) {
     if (!reachable || !roots.Exact()) return;
-    auto prefix = LimitedPrefix(roots.Root(), place, array);
-    if (prefix && prefix->ownerspec == CurRealFrame().spec)
-        prefix->intactprefix = prefix->intactprefix.Prefer(proof);
+    cur.links.prefixes.Establish(LimitedPrefix(roots.Root(), place, array), { true });
+}
+
+// Captures keep their storage identity. A formal and each later writer must
+// be mapped separately: even formals in the same lifetime class can be distinct.
+inline void TypeCheck::ApplyCalleePrefixes(const LimitedPrefixes &prefixes, FnSpec *spec, span<const Val> args) {
+    struct Actual {
+        VarDef *array = nullptr;
+        Roots owners;
+    };
+    auto caller = [&](VarDef *v) -> Actual {
+        if (IsClassRoot(v)) return { nullptr, PrefixWriterOwners(v, spec, args) };
+        if (v->ownerspec != spec) return { v, RootsOf(PrefixOwner(v)) };
+        auto it = find(spec->params.begin(), spec->params.end(), v);
+        auto i = (size_t)(it - spec->params.begin());
+        if (it == spec->params.end() || i >= args.size()) return {};
+        auto place = ArgumentPlace(spec, v, args);
+        auto roots = OwnersAtPlace(args[i], place);
+        auto array = !roots.unknown && roots.Exact() ? LimitedPrefix(roots.Root(), place, v->type->ref->sub) : nullptr;
+        return { array, std::move(roots) };
+    };
+    for (auto &[source, fact] : prefixes.arrays) {
+        auto target = caller(source).array;
+        if (!target) continue;
+        PrefixGuarantee mapped { fact.proof };
+        for (auto &[from, retained] : fact.writers) {
+            auto writer = caller(from);
+            if (writer.owners.unknown || writer.owners.None()) mapped.AfterWrite(target, nullptr, retained);
+            for (auto &a : writer.owners.alts) {
+                if (a.root && MayAliasRoots(PrefixOwner(target), true, a.root, a.exact) == AL_NO) continue;
+                auto name = a.exact ? PrefixWriter(a.root, writer.array) : nullptr;
+                mapped.AfterWrite(target, name, retained);
+            }
+        }
+        cur.links.prefixes.Establish(target, std::move(mapped));
+    }
 }
 
 inline LiveTarget TypeCheck::LivePrefixTarget(Node *n, size_t result, TypeExpr *type) {

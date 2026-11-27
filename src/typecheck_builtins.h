@@ -5099,10 +5099,7 @@ inline void TypeCheck::ApplyCalleeShrinks(Node *at, FnSpec *spec, vector<Val> &a
         // judged which of its own writes still have live targets at this exit.
         ApplyCalleeWrites(spec, argvals);
         if (ordered) projectlinks(&exit.stores, argnodes);
-        if (!spec->inprogress) for (auto [i, proof] : exit.intactparams) {
-            auto param = spec->params[i];
-            RestoreLimitedPrefix(argvals[i], ArgumentPlace(spec, param, argvals), param->type->ref->sub, proof);
-        }
+        if (!spec->inprogress) ApplyCalleePrefixes(exit.prefixes, spec, argvals);
     };
     for (auto &exit : rec->outerexits) {
         auto tf = FrameOfSpec(exit.target);

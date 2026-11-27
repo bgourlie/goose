@@ -2114,11 +2114,10 @@ inline void TypeCheck::NoteExit(int tf, Node *at, vector<RetRoot> results,
     auto target = frames[tf].spec;
     auto exitlinks = [&] {
         auto spec = frames[current].spec;
-        FnRecord::ExitLinks exit { CallerKills(spec, true), cur.links.ClassStores() };
-        for (size_t i = 0; i < spec->params.size(); i++) {
-            auto p = spec->params[i];
-            if (IsAddressRef(p->type) && p->intactprefix.condition) exit.intactparams.emplace(i, p->intactprefix);
-        }
+        FnRecord::ExitLinks exit { CallerKills(spec, true), cur.links.ClassStores(), cur.links.prefixes };
+        exit.prefixes.Forget([&](VarDef *v) {
+            return v->ownerspec == spec && !(v->isparam && !v->isvar && IsAddressRef(v->type));
+        });
         return exit;
     };
     // The caller replays this exit after applying the callee's stores. Each
