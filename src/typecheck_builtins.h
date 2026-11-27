@@ -814,6 +814,7 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
             v.ClearReads();
             v.writable = rv.writable;
             v.refplace = elementplace;
+            if (d.kind == B_PUSH) NoteLiveElement(c, rv, rv.refplace, recvarr);
             // What a receiver that decays the reference loads through.
             c->rettypes.push_back(v.type);
             break;
@@ -4700,14 +4701,7 @@ inline void TypeCheck::ApplyCalleeShrinks(Node *at, FnSpec *spec, vector<Val> &a
             if (live && origins[i] >= 0) {
                 auto it = live->find(origins[i]);
                 if (it == live->end()) continue;
-                if (auto prefix = it->second.liveprefix; prefix && !e.bound) {
-                    if (prefix->ownerspec != spec) {
-                        if (PrefixOwner(prefix) == e.container) state.liveprefix = prefix;
-                    } else if (prefix->isparam) {
-                        auto place = ArgumentPlace(spec, prefix, argvals);
-                        state.liveprefix = LimitedPrefix(e.container, place, prefix->type->ref->sub);
-                    }
-                }
+                if (!e.bound) state.liveprefix = CallerPrefix(it->second.liveprefix, spec, argvals, e.container);
                 if (it->second.suffix && e.storefield.base) {
                     auto &from = spec->record.classevents[origins[i]];
                     auto base = from.storefield.base;

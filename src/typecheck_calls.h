@@ -44,6 +44,7 @@ inline void WarnDeprecatedValue(TypeCheck &tc, Node *at, const vector<SFunction 
 // generic inference (§7.1, §7.7), and case-function tag dispatch (§8.2).
 
 inline Val TypeCheck::CheckCall(Call *c, TypeExpr *expected) {
+    cur.links.targets.erase(c);
     // A node may be re-checked in argument phase 2; reset annotations.
     if (auto suffix = unrenderedargs.extract(c))
         c->args.insert(c->args.end(), suffix.mapped().begin(), suffix.mapped().end());
@@ -1455,19 +1456,25 @@ inline Val TypeCheck::TryDispatch(Call *c, vector<SFunction *> &cands, FnSpec *e
     // no provenance to the result.
     vector<Val> results;
     vector<bool> reached;
+    vector<VarDef *> prefixes;
     for (auto spec : c->dispatch) {
         CallResult(c, spec, argvals);
         results.resize(lastcallrets.size());
         reached.resize(lastcallrets.size());
+        prefixes.resize(lastcallrets.size());
         for (size_t r = 0; r < lastcallrets.size(); r++) {
             auto reaches = spec->inprogress || lastcallrets[r].elementlinks ||
                            (r < spec->record.retroots.size() && spec->record.retroots[r].set);
+            auto prefix = LivePrefixTarget(c, r);
+            if (!reached[r]) prefixes[r] = prefix;
+            else if (reaches && prefixes[r] != prefix) prefixes[r] = nullptr;
             if (!reached[r]) results[r] = lastcallrets[r];
             else if (reaches) results[r] = MergeVals(results[r], true, lastcallrets[r], true, c, true);
             reached[r] = reached[r] || reaches;
         }
     }
     lastcallrets = results;
+    for (size_t r = 0; r < prefixes.size(); r++) cur.links.SetTarget(ResultTarget(c, r), prefixes[r]);
     for (auto &mi : matches) WarnDeprecatedCall(*this, c, name, mi.sf);
     return results.empty() ? VoidVal() : results[0];
 }
@@ -2075,14 +2082,22 @@ inline void TypeCheck::ReplayEnvExits(FnSpec *spec, span<const Val> args) {
 // where any may be (§4.4). Record the bindings after this frame's defers.
 // The exit leaves the bodies checked in the frames above tf too, each of
 // which records what it had assigned by then for a call reusing it.
-inline void TypeCheck::NoteExit(int tf, Node *at, const vector<RetRoot> &results,
-                                vector<FnRecord::InterruptedAssign> interrupted) {
+inline void TypeCheck::NoteExit(int tf, Node *at, vector<RetRoot> results,
+                                vector<FnRecord::InterruptedAssign> interrupted, span<Node *const> expressions) {
     if (cur.probingtypes) return;
     auto current = RealFrameIndex();
     interrupted = CheckExitScopes(std::max(frames[tf].scopebase, frames[current].scopebase), at,
                                   current != tf, std::move(interrupted));
     auto e = frames[tf].exits;
     if (!reachable || !e) return;
+    // The reference was computed before the defers. Only promise a live
+    // target if its proof survived their writes and all later result operands.
+    if (tf == current && !expressions.empty()) for (size_t i = 0; i < results.size(); i++) {
+        if (!IsAddressRef(frames[tf].spec->rets[i]) || !results[i].alts.Exact()) continue;
+        auto prefix = expressions.size() == 1 ? LivePrefixTarget(expressions[0], i)
+                                              : LivePrefixTarget(expressions[i]);
+        if (prefix && PrefixOwner(prefix) == results[i].alts.Root()) results[i].liveprefix = prefix;
+    }
     auto merge = [&](vector<RetRoot> &to) {
         if (to.size() < results.size()) to.resize(results.size());
         for (size_t i = 0; i < results.size(); i++) to[i].Include(results[i], ast.places);
@@ -3818,7 +3833,9 @@ inline void TypeCheck::FinishReturn(int tf, const vector<Val> &vals, Node *at) {
         rr.freshview = isrs && vals[i].freshview;
         rr.set = true;
     }
-    NoteExit(tf, at, results);
+    auto ret = Is<Return>(at);
+    auto expressions = ret ? span<Node *const>(ret->vals) : span<Node *const>(&at, 1);
+    NoteExit(tf, at, std::move(results), {}, expressions);
 }
 
 // One root a result may have, as this call sees it: a parameter's class root
@@ -4012,6 +4029,8 @@ inline Val TypeCheck::CallResult(Call *c, FnSpec *spec, vector<Val> &argvals) {
         }
         v.elementlinks = ri.elementlinks;
         v.intactprefix = ri.intactprefix.value_or(false) && !spec->inprogress;
+        auto prefix = !spec->inprogress && v.Exact() ? CallerPrefix(ri.liveprefix, spec, argvals, v.Root()) : nullptr;
+        cur.links.SetTarget(ResultTarget(c, i), prefix);
         lastcallrets.push_back(v);
     }
     if (spec->rets.empty()) return VoidVal();

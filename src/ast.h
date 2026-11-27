@@ -2799,6 +2799,7 @@ struct RelativeStore {
 struct RetRoot {
     Roots alts;                // Every root the checked returns give.
     RefPlace place;            // Pointee or viewed elements common to those returns.
+    VarDef *liveprefix = nullptr; // Each completing return points into the live length of this array.
     bool writable = true;      // Writable only where every return is (§9.5).
     bool byteview = false;
     bool freshview = false;    // Prov::freshview.
@@ -2817,7 +2818,7 @@ struct RetRoot {
                writable == other.writable && byteview == other.byteview &&
                freshview == other.freshview &&
                heldparam == other.heldparam && elementlinks == other.elementlinks &&
-               intactprefix == other.intactprefix &&
+               intactprefix == other.intactprefix && liveprefix == other.liveprefix &&
                RelativeStore::SameSet(resultlinks, other.resultlinks, how);
     }
 
@@ -2826,6 +2827,7 @@ struct RetRoot {
         if (other.intactprefix) intactprefix = intactprefix.value_or(true) && *other.intactprefix;
         for (auto &link : other.resultlinks) link.AddTo(resultlinks);
         if (!other.set) return;
+        liveprefix = !set || liveprefix == other.liveprefix ? other.liveprefix : nullptr;
         alts.Add(other.alts);
         place = set ? place.Common(other.place, pool) : other.place;
         heldparam = !set || heldparam == other.heldparam ? other.heldparam : -1;

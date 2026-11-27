@@ -1479,6 +1479,7 @@ inline Val TypeCheck::CheckIf(IfExpr *x, TypeExpr *expected, bool wantvalue) {
         JoinPathScope js(*this, onjoin ? x->thenb : nullptr);
         tv = CheckBlockVal(x->thenb, expected, wantvalue);
     }
+    cur.links.SetTarget(x, LivePrefixTarget(x->thenb));
     auto aflow = SaveFlow();
     RestoreFlow(entry);
     Val ev = VoidVal();
@@ -1498,6 +1499,7 @@ inline Val TypeCheck::CheckIf(IfExpr *x, TypeExpr *expected, bool wantvalue) {
     // A nested else-if is checked here rather than through its own Check,
     // so its type is settled here too, void where it never produces.
     if (x->elseb) x->elseb->exprtype = ev.type ? ev.type : ast.voidtype;
+    cur.links.SetTarget(x, LivePrefixTarget(x->elseb));
     auto bflow = SaveFlow();
     Node *last = nullptr;
     if (!blockpos.empty()) {
@@ -1531,6 +1533,9 @@ inline Val TypeCheck::CheckBlockVal(Block *b, TypeExpr *expected, bool wantvalue
     } else if (wantvalue && reachable && expected && expected->kind != TY_VOID) {
         Error(b, "block used as a value must end in an expression");
     }
+    // The block's result survives its local bindings. Its target proof also
+    // survives, unless an exit defer shortens the array before delivery.
+    cur.links.SetTarget(b, wantvalue ? LivePrefixTarget(b->tail) : nullptr);
     PopScope();
     if (reachable) CheckBranchRoot(v, CurDepth(), b->tail, "block");
     b->exprtype = v.type ? v.type : ast.voidtype;
@@ -2205,6 +2210,10 @@ inline void TypeCheck::CheckFor(ForLoop *x) {
         if (IsRefOrSlice(bindtype)) {
             BindProv(vd, iterprov);
             vd->refplace = readback ? RefPlace {} : sequence.ElementPlace(ast.places);
+            if (!readback && byref && x->iterkind == IK_ARRAY) {
+                auto array = IsPlainRef(sequence.type) ? sequence.type->ref->sub : sequence.type;
+                NoteLiveElement(vd, sequence, sequence.refplace, array);
+            }
         }
         x->vdef = vd;
         if (!x->idxvar.empty()) {
@@ -3045,7 +3054,7 @@ inline void TypeCheck::CheckVarDecl(VarDecl *vd, bool global) {
     // initializer about to be checked (CheckCycleInit).
     auto fi = (int)frames.size() - 1;
     auto calls = frames[fi].cyclecalls;
-    auto Finish = [&](VarDef *d, TypeExpr *t, const Val *v, Node *init) {
+    auto Finish = [&](VarDef *d, TypeExpr *t, const Val *v, Node *init, size_t result = 0) {
         // An inferred reference or slice type is const where the value is
         // read-only (in this instantiation, say), as an annotation would
         // have to say for it to fit (§9.5).
@@ -3057,7 +3066,7 @@ inline void TypeCheck::CheckVarDecl(VarDecl *vd, bool global) {
         d->intactprefix = !global && IsArrayKind(t, A_LIMITED) && v && v->intactprefix;
         if (IsArrayKind(t, A_LIMITED) && v) d->limitedcapacity = v->extent.capacity;
         if (v && !global && !d->isvar && IsAddressRef(t) && v->Exact())
-            if (auto prefix = LivePrefixTarget(init); prefix && PrefixOwner(prefix) == v->Root())
+            if (auto prefix = LivePrefixTarget(init, result); prefix && PrefixOwner(prefix) == v->Root())
                 cur.links.targets[d] = prefix;
         if (global) CheckVarExtent(d, vd);
         if (v && IsRefOrSlice(t)) {
@@ -3141,7 +3150,7 @@ inline void TypeCheck::CheckVarDecl(VarDecl *vd, bool global) {
             if (IsPlainRef(rets[i].type) && !IsRefOrSlice(rv.type))
                 NoRelRefCopy(vd->inits[0], rv.type, i, vd, &rv);
             CheckBindingRoot(d, rv, vd->inits[0]);
-            Finish(d, rv.type, &rv, vd->inits[0]);
+            Finish(d, rv.type, &rv, vd->inits[0], i);
         }
         return;
     }

@@ -22,12 +22,28 @@ inline VarDef *TypeCheck::LimitedPrefix(VarDef *owner, const RefPlace &place, Ty
     return nullptr;
 }
 
-inline VarDef *TypeCheck::LivePrefixTarget(Node *n) {
+inline VarDef *TypeCheck::LivePrefixTarget(Node *n, size_t result) {
     if (!n || cur.links.targets.empty()) return nullptr;
     if (auto u = Is<Unary>(n); u && u->op == T_BITAND) n = u->child;
     auto id = Is<Ident>(n);
-    auto it = cur.links.targets.find(id ? LinkFlow::Target(id->vdef) : LinkFlow::Target(n));
+    auto it = cur.links.targets.find(id ? LinkFlow::Target(id->vdef) : ResultTarget(n, result));
     return it == cur.links.targets.end() ? nullptr : it->second;
+}
+
+inline void TypeCheck::NoteLiveElement(LinkFlow::Target key, const Roots &roots, const RefPlace &place,
+                                       TypeExpr *array) {
+    VarDef *prefix = nullptr;
+    if (reachable && roots.Exact() && IsArrayKind(array, A_LIMITED) &&
+        !IsRefOrSlice(array->arr->sub) && HasRelRefT(array->arr->sub))
+        prefix = LimitedPrefix(roots.Root(), place, array);
+    cur.links.SetTarget(key, prefix);
+}
+
+inline VarDef *TypeCheck::CallerPrefix(VarDef *prefix, FnSpec *spec, span<const Val> args, VarDef *owner) {
+    if (!prefix || !owner) return nullptr;
+    if (prefix->ownerspec != spec) return PrefixOwner(prefix) == owner ? prefix : nullptr;
+    if (!prefix->isparam || !IsAddressRef(prefix->type)) return nullptr;
+    return LimitedPrefix(owner, ArgumentPlace(spec, prefix, args), prefix->type->ref->sub);
 }
 
 inline TypeCheck::LVal TypeCheck::CheckLValue(Node *n, PathUse use) {
@@ -114,10 +130,7 @@ inline TypeCheck::LVal TypeCheck::CheckLValue(Node *n, PathUse use) {
         if (lv.intemp) NoRelRefTempRead(ix->obj, lv.type, elem);
         // The index checks the captured length. A shrink during evaluation of
         // the subscript invalidates this evidence just like a later shrink.
-        cur.links.targets.erase(n);
-        auto owner = lv.Exact() ? lv.Root() : nullptr;
-        if (reachable && IsArrayKind(lv.type, A_LIMITED) && !IsRefOrSlice(elem) && HasRelRefT(elem))
-            if (auto prefix = LimitedPrefix(owner, lv.place, lv.type)) cur.links.targets[n] = prefix;
+        NoteLiveElement(n, lv, lv.place, lv.type);
         lv.place = lv.place.Inside(ast.places, IsArrayKind(lv.type, A_GROW));
         if (use != PathUse::Reread) CheckIntAny(ix->idx);
         if (lv.type->cq) lv.writable = false;   // An element of a const value.

@@ -310,8 +310,12 @@ struct TypeCheck {
         map<Part, Write, std::less<>> live;
         // Successful index evaluations and immutable reference bindings known
         // to address a live element of a particular limited array on this path.
-        using Target = variant<Node *, VarDef *>;
+        using Target = variant<Node *, VarDef *, pair<Node *, size_t>>;
         map<Target, VarDef *> targets;
+        void SetTarget(Target key, VarDef *prefix) {
+            if (prefix) targets[key] = prefix;
+            else targets.erase(key);
+        }
         template<typename F> void DropPrefixes(F matches) {
             erase_if(targets, [&](const auto &p) { return matches(p.second); });
             for (auto &[part, write] : live)
@@ -1813,8 +1817,8 @@ struct TypeCheck {
     // callee takes -- a function value's `return`, a `return from`. A
     // callee records such an exit (FnRecord::outerexits), which a call reusing
     // it takes again.
-    void NoteExit(int tf, Node *at, const vector<RetRoot> &results = {},
-                  vector<FnRecord::InterruptedAssign> interrupted = {});
+    void NoteExit(int tf, Node *at, vector<RetRoot> results = {},
+                  vector<FnRecord::InterruptedAssign> interrupted = {}, span<Node *const> expressions = {});
     void ReplayOuterExit(int tf, FnSpec *spec, const FnRecord::OuterExit &exit, const FlowState &entry,
                          Node *at, vector<Val> &args);
 
@@ -2052,7 +2056,12 @@ struct TypeCheck {
 
     enum class PathUse { Evaluate, ComparisonView, Reread };
     LVal CheckLValue(Node *n, PathUse use = PathUse::Evaluate);
-    VarDef *LivePrefixTarget(Node *n);
+    static LinkFlow::Target ResultTarget(Node *n, size_t result) {
+        return result ? LinkFlow::Target(std::pair { n, result }) : LinkFlow::Target(n);
+    }
+    VarDef *LivePrefixTarget(Node *n, size_t result = 0);
+    void NoteLiveElement(LinkFlow::Target key, const Roots &roots, const RefPlace &place, TypeExpr *array);
+    VarDef *CallerPrefix(VarDef *prefix, FnSpec *spec, span<const Val> args, VarDef *owner);
     static VarDef *PrefixOwner(VarDef *prefix) {
         return prefix->type && IsAddressRef(prefix->type) ? prefix->ref.Root() : prefix;
     }
