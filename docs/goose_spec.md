@@ -2588,12 +2588,18 @@ Restrictions, all checked statically:
   one that does, transitively. The body may run while such a return is in
   flight (§7.9), and a second one, a contained throw and catch included,
   would disturb the first's state.
-* The body does not name a local the function returns by name: that local
-  is built at its result destination (§7.3), and is complete when the body
-  runs. A write through an alias to any part of that storage is also an
-  error, including a write performed by a function the body calls. An
-  alias may be read. A reference stored in the result may still be used
-  to modify a separate object it points to.
+* The body does not name the local of a named result (§7.3), even when
+  conversion copies that local into the result. It may read through an
+  alias to the local.
+* Once evaluation of a return operand begins, a defer must not write
+  through an alias to storage that the corresponding named local shares
+  with the result destination. This includes writes by functions the body
+  calls and applies through the evaluation of later operands and the
+  function's exit. An earlier scope exit may write through the alias.
+  On a long-distance return (§7.9), the restriction applies to all named
+  result destinations in the functions being unwound, since these may use
+  the same stack. A defer may change a source field copied into the result
+  or a separate object reached through a reference stored in the result.
 * The body is checked where it is written: it names what is declared
   before it, and a `var` optional narrowed before it is not narrowed in it,
   since an assignment before an exit may have undone that. What the body

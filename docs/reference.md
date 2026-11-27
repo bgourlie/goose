@@ -2822,8 +2822,8 @@ block done
 
 The body is checked where it is written, so it names only what is declared
 before it, and a `var` optional narrowed before it is not narrowed inside
-it, since an assignment before an exit may undo that. Three things it may
-not do, each a compile error:
+it, since an assignment before an exit may undo that. Each of the
+following is a compile error.
 
 * **Leave.** No `return`, `break` or `continue` in it may target anything
   outside it, including a `return` in a block passed to a call in the body.
@@ -2831,13 +2831,18 @@ not do, each a compile error:
   `return … from`, propagates one, or catches one, since the body may run
   while such a return is in flight ([section 20](#20-long-distance-return-and-errors));
   the error names the chain of calls that brings the machinery in.
-* **Name the function's named result.** When every return of a non-fixed
-  result names the same local, the body may not name that local
-  ([section 17](#results)). The result is complete before the body runs.
-  The body may read through an alias to the local. A write through an
-  alias, directly or in a function the body calls, is an error if it can
-  change storage shared with the delivered result. The body may write to
-  source fields already copied into the result.
+* **Name the function's named result.** The body may not name the local
+  of a named result ([section 17](#results)), even when conversion copies
+  the local into the result. It may read through an alias to the local.
+* **Write through an alias to result storage during return.** A defer in
+  an inner block can update the local through an alias before evaluation
+  of its return operand begins. From the start of that operand through the
+  function's exit, a defer may not change storage the local shares with
+  its result destination, even through a call. A long-distance return
+  protects all named result destinations in the functions it unwinds,
+  since they may use the same stack. The body may still change a source
+  field copied into the result or a separate object that a reference in
+  the result points to.
 
 A `defer` belongs in a function: a global initializer has no scope exit.
 Nothing runs a defer where no exit happens: `abort`, a failed `assert` or
