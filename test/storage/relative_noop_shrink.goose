@@ -71,6 +71,9 @@ fn main() {
     cells.data.pop_n(zero_count);
     cells.data.resize(cells.data.len, 0);
     cells.data.resize(cells.data.len, cells.data[0] + 1);
+    let n: u64 = 3;
+    cells.data.resize(cells.data.len, n as i64);
+    cells.data.resize(cells.data.len, if n > 0 { 1 } else { 2 });
     assert(cells.head .== cells.data[1]);
     through_mutable_ref();
     let pair: Node[] = limited_pair();

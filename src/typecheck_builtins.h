@@ -18,6 +18,12 @@ inline bool ReadOnlyResizeFill(Node *n) {
     if (auto b = Is<Binary>(n)) return ReadOnlyResizeFill(b->left) && ReadOnlyResizeFill(b->right);
     if (auto d = Is<Dot>(n)) return ReadOnlyResizeFill(d->obj);
     if (auto ix = Is<Index>(n)) return ReadOnlyResizeFill(ix->obj) && ReadOnlyResizeFill(ix->idx);
+    if (auto cast = Is<AsCast>(n)) return ReadOnlyResizeFill(cast->child);
+    if (auto block = Is<Block>(n))
+        return block->stmts.empty() && block->tail && ReadOnlyResizeFill(block->tail);
+    if (auto cond = Is<IfExpr>(n))
+        return cond->elseb && ReadOnlyResizeFill(cond->cond) && ReadOnlyResizeFill(cond->thenb) &&
+               ReadOnlyResizeFill(cond->elseb);
     return false;
 }
 
