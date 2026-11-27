@@ -4248,6 +4248,7 @@ inline bool TypeCheck::BackwardElementRebind(Node *slot, Node *value) {
     if (!a || !b) return false;
     if (SamePath(a, b, PathInterval::ConsecutiveReads)) return true;
     if (!a->arrayheader || a->arrayheader != b->arrayheader) return false;
+    if (b->constantindex == 0) return true; // Every valid source index is at least zero.
     if (a->constantindex >= 0 && b->constantindex >= 0) return b->constantindex <= a->constantindex;
     // The right-hand base runs between the two subscript evaluations. It
     // can return the same array while changing a variable the index reads.

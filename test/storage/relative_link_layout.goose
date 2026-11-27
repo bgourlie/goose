@@ -74,6 +74,18 @@ fn same_constant_element() {
     assert(calls == 1 && nodes[0].owner .== nodes[0]);
 }
 
+fn link_to_first(i: i64) {
+    var nodes: Bucket[>..] = [Bucket {}, Bucket {}, Bucket {}];
+    let alias .= nodes;
+    const first: i64 = 0;
+    nodes[i].owner .= alias[first];
+    nodes[i].selected .= nodes[0].value;
+    nodes.pop_n(1);
+    if i < nodes.len {
+        assert(nodes[i].owner .== nodes[0] && nodes[i].selected .== nodes[0].value);
+    } else { assert(nodes[0].owner == null && nodes[1].owner == null); }
+}
+
 fn backward_link() {
     var nodes: Node[>..] = [Node {}, Node {}, Node {}];
     let alias .= nodes;
@@ -194,6 +206,9 @@ fn main() {
     extend();
     appended_link(1);
     backward_link();
+    link_to_first(0);
+    link_to_first(1);
+    link_to_first(2);
     same_element(0);
     same_element(1);
     same_constant_element();
