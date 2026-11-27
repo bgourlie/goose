@@ -244,6 +244,7 @@ struct TypeCheck {
         size_t at = 0;
         bool relative = false;
         bool prefixonly = false;  // Old limited-array slots may still be observable through views.
+        CountProof guard = true;
         Kill Field(string_view name) const {
             auto field = *this;
             Append(field.path, ".", name);
@@ -253,7 +254,7 @@ struct TypeCheck {
             return container == other.container && base == other.base && relative == other.relative;
         }
         bool SamePart(const Kill &other) const {
-            return SameStorage(other) && path == other.path && prefixonly == other.prefixonly;
+            return SameStorage(other) && path == other.path && prefixonly == other.prefixonly && guard == other.guard;
         }
         bool operator==(const Kill &) const = default;
     };
@@ -276,7 +277,7 @@ struct TypeCheck {
         bool maybeassigned = false;
         TypeExpr *narrowed = nullptr;
         RefPlace refplace;
-        PrefixProof intactprefix;
+        CountProof intactprefix;
         bool operator==(const VarFlow &) const = default;
     };
     struct FlowEntry {
@@ -316,7 +317,7 @@ struct TypeCheck {
             if (prefix.array) targets[key] = prefix;
             else targets.erase(key);
         }
-        template<typename F> void DropPrefixes(F matches, PrefixProof retained = false) {
+        template<typename F> void DropPrefixes(F matches, CountProof retained = false) {
             auto weaken = [&](LiveTarget &target) {
                 if (target.array && matches(target.array)) target = { target.array, target.proof.Both(retained) };
             };
@@ -350,6 +351,7 @@ struct TypeCheck {
         };
         map<ArrayLit *, FillLinks> fills;
         void Add(const StoreEvent &e, size_t index, FnRecord::LinkState state = {}) {
+            if (state.cleared.Committed()) return;
             Part part { e.container, e.elementlink, e.storefield, e.linkclass, e.linktarget, e.boundfield };
             Write write { state, index };
             auto [it, added] = live.try_emplace(std::move(part), write);
@@ -2066,7 +2068,6 @@ struct TypeCheck {
     static LinkFlow::Target ResultTarget(Node *n, size_t result) {
         return result ? LinkFlow::Target(std::pair { n, result }) : LinkFlow::Target(n);
     }
-    set<ZeroCondition> zeroconditions;
     LiveTarget LivePrefixTarget(Node *n, size_t result = 0);
     void NoteLiveElement(LinkFlow::Target key, const Roots &roots, const RefPlace &place, TypeExpr *array);
     LiveTarget CallerPrefix(LiveTarget target, FnSpec *spec, span<const Val> args, VarDef *owner);
@@ -2363,7 +2364,7 @@ struct TypeCheck {
             (uint64_t)count >= (1ull << IntBits(ls)))
             Error(n, cat("array length ", count, " exceeds storage range of ", TypeStr(t)));
     }
-    bool FitsAt(Val &v, TypeExpr *dt, bool delivered = true);
+    bool FitsAt(Val &v, TypeExpr *dt, bool delivered = true, Node *conversion = nullptr);
     static string ConstStr(const Val &v);
     Val CheckCond(Node *n);
     TypeExpr *UnifyBranch(TypeExpr *a, TypeExpr *b, Node *at, bool wantvalue);
@@ -2884,7 +2885,7 @@ struct TypeCheck {
     // Builtins (§3.7, §9.3, §11.2) and array members (§3.3, §5.4).
 
     Val CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> &args, Val *precv);
-    enum class SlotRemoval { None, Possible, All, NamedZeroPop };
+    enum class SlotRemoval { None, Possible, All, NamedZeroPop, NamedZeroResize };
     SlotRemoval CountedRemoval(BuiltinKind op, const vector<Node *> &args, const Val &count,
                                const Val &receiver, TypeExpr *array);
     void CheckByteOut(Call *c, Node *out, const string &form);
@@ -2914,14 +2915,17 @@ struct TypeCheck {
     const string *EmbedFile(Call *c, vector<Node *> &args);
     void CheckGrowShrink(Node *at, const char *op, Node *recv, const Val &rv,
                          SlotRemoval removal, VarDef *zerocount);
-    bool RelyOnZeroCounts(const set<VarDef *> &counts, Node *at);
-    bool LiveConversionTargets(const ValueLinks &links, PrefixProof whole, Node *at);
+    bool RelyOnCountProof(CountProof proof, Node *at, const char *use);
+    bool LiveConversionTargets(const ValueLinks &links, CountProof whole, Node *at);
     void GrowOnlyAssignKnown(Assign *a, const Roots &built, bool whole);
     bool RetainsRelativeSlot(TypeExpr *part, TypeExpr *array, TypeExpr *replaced);
     bool LinkMayReachElements(TypeExpr *array, TypeExpr *pointee);
+    // Slot types a global view could expose, and the condition removing all
+    // candidate links of that type. CheckGlobalShrinks resolves the views.
+    using GlobalSlots = map<TypeExpr *, CountProof>;
     ValueLinks LiveElementLinks(VarDef *owner, TypeExpr *target = nullptr,
                                TypeExpr *replaced = nullptr, bool callerchecks = false, Node *shrink = nullptr,
-                               set<TypeExpr *> *globalSlots = nullptr);
+                               GlobalSlots *globalSlots = nullptr, CountProof *requirements = nullptr);
     // Whether a shrink whose receiver has these roots knows the arrays it
     // frees: none is static data or a temporary (§5.1).
     static bool ShrinkRootsKnown(const Roots &roots) {
@@ -2955,7 +2959,7 @@ struct TypeCheck {
     bool MayKeepLimitedSlots(TypeExpr *t, const Kill &part, Node *value);
     void NoteOverwrite(Kill kill, TypeExpr *target, Node *value = nullptr);
     void NoteOverwrite(Node *path, const Roots &loc, size_t at, TypeExpr *target,
-                       const RefPlace *place = nullptr, Node *value = nullptr);
+                       const RefPlace *place = nullptr, Node *value = nullptr, CountProof guard = true);
     bool KilledFor(VarDef *c, VarDef *base, TypeExpr *t, TypeExpr *arr, size_t &since,
                    bool relative = false, TypeExpr *replaced = nullptr, Node *shrink = nullptr);
     TypeExpr *FieldPathType(VarDef *base, string_view path);
@@ -3106,12 +3110,12 @@ struct TypeCheck {
         TypeExpr *replaced;
         bool incoming; // Links from before this activation may still survive.
         bool arrayonly;
-        set<string> clearedfields;  // Global fields overwritten on every path to this shrink.
-        set<TypeExpr *> slots;  // A global view into these limited arrays can expose a surviving link.
-        set<VarDef *> zerocounts;
+        map<string, CountProof> clearedfields;  // Global fields overwritten on every path to this shrink.
+        GlobalSlots slots;
+        CountProof preserves, replacesif;
     };
     vector<GlobalShrink> globalshrinks;
-    void NoteGlobalShrink(const LinkShrink &shrink, set<TypeExpr *> slots);
+    void NoteGlobalShrink(const LinkShrink &shrink, GlobalSlots slots);
     [[noreturn]] void ThreadIndexError(Node *at, TypeExpr *t);
     void CheckGlobalShrinks();
     // Whether what a store record leads to may point into the array `arr`

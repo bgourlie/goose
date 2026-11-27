@@ -3,6 +3,11 @@ let ZERO = 0;
 let length = 0;
 
 fn clear(nodes: Node[>..]&) { nodes.clear(); }
+fn resize(nodes: Node[>..]&) { nodes.resize(length); }
+fn reset(nodes: Node[>..]&) { nodes.resize(ZERO); }
+fn reset_or_keep(nodes: Node[>..]&, empty: bool) {
+    if empty { reset(nodes); } else { nodes.pop_n(ZERO); }
+}
 
 fn change(n: i64&) { n = 1; }
 
@@ -11,12 +16,12 @@ fn resize_after_clear() {
     nodes[0].next .= nodes[1];
     nodes.clear();
     nodes.push(Node {});
-    nodes.resize(length);
+    resize(nodes);
     assert(nodes.len == 0);
     change(length);
     nodes.push(Node {});
     nodes.push(Node {});
-    nodes.resize(length);
+    resize(nodes);
     assert(nodes.len == 1);
 }
 
@@ -34,8 +39,12 @@ fn main() {
     resized.push(Node {});
     resized.push(Node {});
     resized[0].next .= resized[1];
-    resized.resize(ZERO);
+    reset_or_keep(resized, false);
+    assert(resized.len == 2 && resized[0].next .== resized[1]);
+    reset(resized);
     assert(resized.len == 0);
+    resized.push(Node {});
+    resized.pop_n(1);
     var nodes: Node[>..] = [Node {}, Node {}];
     var other: Node[>..] = [Node {}, Node {}];
     nodes[0].next .= nodes[1];

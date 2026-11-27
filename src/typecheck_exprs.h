@@ -1215,7 +1215,7 @@ inline void TypeCheck::MustFit(Val &v, Node *n, TypeExpr *dt) {
     fitfail.clear();
     fitnode = n;
     auto from = LoadType(v.type);
-    if (FitsAt(v, dt, reachable)) {
+    if (FitsAt(v, dt, reachable, n)) {
         if (v.elementlinks && !curdst.discarded && !IsRefOrSlice(dt) && !curdst.roots.None())
             RecordElementLinks(curdst, dt, v.elementlinks, n);
         if (IsIntT(dt) && !TypeEq(from, dt)) {
@@ -1256,7 +1256,7 @@ inline void TypeCheck::MustFit(Val &v, Node *n, TypeExpr *dt) {
 // owned by curdst must be rooted at least as shallow (call-site argument
 // slots pass curdst null: parameters always die before their arguments'
 // roots).
-inline bool TypeCheck::FitsAt(Val &v, TypeExpr *dt, bool delivered) {
+inline bool TypeCheck::FitsAt(Val &v, TypeExpr *dt, bool delivered, Node *conversion) {
     auto t = v.type;
     if (!delivered) v.elementlinks = {};
     // An lvalue at a reference destination is the reference to it (§4.1),
@@ -1510,7 +1510,7 @@ inline bool TypeCheck::FitsAt(Val &v, TypeExpr *dt, bool delivered) {
                               "reference still names (§5.2)");
                 return false;
             }
-            if (IsArrayKind(t, A_LIMITED) && !LiveConversionTargets(links, v.intactprefix, fitnode)) {
+            if (IsArrayKind(t, A_LIMITED) && !LiveConversionTargets(links, v.intactprefix, conversion)) {
                 fitfail = cat("cannot construct ", TypeStr(dt), " from ", TypeStr(t),
                               ": a self-relative link may name a slot beyond the live length "
                               "that the conversion would discard (§5.3)");

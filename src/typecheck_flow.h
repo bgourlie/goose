@@ -2747,7 +2747,7 @@ inline void TypeCheck::CollectStorageRead(vector<StorageRead> &reads, const Stor
         }
         if (!cur.deferring && owner && owner->ownerspec == CurRealFrame().spec && read.owner.exact) continue;
         if (any_of(cur.kills.begin(), cur.kills.end(), [&](const Kill &k) {
-            return k.relative && !k.prefixonly && k.container == owner && k.base && k.base == slot.Base() &&
+            return k.relative && k.guard.Committed() && !k.prefixonly && k.container == owner && k.base && k.base == slot.Base() &&
                    FieldPathWithin(slot.Path(), k.path);
         })) continue;
         if (incoming) {
@@ -2801,7 +2801,7 @@ inline void TypeCheck::RecordStorageWrite(FnRecord::StorageWrite write, Defer *e
     auto spec = CurRealFrame().spec;
     if (!spec || !write.root || write.root->isglobal || IsTemp(write.root)) return;
     if (write.effect != StorageWrite::Storage) {
-        auto retained = write.zeropop ? PrefixProof::IfZero(zeroconditions, write.zeropop) : PrefixProof();
+        auto retained = write.zeropop ? CountProof::IfZero(ast.zeroconditions, write.zeropop) : CountProof();
         if (write.root->type && write.root->ownerspec == spec && TopConstEq(write.root->type, write.type))
             write.root->intactprefix = write.root->intactprefix.Both(retained);
         cur.links.DropPrefixes([&](VarDef *prefix) {
@@ -3065,7 +3065,7 @@ inline void TypeCheck::CheckVarDecl(VarDecl *vd, bool global) {
         if (t->kind == TY_FN)
             Error(vd, "function values are compile-time only and cannot be stored (§7.6)");
         d->type = t;
-        d->intactprefix = !global && IsArrayKind(t, A_LIMITED) && v ? v->intactprefix : PrefixProof();
+        d->intactprefix = !global && IsArrayKind(t, A_LIMITED) && v ? v->intactprefix : CountProof();
         if (IsArrayKind(t, A_LIMITED) && v) d->limitedcapacity = v->extent.capacity;
         if (v && !global && !d->isvar && IsAddressRef(t) && v->Exact())
             if (auto prefix = LivePrefixTarget(init, result); prefix.array && PrefixOwner(prefix.array) == v->Root())

@@ -3182,7 +3182,7 @@ inline bool TypeCheck::SameRecord(const FnRecord &a, const FnRecord &b, const Fn
                        p.maybeassigned == q.maybeassigned && sameresults(p.results, q.results);
             })) return why("nonlocal exits");
     auto sameeffect = [&](const ShrinkEffect &p, const ShrinkEffect &q) {
-        return p.balance == q.balance && p.mayremove == q.mayremove && p.zerocounts == q.zerocounts &&
+        return p.balance == q.balance && p.preserves == q.preserves && p.replacesif == q.replacesif &&
                sametype(p.replaced, q.replaced) && sametype(p.arrayreceiver, q.arrayreceiver);
     };
     auto sameshrinks = [&](const auto &x, const auto &y) {

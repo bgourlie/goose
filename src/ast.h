@@ -1012,32 +1012,42 @@ struct ZeroCondition {
     bool operator<(const ZeroCondition &other) const { return names < other.names; }
 };
 
-struct PrefixProof {
+struct CountProof {
     const ZeroCondition *condition = nullptr; // No proof. An empty condition is unconditional.
-    PrefixProof(bool known = false) {
+    CountProof(bool known = false) {
         static const ZeroCondition always;
         if (known) condition = &always;
     }
-    explicit PrefixProof(const ZeroCondition *c) : condition(c) {}
-    static PrefixProof IfZero(set<ZeroCondition> &pool, VarDef *name) {
-        return PrefixProof(&*pool.insert({ { name }, &pool }).first);
+    explicit CountProof(const ZeroCondition *c) : condition(c) {}
+    bool Unconditional() const { return condition && condition->names.empty(); }
+    bool Available() const;
+    bool Committed() const;
+    CountProof Prefer(CountProof other) const {
+        if (Committed()) return *this;
+        if (other.Committed()) return other;
+        if (!Available()) return other;
+        if (other.Available() && other.condition->names.size() < condition->names.size()) return other;
+        return *this;
     }
-    PrefixProof Both(PrefixProof other) const {
+    static CountProof IfZero(set<ZeroCondition> &pool, VarDef *name) {
+        return CountProof(&*pool.insert({ { name }, &pool }).first);
+    }
+    CountProof Both(CountProof other) const {
         if (!condition || !other.condition) return false;
         if (condition == other.condition || other.condition->names.empty()) return *this;
         if (condition->names.empty()) return other;
         auto joined = *condition;
         joined.names.insert(other.condition->names.begin(), other.condition->names.end());
-        return PrefixProof(&*condition->pool->insert(std::move(joined)).first);
+        return CountProof(&*condition->pool->insert(std::move(joined)).first);
     }
-    auto operator<=>(const PrefixProof &) const = default;
+    auto operator<=>(const CountProof &) const = default;
 };
 
 struct LiveTarget {
     VarDef *array = nullptr;
-    PrefixProof proof;
-    LiveTarget(VarDef *array = nullptr, PrefixProof proof = true)
-        : array(proof.condition ? array : nullptr), proof(array ? proof : PrefixProof()) {}
+    CountProof proof;
+    LiveTarget(VarDef *array = nullptr, CountProof proof = true)
+        : array(proof.condition ? array : nullptr), proof(array ? proof : CountProof()) {}
     LiveTarget Common(LiveTarget other) const {
         return array == other.array ? LiveTarget(array, proof.Both(other.proof)) : LiveTarget();
     }
@@ -1049,7 +1059,7 @@ struct ElementLink {
     ElementLinks direction = EL_NONE;
     bool intail = false; // The receiving slot lies in its owner's resizable tail.
     bool suffixonly = false; // In a limited-array value, this slot is outside its live length.
-    PrefixProof livetarget; // Its target is within this limited-array value's current length.
+    CountProof livetarget; // Its target is within this limited-array value's current length.
     explicit operator bool() const { return direction != EL_NONE; }
     auto operator<=>(const ElementLink &) const = default;
     bool SameSlotKind(ElementLink other) const {
@@ -1126,7 +1136,7 @@ struct Val : Prov {
     bool uns = false;            // CK_INT: ival's bits are a u64 above i64.max.
     bool strlit = false;         // String literal: adaptable to u8 array types.
     bool emptyarr = false;       // [] with as yet unknown element type.
-    PrefixProof intactprefix;   // Every previously addressable slot is still live (§5.3).
+    CountProof intactprefix;   // Every previously addressable slot is still live (§5.3).
     ArrayExtent extent;
     int64_t ival = 0;
     double fval = 0;
@@ -2378,7 +2388,7 @@ struct VarDef {
     bool assigned = false;
     bool maybeassigned = false;
     TypeExpr *narrowed = nullptr;  // T? narrowed to T& in the current region.
-    PrefixProof intactprefix;      // Every previously addressable limited-array slot is currently live.
+    CountProof intactprefix;      // Every previously addressable limited-array slot is currently live.
     int64_t limitedcapacity = -1;   // Set at construction and independent of subsequent length changes.
     bool captured = false;         // Accessed from a nested fn / function value.
     // The first comparison relying on the variable being non-negative
@@ -2651,6 +2661,22 @@ struct RootArg {
     }
 };
 
+inline bool CountProof::Available() const {
+    if (!condition) return false;
+    for (auto name : condition->names)
+        for (auto d = name; d; d = d->constfrom)
+            if (d->refwrite) return false;
+    return true;
+}
+
+inline bool CountProof::Committed() const {
+    if (!condition) return false;
+    for (auto name : condition->names)
+        for (auto d = name; d; d = d->constfrom)
+            if (!d->type->cq && !d->constuse) return false;
+    return true;
+}
+
 // How a body's shrinks of one array leave it (§5.2): balanced where each
 // resizes it back to a length it had during the call, or is a balanced call,
 // so that it is never shorter than when the call began and no view taken
@@ -2665,9 +2691,8 @@ struct ShrinkEffect {
     ShrinkBalance balance;
     TypeExpr *replaced;
     TypeExpr *arrayreceiver = nullptr; // A shrink of this array alone preserves its owner's fixed fields.
-    bool mayremove = true; // A grow-only shrink operation can preserve every slot.
-    // All possible removals are zero-count pops if these bindings retain their initial values.
-    set<VarDef *> zerocounts;
+    CountProof preserves;          // No slot is removed.
+    CountProof replacesif = true;  // A removing operation empties 'replaced' under this condition.
     ShrinkEffect(ShrinkBalance b = SB_UNBALANCED, TypeExpr *r = nullptr)
         : balance(b), replaced(r) {}
 };
@@ -2701,6 +2726,7 @@ vector<K> CommonOverwrites(const vector<K> &a, const vector<K> &b, F evidence) {
             (right.prefixonly && part->path != right.path)) continue;
         auto overlap = *part;
         overlap.prefixonly = left.prefixonly || right.prefixonly;
+        overlap.guard = left.guard.Both(right.guard);
         auto it = find_if(common.begin(), common.end(), [&](const K &k) { return k.SamePart(overlap); });
         bool first = it == common.end();
         auto &out = first ? common.emplace_back(std::move(overlap)) : *it;
@@ -2843,7 +2869,7 @@ struct RetRoot {
     bool writable = true;      // Writable only where every return is (§9.5).
     bool byteview = false;
     bool freshview = false;    // Prov::freshview.
-    std::optional<PrefixProof> intactprefix; // Whether all completing limited-array results preserve their slots.
+    std::optional<CountProof> intactprefix; // Whether all completing limited-array results preserve their slots.
     ValueLinks elementlinks; // Any return may give an array with Val::elementlinks.
     vector<RelativeStore> resultlinks; // Links written into a result that reaches its caller.
     bool set = false;          // A return supplied provenance, including a known null.
@@ -3007,11 +3033,14 @@ struct FnRecord {
         VarDef *base = nullptr;
         bool prefixonly = false;
         set<int> writes; // Ordinary class stores that may survive this overwrite at the shrink.
+        CountProof guard = true;
         bool SameStorage(const CallerKill &k) const {
             return param == k.param && external == k.external && base == k.base &&
                    relative == k.relative;
         }
-        bool SamePart(const CallerKill &k) const { return SameStorage(k) && path == k.path && prefixonly == k.prefixonly; }
+        bool SamePart(const CallerKill &k) const {
+            return SameStorage(k) && path == k.path && prefixonly == k.prefixonly && guard == k.guard;
+        }
         bool operator==(const CallerKill &) const = default;
     };
     static void IntersectKills(vector<CallerKill> &a, const vector<CallerKill> &b) {
@@ -3024,10 +3053,12 @@ struct FnRecord {
     struct LinkState {
         std::optional<string_view> suffix; // The slot only survives outside this field's live length.
         LiveTarget liveprefix;             // The target is live in this array or array parameter.
+        CountProof cleared;                // A named-zero resize can have removed this slot.
 
         void Include(const LinkState &other) {
             if (suffix != other.suffix) suffix.reset();
             liveprefix = liveprefix.Common(other.liveprefix);
+            cleared = cleared.Both(other.cleared);
         }
         bool operator==(const LinkState &) const = default;
     };
@@ -3447,6 +3478,7 @@ struct Ast {
     map<string_view, Namespace> namespaces;
     deque<string> interned;
     PlacePool places;
+    set<ZeroCondition> zeroconditions;
 
     // Shared instances of the primitive types.
     TypeExpr *inttypes[IS_VARINT + 1];
