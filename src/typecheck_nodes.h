@@ -252,6 +252,7 @@ inline Val ArrayLit::Check(TypeCheck &tc, TypeExpr *expected) {
     TypeCheck::FlagScope inelement(tc.curdst.place.intail, tc.curdst.place.intail || (expected && IsArrayKind(expected, A_GROW)));
     TypeCheck::FlagScope nofieldsteps(tc.curdst.fieldsteps, false);
     TypeCheck::FlagScope noboundsteps(tc.curdst.boundsteps, false);
+    TypeCheck::Saved<IndexedSlot> noindex(tc.curdst.indexed, {});
     // A fixed array and an appended run write their elements in order.
     // Other array representations write their length before the elements.
     if (starts && expected && expected->kind == TY_ARRAY && !IsArrayKind(expected, A_FIXED)) {

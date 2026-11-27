@@ -154,7 +154,42 @@ fn resize_with_fill() {
     assert(calls == 1 && other.len == 1 && list.values[2] == 33 && list.focus .== list.values[1]);
 }
 
+fn clear_node(node: Node&) { node.next .= null; }
+
+fn clear_link(i: i64) {
+    var nodes: Node[>..] = [Node {}, Node {}, Node {}];
+    nodes[i].next .= nodes[2];
+    let alias .= nodes;
+    assert(alias[i].next .== nodes[2]);
+    alias[i].next .= null;
+    nodes[i] = Node { next: nodes[2] };
+    clear_node(nodes[i]);
+    nodes[i].next .= { nodes[2] };
+    { defer alias[i].next .= null; }
+    nodes.pop_n(1);
+    assert(nodes[i].next == null);
+    let change .= i;
+    change = 1;
+}
+
+fn deferred_clear(i: i64) {
+    var nodes: Node[>..] = [Node {}, Node {}, Node {}];
+    nodes[i].next .= nodes[2];
+    {
+        defer {
+            nodes[i].next .= null;
+            let change .= i;
+            change = 1;
+        }
+    }
+    nodes.pop_n(1);
+    assert(nodes[0].next == null);
+}
+
 fn main() {
+    deferred_clear(0);
+    clear_link(0);
+    clear_link(1);
     resize_with_fill();
     extend();
     appended_link(1);

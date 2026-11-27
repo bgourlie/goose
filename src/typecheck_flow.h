@@ -2437,8 +2437,15 @@ inline vector<TypeCheck::DeferBinding> TypeCheck::DeferBindings(Defer *d) {
     vector<DeferBinding> bindings;
     auto visit = [&](auto &&self, VarDef *v) -> void {
         if (!v || v->isglobal || !seen.insert(v).second) return;
-        if (v->type && HoldsPlainRef(v->type))
-            bindings.push_back({ EnvReadOf(v), cur.links.GetTarget(LinkFlow::BindingKey(v)) });
+        if (v->type && (HoldsPlainRef(v->type) || (!v->isvar && IsIntT(v->type))))
+            bindings.push_back({ EnvReadOf(v), cur.links.GetTarget(LinkFlow::BindingKey(v)),
+                                 cur.links.borrowedindices.count(v) != 0 });
+        // A captured element reference also depends on the integer that
+        // selected its slot, even when the defer never names the index.
+        if (v->refplace.indexed.array) {
+            self(self, v->refplace.indexed.array->base);
+            self(self, v->refplace.indexed.element->base);
+        }
         self(self, v->heldholder);
         self(self, v->heldslice);
         for (auto &a : v->ref.alts) self(self, a.root);
@@ -2467,6 +2474,7 @@ inline TypeCheck::DeferEffects TypeCheck::CheckDeferredBody(Defer *d) {
         Saved collecting(cur.deferring, &effects);
         Saved<Rebuild *> active(cur.rebuild, nullptr); // Checked now, executed on scope exit.
         cur.links = {};
+        cur.links.borrowedindices = saved.links.borrowedindices;
         // A defer starts with its captured bindings. Its summary contains
         // only stores made by the body, even when earlier stores reach it.
         for (auto &e : saved.locals) cur.links.CopyBindingTarget(e.var, saved.links);
@@ -2495,7 +2503,8 @@ inline void TypeCheck::RefreshDeferredBody(DeferEffects &effects) {
             auto &r = binding.read;
             return r.ref != r.var->ref || r.contents != r.var->contents ||
                    r.slotref != r.var->slotref || r.refplace != r.var->refplace ||
-                   binding.target != cur.links.GetTarget(LinkFlow::BindingKey(r.var));
+                   binding.target != cur.links.GetTarget(LinkFlow::BindingKey(r.var)) ||
+                   binding.borrowedindex != (cur.links.borrowedindices.count(r.var) != 0);
         })) return;
     auto exit = SaveFlow();
     {
@@ -2510,6 +2519,7 @@ inline void TypeCheck::RefreshDeferredBody(DeferEffects &effects) {
         Saved ps(cur.nodepath, env->path);
         scopes.back().defers.resize(env->ndefers);
         RestoreFlow(env->entry);
+        cur.links.borrowedindices = exit.links.borrowedindices;
         // The declarations and narrowing are those at registration. The
         // references those declarations hold are the ones on this exit.
         for (auto &e : exit.locals) {
@@ -2545,8 +2555,9 @@ inline void TypeCheck::ApplyLinkEffects(const LinkEffects &effects) {
     for (auto &[part, write] : effects.writes.live) {
         storeevents.push_back(storeevents[write.at]);
         storeevents.back().boundfield = part.boundfield;
-        cur.links.Add(storeevents.back(), storeevents.size() - 1, write);
+        cur.links.Add(storeevents.back(), storeevents.size() - 1, write, part.indexed);
     }
+    cur.links.borrowedindices.insert(effects.writes.borrowedindices.begin(), effects.writes.borrowedindices.end());
     for (auto &[v, fact] : effects.writes.prefixes.arrays) cur.links.prefixes.Establish(v, fact);
 }
 
@@ -3664,7 +3675,9 @@ inline void TypeCheck::CheckRebind(Assign *a, LVal &lv) {
             a->rhs = AutoRef(a->rhs, v, !target->cq);
         }
         wasplain = IsPlainRef(v.type);
-        if (IsSelfRelRef(target)) curdst.backwardlink = BackwardElementRebind(a->lval, a->rhs);
+        if (IsSelfRelRef(target)) {
+            curdst.backwardlink = BackwardElementRebind(a->lval, a->rhs);
+        }
         MustFit(v, a->rhs, target);
     }
     a->rhs->exprtype = v.type;

@@ -936,6 +936,17 @@ struct PlacePaths {
     }
 };
 
+// An indexed location can coincide with a later access if the same integer
+// binding still holds its value. Different indices do not prove disjointness.
+struct IndexedSlot {
+    const LinkField *array = nullptr;
+    const LinkField *element = nullptr; // Index binding plus the inline path within the element.
+    template<typename F> bool DependsOn(F matches) const {
+        return array && (matches(array->base) || matches(element->base));
+    }
+    auto operator<=>(const IndexedSlot &) const = default;
+};
+
 // A storage location. A field path can name the slot itself or a field
 // containing it, e.g. the array when the slot is one of its elements.
 struct RefPlace {
@@ -946,6 +957,8 @@ struct RefPlace {
     WriteRegions regions;
     const LinkField *bound = nullptr; // The same place or a containing field, relative to an immutable binding.
 
+    IndexedSlot indexed;
+
     VarDef *Base() const { return fields.Cover().base; }
     string_view Path() const { return fields.Cover().Path(); }
     bool Enclosing() const { return fields.Cover().enclosing; }
@@ -953,11 +966,13 @@ struct RefPlace {
     void ForgetBound() { bound = nullptr; boundenclosing = false; }
     void Project(PlacePool &pool, string_view step) {
         fields = fields.Project(pool, step, false, ".");
+        indexed.element = pool.Project(indexed.element, step, ".");
         if (!boundenclosing) bound = pool.Project(bound, step, ".");
     }
     RefPlace Inside(PlacePool &pool, bool intail = false) const {
         auto part = *this;
         part.fields = fields.Project(pool, {}, true);
+        part.indexed = {};
         part.boundenclosing = bound != nullptr;
         part.location.intail |= intail;
         return part;
@@ -967,6 +982,7 @@ struct RefPlace {
     // this place. Region alternatives prove a fact only as a complete set.
     template<typename F> RefPlace StorageInScope(F keep) const {
         auto part = *this;
+        if (indexed.DependsOn([&](VarDef *v) { return !keep(v); })) part.indexed = {};
         if (location.param && !keep(location.param)) part.location.param = nullptr;
         for (auto r : regions.All()) if (!keep(r.owner)) {
             part.regions = {};
@@ -986,6 +1002,7 @@ struct RefPlace {
         if (other.nullonly) return *this;
         RefPlace common;
         common.location.intail = location.intail && other.location.intail;
+        if (indexed == other.indexed) common.indexed = indexed;
         if (location.param == other.location.param) common.location.param = location.param;
         common.regions = regions.Join(other.regions, pool.regions);
         if (bound == other.bound) {
@@ -2366,6 +2383,7 @@ struct VarDef {
     int globalindex = 0;
     bool isparam = false;
     // An immutable reference selected from a grow-only array at declaration.
+    VarDef *subscript = nullptr; // Synthetic element binding for relative overwrite paths.
     VarDef *elementorigin = nullptr; // The original binding, including through let aliases.
     const LinkField *elementarray = nullptr;
     int elementdecl = -1; // Its position among active locals.

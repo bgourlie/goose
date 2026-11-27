@@ -929,11 +929,42 @@ inline void TypeCheck::CheckAccessorOwner(Node *at, TypeExpr *owner, TypeExpr *t
         Error(at, cat("const for accessor belongs to ", TypeStr(owner), ", not ", TypeStr(t)));
 }
 
+// The field path of an indexed overwrite uses the element as its base.
+// Its binding is shared by accesses to the same evaluated array and index.
+inline VarDef *TypeCheck::IndexedBinding(IndexedSlot slot) {
+    auto index = slot.element->base;
+    auto &binding = indexedelements[{ slot.array, index }];
+    if (!binding) {
+        binding = ast.NewVarDef();
+        auto array = FieldPathType(slot.array->base, slot.array->path);
+        binding->type = array->arr->sub;
+        binding->subscript = index;
+        binding->elementarray = slot.array;
+        binding->depth = std::max(Depth(index), Depth(slot.array->base));
+        binding->ownerspec = index->ownerspec;
+    }
+    return binding;
+}
+
+inline CountProof TypeCheck::SameIndexedElement(VarDef *index) {
+    if (index->type->cq) return true;
+    if (!index->isglobal && !index->captured && index->ownerspec == CurRealFrame().spec &&
+        !cur.links.borrowedindices.count(index)) return true;
+    return CountProof::IfUnchanged(ast.countconditions, index);
+}
+
 // A slice can start anywhere in its backing array. Its subscript alone
 // cannot identify the absolute slot, even when the subscript is constant.
 inline RefPlace TypeCheck::IndexedPlace(RefPlace place, TypeExpr *sequence, const Index *ix) {
     auto intail = IsArrayKind(sequence, A_GROW);
-    if (sequence->kind != TY_ARRAY || ix->constantindex < 0) return place.Inside(ast.places, intail);
+    if (sequence->kind != TY_ARRAY || ix->constantindex < 0) {
+        auto part = place.Inside(ast.places, intail);
+        auto id = Is<Ident>(ix->idx);
+        if (ix->arrayheader && id && id->vdef && !id->vdef->isvar && IsIntT(id->vdef->type) &&
+            sequence->kind == TY_ARRAY && HasRelRefT(sequence->arr->sub))
+            part.indexed = { ix->arrayheader, ast.places.Bound(id->vdef) };
+        return part;
+    }
     place.Project(ast.places, cat("[", ix->constantindex, "]"));
     place.location.intail |= intail;
     return place;
@@ -1916,6 +1947,8 @@ inline void TypeCheck::NoteWritableRef(VarDef *d, Node *at) {
     // Selecting an overload can check an operand the winning call never
     // evaluates. Its binding-wide obligations are committed on evaluation.
     if (ProbedBinding(d)) return;
+    if (reachable && !cur.probingtypes && !d->isvar && d->type && IsIntT(d->type))
+        cur.links.borrowedindices.insert(d);
     if (!d->refwrite) d->refwrite = at;
     if (d->nonneguse)
         Error(at, cat(d->name, " is bound to a writable reference here, through which it may "
@@ -3568,6 +3601,8 @@ inline TypeCheck::LitDeep TypeCheck::CheckInits(StructLit *sl, vector<Field> &fi
         auto component = selft->kind == TY_STRUCT && selft->struc->st->isroot
                              ? RootComponent(rootowner, selft, sl->fieldindices[k]) : nullptr;
         DestScope ds(*this, component ? Dest(component) : curdst);
+        if (selft->kind == TY_STRUCT) curdst.indexed.element = ast.places.Project(curdst.indexed.element, fi.name, ".");
+        else curdst.indexed = {};
         curdst.fieldsteps &= selft->kind == TY_STRUCT;
         curdst.boundsteps &= selft->kind == TY_STRUCT;
         if (curdst.boundsteps) curdst.boundfield = ast.places.Project(curdst.boundfield, fi.name, ".");

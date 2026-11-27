@@ -3925,6 +3925,7 @@ inline RefPlace TypeCheck::CallerPlace(RefPlace place, FnSpec *spec, span<const 
         if (mapped.All().empty()) break;
     }
     place.regions = mapped;
+    if (place.indexed.DependsOn([&](VarDef *v) { return v->ownerspec == spec; })) place.indexed = {};
     if (place.bound && place.bound->base->ownerspec == spec) place.ForgetBound();
     if (auto p = place.location.param; p && p->ownerspec == spec) {
         auto loc = ArgumentPlace(spec, p, args).location;
@@ -3935,6 +3936,8 @@ inline RefPlace TypeCheck::CallerPlace(RefPlace place, FnSpec *spec, span<const 
         if (!actual.boundenclosing) actual.bound = ast.places.Project(actual.bound, place.Path());
         actual.boundenclosing |= actual.bound && place.Enclosing();
         actual.fields = actual.fields.Project(ast.places, place.Path(), place.Enclosing());
+        if (place.Enclosing()) actual.indexed = {};
+        else actual.indexed.element = ast.places.Project(actual.indexed.element, place.Path());
         actual.location = place.location;
         actual.regions = mapped;
         return actual;
@@ -4606,6 +4609,7 @@ inline void TypeCheck::ApplyRelativeStore(Node *call, FnSpec *spec, vector<Val> 
         }
         if (dest.fieldsteps) dest.field.path += s.field;
         if (dest.boundsteps) dest.boundfield = ast.places.Project(dest.boundfield, s.field);
+        dest.indexed.element = ast.places.Project(dest.indexed.element, s.field);
         dest.discarded |= !survives;
     }
     dest.place.intail |= s.intail;

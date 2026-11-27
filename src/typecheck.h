@@ -303,6 +303,7 @@ struct TypeCheck {
             int summary;
             LinkField target;
             const LinkField *boundfield;
+            IndexedSlot indexed;
             auto operator<=>(const Part &) const = default;
             auto operator<=>(VarDef *v) const { return std::compare_three_way {}(owner, v); }
         };
@@ -315,6 +316,8 @@ struct TypeCheck {
             }
         };
         map<Part, Write, std::less<>> live;
+        // Integer bindings whose address may already have escaped on this path.
+        set<VarDef *> borrowedindices;
         LimitedPrefixes prefixes;
         // Evaluated references, reference bindings and ranges of slice elements.
         using Target = variant<Node *, VarDef *, pair<Node *, size_t>, SliceElements>;
@@ -382,9 +385,9 @@ struct TypeCheck {
             }
         };
         map<ArrayLit *, FillLinks> fills;
-        void Add(const StoreEvent &e, size_t index, FnRecord::LinkState state = {}) {
+        void Add(const StoreEvent &e, size_t index, FnRecord::LinkState state = {}, IndexedSlot indexed = {}) {
             if (state.cleared.Committed()) return;
-            Part part { e.container, e.elementlink, e.storefield, e.linkclass, e.linktarget, e.boundfield };
+            Part part { e.container, e.elementlink, e.storefield, e.linkclass, e.linktarget, e.boundfield, indexed };
             Write write { state, index };
             auto [it, added] = live.try_emplace(std::move(part), write);
             if (!added) it->second.Include(write);
@@ -392,6 +395,7 @@ struct TypeCheck {
         // Once a binding expires, its outstanding writes still belong to
         // the enclosing field. A fresh iteration can bind a different slot.
         template<typename F> void ForgetBindings(F expired) {
+            erase_if(borrowedindices, expired);
             erase_if(targets, [&](const auto &p) {
                 auto var = get_if<VarDef *>(&p.first);
                 if (auto slice = get_if<SliceElements>(&p.first)) var = get_if<VarDef *>(&slice->of);
@@ -399,17 +403,21 @@ struct TypeCheck {
             });
             for (auto it = live.begin(); it != live.end();) {
                 auto field = it->first.boundfield;
-                if (!field || !expired(field->base)) {
+                auto forgetfield = field && expired(field->base);
+                auto forgetindex = it->first.indexed.DependsOn(expired);
+                if (!forgetfield && !forgetindex) {
                     ++it;
                     continue;
                 }
                 auto entry = live.extract(it++);
-                entry.key().boundfield = nullptr;
+                if (forgetfield) entry.key().boundfield = nullptr;
+                if (forgetindex) entry.key().indexed = {};
                 auto merged = live.insert(std::move(entry));
                 if (!merged.inserted) merged.position->second.Include(merged.node.mapped());
             }
         }
         void Join(const LinkFlow &other) {
+            borrowedindices.insert(other.borrowedindices.begin(), other.borrowedindices.end());
             prefixes.Join(other.prefixes);
             for (auto it = targets.begin(); it != targets.end();) {
                 auto p = other.targets.find(it->first);
@@ -432,7 +440,7 @@ struct TypeCheck {
         }
         // Loop convergence depends on the possible writes, not event numbers.
         bool operator==(const LinkFlow &o) const {
-            return prefixes == o.prefixes && targets == o.targets && fills == o.fills &&
+            return borrowedindices == o.borrowedindices && prefixes == o.prefixes && targets == o.targets && fills == o.fills &&
                    RelativeStore::SameSet(resultlinks, o.resultlinks) && live.size() == o.live.size() &&
                    equal(live.begin(), live.end(), o.live.begin(),
                          [](const auto &a, const auto &b) {
@@ -442,7 +450,8 @@ struct TypeCheck {
     };
     struct FlowState {
         LinkFlow links;
-        small_vector<FlowEntry, 16> locals;
+        // Call entry snapshots stay on the native stack while checking callees.
+        small_vector<FlowEntry, 4> locals;
         // The narrowed globals only, in ast.globals order: the others are
         // not narrowed.
         vector<pair<VarDef *, TypeExpr *>> globals;
@@ -479,6 +488,7 @@ struct TypeCheck {
     // where the storage the value lands in may be (an lvalue's roots).
     struct Dest {
         LinkLocation place;
+        IndexedSlot indexed;
         LinkField field;
         const LinkField *boundfield = nullptr;
         bool fieldsteps = true;  // False when only the enclosing storage is known.
@@ -514,6 +524,7 @@ struct TypeCheck {
             : roots(r), varbind(vb), reached(re), unknown(r.None()) {}
         Dest(const Prov &storage, const RefPlace &part)
             : Dest(storage, false, storage.reached) {
+            indexed = part.indexed;
             place = part.location;
             field = { part.Base(), string(part.Path()) };
             boundfield = part.bound;
@@ -671,6 +682,7 @@ struct TypeCheck {
     struct DeferBinding {
         EnvRead read;
         LiveTarget target;
+        bool borrowedindex;
     };
     // A defer sees its original declarations and the bindings at execution.
     struct DeferEnv {
@@ -2177,6 +2189,9 @@ struct TypeCheck {
     Val ContainerRead(LVal lv);
     void CheckAccessorOwner(Node *at, TypeExpr *owner, TypeExpr *t, StructLit *lit = nullptr);
     void ResolveMemberLValue(LVal &lv, Dot *d);
+    map<pair<const LinkField *, VarDef *>, VarDef *> indexedelements;
+    VarDef *IndexedBinding(IndexedSlot slot);
+    CountProof SameIndexedElement(VarDef *index);
     RefPlace IndexedPlace(RefPlace place, TypeExpr *sequence, const Index *ix);
     void ProjectField(Prov &storage, RefPlace &place, TypeExpr *owner, const FieldRun &fields, size_t i);
     // Where a holder value's references point: what was derived for it, else
@@ -3042,6 +3057,7 @@ struct TypeCheck {
     // in force empty every slot of a `t` at `base` in container c that can
     // hold a view into an `arr`'s elements, since which event.
     bool KillPath(Node *n, VarDef *&base, string &path);
+    std::optional<Kill> IndexedOverwrite(const RefPlace &place, const Roots &loc, TypeExpr *target, size_t at);
     std::optional<Kill> OverwrittenPart(Node *n, const Roots &loc, TypeExpr *target,
                                         size_t at, const RefPlace *place);
     RefPlace StoragePlace(const Roots &roots, TypeExpr *target, RefPlace place);
@@ -3109,21 +3125,25 @@ struct TypeCheck {
         erase_if(cur.kills, [&](const Kill &k) { return k.container == container && !k.relative; });
     }
     void ForgetOwner(VarDef *v) {
+        cur.links.borrowedindices.erase(v);
         // A local alias can write or empty storage owned by an outer scope.
         auto [first, last] = cur.links.live.equal_range(v);
         cur.links.live.erase(first, last);
-        erase_if(cur.kills, [&](const Kill &k) { return k.container == v; });
+        erase_if(cur.kills, [&](const Kill &k) {
+            return k.container == v || (k.relative && k.base && k.base->subscript &&
+                (k.base->subscript == v || k.base->elementarray->base == v));
+        });
         cur.links.DropPrefixes([&](VarDef *prefix) { return prefix == v; });
         cur.links.prefixes.Forget([&](VarDef *prefix) { return prefix == v; });
         cur.links.targets.erase(v);
         cur.links.targets.erase(SliceElements { v });
+        if (!cur.links.live.empty()) cur.links.ForgetBindings([&](VarDef *base) { return base == v; });
         if (!v->type || v->isvar || !IsAddressRef(v->type)) return;
-        cur.links.ForgetBindings([&](VarDef *base) { return base == v; });
         erase_if(cur.kills, [&](const Kill &k) { return k.relative && k.base == v; });
     }
     void ForgetLocal(VarDef *v) {
         if (cur.links.live.empty() && cur.links.targets.empty() && cur.links.prefixes.arrays.empty() &&
-            cur.links.fills.empty() && cur.kills.empty()) return;
+            cur.links.fills.empty() && cur.links.borrowedindices.empty() && cur.kills.empty()) return;
         ForgetOwner(v);
         for (auto c : v->components) if (c) ForgetLocal(c);
     }
@@ -3153,7 +3173,7 @@ struct TypeCheck {
     void FinishFill(ArrayLit *fill, const Dest &dest);
     void RecordLinkStore(const Roots &owners, TypeExpr *reached, ElementLink link, Node *at,
                          LinkLocation place = {}, const LinkField &field = {}, const LinkField &target = {},
-                         const LinkField *boundfield = nullptr, FnRecord::LinkState state = {});
+                         const LinkField *boundfield = nullptr, FnRecord::LinkState state = {}, IndexedSlot indexed = {});
     void NoteSlotStore(const StoreEvent &e);
     // How NeverStoredError words a grow-shrink array `gs` a value pointing at
     // `roots` may point into: as the array itself where it is the value's one

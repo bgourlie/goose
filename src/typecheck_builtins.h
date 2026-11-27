@@ -1802,11 +1802,21 @@ inline RefPlace TypeCheck::StoragePlace(const Roots &roots, TypeExpr *target, Re
     return place;
 }
 
+inline std::optional<TypeCheck::Kill> TypeCheck::IndexedOverwrite(const RefPlace &place, const Roots &loc,
+                                                                   TypeExpr *target, size_t at) {
+    if (!place.indexed.array || !loc.Exact()) return {};
+    Kill kill { loc.Root(), IndexedBinding(place.indexed), place.indexed.element->path, at, true };
+    if (!KillNamesType(kill, target)) return {};
+    kill.guard = SameIndexedElement(kill.base->subscript);
+    return kill;
+}
+
 inline std::optional<TypeCheck::Kill> TypeCheck::OverwrittenPart(Node *n, const Roots &loc,
                                         TypeExpr *target, size_t at, const RefPlace *place) {
     if (place) {
         auto part = StoragePlace(loc, target, *place);
-        if (!part.Base() || (part.Enclosing() && (!part.bound || part.boundenclosing))) return {};
+        if (!part.Base() || (part.Enclosing() && (!part.bound || part.boundenclosing)))
+            return IndexedOverwrite(part, loc, target, at);
         Kill kill { loc.Root(), part.Enclosing() ? part.bound->base : part.Base(),
                     part.Enclosing() ? part.bound->path : string(part.Path()), at, true };
         // A reference field names its slot. An overwrite through it affects its pointee.
@@ -1874,7 +1884,13 @@ inline void TypeCheck::NoteOverwrite(Node *lval, const Roots &loc, size_t at, Ty
     if (!reachable) return;
     auto kill = OverwrittenPart(lval, loc, target, at, place);
     if (!kill || (!kill->relative && (kill->container->isglobal || kill->base->isglobal))) return;
-    kill->guard = guard;
+    if (place && place->indexed.array && !kill->base->subscript) {
+        if (auto indexed = IndexedOverwrite(*place, loc, target, at)) {
+            indexed->guard = indexed->guard.Both(guard);
+            NoteOverwrite(std::move(*indexed), target, value);
+        }
+    }
+    kill->guard = kill->guard.Both(guard);
     NoteOverwrite(std::move(*kill), target, value);
 }
 
@@ -2065,6 +2081,18 @@ inline void TypeCheck::NoteOverwrite(Kill kill, TypeExpr *target, Node *value) {
 // value or effects after construction can install links that survive.
 inline void TypeCheck::ApplyLinkKill(const Kill &k) {
     if (cur.links.live.empty()) return;
+    if (auto index = k.base ? k.base->subscript : nullptr) {
+        // Same integer binding, same array, same inline path. The guarantee
+        // is replayed on deferred exits and at call sites just like a field overwrite.
+        if (k.prefixonly) return;
+        auto guard = k.guard.Both(SameIndexedElement(index));
+        if (!guard.Available()) return;
+        for (auto &[part, write] : cur.links.live)
+            if (part.owner == k.container && write.at < k.at && part.indexed.array == k.base->elementarray &&
+                part.indexed.element && part.indexed.element->Within(index, k.path))
+                write.cleared = write.cleared.Prefer(guard);
+        return;
+    }
     if (k.prefixonly) {
         // Record the condition on each incoming write in this execution
         // context, including caller and unwind state replaying this effect.
@@ -2694,7 +2722,10 @@ inline void TypeCheck::StoreElementLink(const Dest &dest, TypeExpr *type, Elemen
     auto cleared = link.cleared;
     link.cleared = false;
     auto bound = dest.boundsteps ? ast.places.Project(dest.boundfield, path) : dest.boundfield;
-    RecordLinkStore(dest.roots, reached, link, at, dest.place, field, target, bound, { suffix, liveprefix, cleared });
+    auto indexed = dest.indexed;
+    indexed.element = ast.places.Project(indexed.element, path);
+    RecordLinkStore(dest.roots, reached, link, at, dest.place, field, target, bound,
+                    { suffix, liveprefix, cleared }, indexed);
 }
 
 inline void TypeCheck::FinishFill(ArrayLit *fill, const Dest &dest) {
@@ -2717,7 +2748,7 @@ inline LinkField TypeCheck::StoredField(const LinkField &field, const Roots &own
 inline void TypeCheck::RecordLinkStore(const Roots &owners, TypeExpr *reached,
                                       ElementLink link, Node *at, LinkLocation place, const LinkField &field,
                                       const LinkField &target, const LinkField *boundfield,
-                                      FnRecord::LinkState state) {
+                                      FnRecord::LinkState state, IndexedSlot indexed) {
     if (!reachable || cur.probingtypes || owners.None()) return;
     link.intail |= place.intail;
     for (auto &d : ShrinkTargets(owners, reached, false)) {
@@ -2740,7 +2771,8 @@ inline void TypeCheck::RecordLinkStore(const Roots &owners, TypeExpr *reached,
         auto write = state;
         if (!e.storefield.base) write.suffix.reset();
         if (d.bound || !owners.Exact() || d.root != owners.Root()) write.liveprefix = nullptr;
-        cur.links.Add(storeevents.back(), index, write);
+        cur.links.Add(storeevents.back(), index, write,
+                      owners.Exact() && !d.bound && owners.Root() == d.root ? indexed : IndexedSlot {});
     }
 }
 
@@ -4961,12 +4993,21 @@ inline void TypeCheck::ApplyCalleeShrinks(Node *at, FnSpec *spec, vector<Val> &a
     auto argkill = [&](const FnRecord::CallerKill &k, bool permanent) {
         auto mapped = mapkill(k);
         if (!mapped) return;
-        auto &kill = *mapped;
-        kill.prefixonly = k.prefixonly;
-        kill.guard = k.guard;
-        if (permanent) erase_if(cur.kills, [&](const Kill &old) { return old.SamePart(kill); });
-        cur.kills.push_back(std::move(kill));
-        if (k.relative) ApplyLinkKill(cur.kills.back());
+        auto apply = [&](Kill kill) {
+            kill.prefixonly = k.prefixonly;
+            kill.guard = kill.guard.Both(k.guard);
+            if (permanent) erase_if(cur.kills, [&](const Kill &old) { return old.SamePart(kill); });
+            cur.kills.push_back(std::move(kill));
+            if (k.relative) ApplyLinkKill(cur.kills.back());
+        };
+        if (k.relative && !k.external && !mapped->base->subscript && (size_t)k.param < argvals.size()) {
+            auto &arg = argvals[k.param];
+            if (auto indexed = IndexedOverwrite(arg.refplace, arg, spec->params[k.param]->type->ref->sub, storesbase)) {
+                indexed->path += k.path;
+                apply(std::move(*indexed));
+            }
+        }
+        apply(std::move(*mapped));
     };
     auto entrylinks = cur.links;
     // Link stores and guaranteed overwrites describe two separate effects:
