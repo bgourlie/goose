@@ -68,7 +68,33 @@ fn through_parameters(first: bool) -> Node[..] {
     return nodes;
 }
 
+fn mutable_target(rebind: bool) -> Node[..] {
+    var nodes: Node[..] = [Node {}; 4];
+    nodes.pop_n(1);
+    var last .= nodes[1];
+    if rebind { last .= nodes[2]; }
+    nodes[0].next .= last;
+    return nodes;
+}
+
+fn first_arg(n: Node&, ignored: i64) -> Node& { n }
+fn evaluated_target() -> Node[..] {
+    var nodes: Node[..] = [Node {}; 3];
+    let stale .= nodes[2];
+    nodes.pop_n(1);
+    var last .= nodes[1];
+    nodes[0].next .= first_arg(last, block { last .= stale; 0 });
+    return nodes;
+}
+
 fn main() {
+    let evaluated: Node[] = evaluated_target();
+    assert(evaluated[0].next .== evaluated[1]);
+    for rebind in [false, true] {
+        let nodes: Node[] = mutable_target(rebind);
+        if rebind { assert(nodes[0].next .== nodes[2]); }
+        else { assert(nodes[0].next .== nodes[1]); }
+    }
     for first in [true, false] {
         let nodes: Node[] = through_parameters(first);
         assert(nodes[0].next .== nodes[1]);

@@ -702,7 +702,8 @@ struct Prov : Roots {
 };
 
 // A relative link built into a newly appended element can reach only existing
-// storage. A decoded run or a rebind may also link into a later element.
+// storage. A link within its own element is likewise safe across a suffix
+// removal. A decoded run or any other rebind may reach a later element.
 enum ElementLinks { EL_NONE, EL_BACKWARD, EL_ANY };
 
 // The slot lies in a growable array element, or within the pointee of this

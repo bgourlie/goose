@@ -26,8 +26,8 @@ inline LiveTarget TypeCheck::LivePrefixTarget(Node *n, size_t result) {
     if (!n || cur.links.targets.empty()) return nullptr;
     if (auto u = Is<Unary>(n); u && u->op == T_BITAND) n = u->child;
     auto id = Is<Ident>(n);
-    auto it = cur.links.targets.find(id ? LinkFlow::Target(id->vdef) : ResultTarget(n, result));
-    return it == cur.links.targets.end() ? nullptr : it->second;
+    if (id && id->vdef && !id->vdef->isvar) return cur.links.GetTarget(id->vdef);
+    return cur.links.GetTarget(ResultTarget(n, result));
 }
 
 // The result denotes the same storage as its source on this path. Record it
@@ -52,8 +52,22 @@ inline Roots TypeCheck::NonNullRefRoots(const Roots &roots, TypeExpr *type, bool
     return links;
 }
 
+// Save the evaluated reference. A later argument may rebind its variable,
+// while a shrink of the array must still invalidate both proofs.
+inline void TypeCheck::ReadBindingTarget(Ident *id) {
+    auto v = id->vdef;
+    if (!cur.links.targets.empty() && v->isvar && v->type && IsAddressRef(v->type))
+        cur.links.SetTarget(id, cur.links.GetTarget(v));
+}
+
+inline void TypeCheck::ForgetReboundTarget(VarDef *binding) {
+    if (!binding->isvar || binding->isglobal || !IsAddressRef(binding->type)) return;
+    cur.links.targets.erase(binding);
+    if (cur.deferring && reachable && !cur.probingtypes) cur.deferring->reboundtargets.insert(binding);
+}
+
 inline void TypeCheck::BindLiveTarget(VarDef *binding, Node *source, const Val &value, size_t result) {
-    if (binding->isglobal || binding->isvar || !IsAddressRef(binding->type)) return;
+    if (binding->isglobal || !IsAddressRef(binding->type)) return;
     auto prefix = value.isnull || value.refplace.nullonly ? LiveTarget::Null() : LivePrefixTarget(source, result);
     if (prefix.array) {
         auto roots = NonNullRefRoots(value, binding->type, value.writable);
@@ -130,6 +144,7 @@ inline TypeCheck::LVal TypeCheck::CheckLValue(Node *n, PathUse use) {
         // run, no path may start at it, whether it reads or writes.
         if (vd->isglobal) RequireAssigned(vd, n);
         id->vdef = vd;
+        ReadBindingTarget(id);
         LVal lv;
         lv.type = vd->narrowed ? vd->narrowed : vd->type;
         lv.var = vd;
@@ -204,6 +219,7 @@ inline TypeCheck::LVal TypeCheck::CheckLValue(Node *n, PathUse use) {
         lv.isvarint = elem->kind == TY_INT && elem->intstorage == IS_VARINT;
         n->exprtype = lv.type;
         RecordVal(n, ContainerRead(lv));
+        if (hasdefers) NoteStorageRead(n);
         return lv;
     }
     Error(n, "not an assignable location");
@@ -309,11 +325,7 @@ inline void TypeCheck::RequireAssigned(VarDef *vd, Node *at, string_view use) {
     if (failedglobals.count(vd)) throw Abandoned {};
     // A probe may use a declared type before a local or global has a value.
     // If a nested body depended on that read, check it again at an actual call.
-    if (vd->type && probebody >= 0 &&
-        (cur.probingtypes || vd->isglobal || vd->ownerspec != CurRealFrame().spec)) {
-        MarkProbeCallees();
-        return;
-    }
+    if (vd->type && ProbedBinding(vd)) return;
     auto order = vd->isglobal
                      ? cat(": globals initialize in declaration order, imported files first "
                            "(§11.1), so ", vd->name, " has no value until its initializer at ",
@@ -1652,7 +1664,7 @@ inline bool TypeCheck::FitsAt(Val &v, TypeExpr *dt, bool delivered, Node *conver
                     return false;
                 }
                 if (recordingrelative && !dt->ref->pool && !curdst.result) {
-                    ElementLink link { pointee, curdst.appended ? EL_BACKWARD : EL_ANY };
+                    ElementLink link { pointee, curdst.appended || curdst.sameelement ? EL_BACKWARD : EL_ANY };
                     auto prefix = LivePrefixTarget(fitnode);
                     if (prefix.array && (PrefixOwner(prefix.array) != have || have != want)) prefix = {};
                     StoreElementLink(curdst, dt, link, fitnode, links, {}, target, prefix);
@@ -1788,6 +1800,9 @@ inline Val TypeCheck::CheckRefOf(Unary *x) {
 // is an error (but for a resize, which is merely unbalanced after the
 // reference).
 inline void TypeCheck::NoteWritableRef(VarDef *d, Node *at) {
+    // Selecting an overload can check an operand the winning call never
+    // evaluates. Its binding-wide obligations are committed on evaluation.
+    if (ProbedBinding(d)) return;
     if (!d->refwrite) d->refwrite = at;
     if (d->nonneguse)
         Error(at, cat(d->name, " is bound to a writable reference here, through which it may "

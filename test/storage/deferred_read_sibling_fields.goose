@@ -20,7 +20,17 @@ fn replace(which: bool, stop: bool) {
     s.bag = Bag { tag: 8, xs: [2, if stop { return; } else { 3 }] };
 }
 
+struct Box { tag: i64, data: i64[>..<]& }
+fn indexed(stop: bool, i: i64) {
+    var xs: i64[>..<] = [1];
+    let boxes = [Box { tag: 7, data: xs }];
+    defer { assert(boxes[i].tag == 7); }
+    xs = [3, if stop { return; } else { 4 }];
+}
+
 fn main() {
+    indexed(true, 0);
+    indexed(false, 0);
     for which in [true, false] { replace(which, true); replace(which, false); }
     print("ok");
 }

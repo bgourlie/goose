@@ -2543,6 +2543,7 @@ inline void TypeCheck::RunExitDefers(int first, span<const FnRecord::Interrupted
                 reachable = false;
                 return;
             }
+            for (auto v : it->reboundtargets) ForgetReboundTarget(v);
             for (auto &[v, place] : it->bindings) v->refplace = place;
             ApplyLinkEffects(it->exit);
         }
@@ -2627,10 +2628,16 @@ inline void TypeCheck::NoteStorageRead(Node *n) {
     if (!reachable || cur.probingtypes) return;
     auto property = Is<Dot>(n);
     bool header = property && (property->member == B_LEN || property->member == B_CAP);
+    bool bounds = false;
     bool slotonly = header || cur.bindingread == n;
     if (cur.nodepath.size() > 1) {
         auto parent = cur.nodepath[cur.nodepath.size() - 2].node;
         if (auto d = Is<Dot>(parent); d && d->obj == n) return; // The complete path records the read.
+        if (auto ix = Is<Index>(parent); ix && ix->obj == n) {
+            // The subscript needs the sequence bounds. The completed path
+            // records what is read from the selected element.
+            bounds = slotonly = true;
+        }
         if (auto a = Is<Assign>(parent); a && a->lval == n) {
             slotonly |= a->op == T_DOTASSIGN || (a->op == T_ASSIGN && n->exprtype && n->exprtype->kind == TY_SLICE);
         } else if (auto b = Is<Binary>(parent)) {
@@ -2638,18 +2645,27 @@ inline void TypeCheck::NoteStorageRead(Node *n) {
             slotonly |= b->op == T_DOTEQ || b->op == T_DOTNEQ ||
                        ((b->op == T_EQ || b->op == T_NEQ) && Is<NullLit>(other));
         }
-        if (auto id = Is<Ident>(n); slotonly && id && id->vdef && id->vdef->type && IsRefOrSlice(id->vdef->type))
+        if (auto id = Is<Ident>(n); slotonly && !bounds && id && id->vdef && id->vdef->type && IsRefOrSlice(id->vdef->type))
             return;
     }
     auto base = n;
-    while (auto d = Is<Dot>(base)) base = d->obj;
+    small_vector<Node *, 4> steps;
+    while (Is<Dot>(base) || Is<Index>(base)) {
+        if (auto d = Is<Dot>(base)) {
+            if (d->fieldidx >= 0) steps.push_back(d);
+            base = d->obj;
+        } else {
+            steps.push_back(base);
+            base = Is<Index>(base)->obj;
+        }
+    }
     auto id = Is<Ident>(base);
     auto v = id ? id->vdef : nullptr;
     auto spec = CurRealFrame().spec;
     if (!v || !v->type || !spec) return;
     // A saved slice carries its own length, even if its elements are in
     // the object being replaced. A slice field's descriptor lives in its holder.
-    auto descriptor = header && property->obj == id && v->type->kind == TY_SLICE;
+    auto descriptor = ((bounds && n == id) || (header && property->obj == id)) && v->type->kind == TY_SLICE;
     auto ref = IsRefOrSlice(v->type) && !descriptor;
     if (!cur.deferring && !ref && !v->isglobal && v->ownerspec == spec) return;
     auto holder = ref ? PointeeOf(v->type) : v->type;
@@ -2674,10 +2690,7 @@ inline void TypeCheck::NoteStorageRead(Node *n) {
         }
     };
 
-    vector<Dot *> fields;
-    for (auto d = Is<Dot>(n); d; d = Is<Dot>(d->obj))
-        if (d->fieldidx >= 0) fields.push_back(d);
-    if (ClassOf(holder) == SC_ROOT && fields.empty()) {
+    if (ClassOf(holder) == SC_ROOT && steps.empty()) {
         // A bare root exposes all its independently owned components.
         auto inst = GetStructInst(holder);
         for (size_t i = 0; i < inst->ftypes.size(); i++) {
@@ -2690,17 +2703,28 @@ inline void TypeCheck::NoteStorageRead(Node *n) {
         return;
     }
     TypeExpr *field = nullptr;
-    for (auto it = fields.rbegin(); it != fields.rend(); ++it) {
-        auto t = field ? field : holder;
-        auto runs = FieldRuns(t);
-        if (runs.size() != 1) break;
-        auto i = (*it)->fieldidx;
-        ProjectField(storage, place, t, runs[0], i);
-        field = (*runs[0].ftypes)[i];
-        if (ClassOf(t) == SC_ROOT) holder = field;
+    for (size_t j = steps.size(); j-- > 0;) {
+        auto step = steps[j];
+        if (auto ix = Is<Index>(step)) {
+            auto seq = ix->obj->exprtype;
+            if (!seq) break;
+            if (IsPlainRef(seq)) seq = seq->ref->sub;
+            if (seq->kind != TY_ARRAY && seq->kind != TY_SLICE) break;
+            field = seq->kind == TY_SLICE ? seq->sub : seq->arr->sub;
+            place = place.Inside(ast.places, IsArrayKind(seq, A_GROW));
+        } else {
+            auto t = field ? field : holder;
+            auto runs = FieldRuns(t);
+            if (runs.size() != 1) break;
+            auto i = Is<Dot>(step)->fieldidx;
+            ProjectField(storage, place, t, runs[0], i);
+            field = (*runs[0].ftypes)[i];
+            if (ClassOf(t) == SC_ROOT) holder = field;
+        }
         if (IsRefOrSlice(field)) {
-            // A reference on the way to a destination must be followed to locate its final slot.
-            if (*it != n && !(header && *it == property->obj && field->kind == TY_SLICE)) slotonly = false;
+            // Indexing through a stored reference also reads its pointee.
+            if ((bounds && field->kind == TY_REF) ||
+                (step != n && !(header && step == property->obj && field->kind == TY_SLICE))) slotonly = false;
             break;
         }
     }
@@ -2862,6 +2886,7 @@ inline void TypeCheck::ApplyCalleeWrites(FnSpec *spec, const vector<Val> &args) 
     }
     auto rec = RecordOf(spec);
     if (!rec) return;
+    for (auto &[v, binding] : rec->reboundplaces) ForgetReboundTarget(v);
     for (auto &w : rec->storagewrites) {
         auto roots = MapClass(spec, w.root, args);
         // Several formals can share a lifetime class. Only narrow the
@@ -3559,13 +3584,18 @@ inline void TypeCheck::CheckRebind(Assign *a, LVal &lv) {
         // explicit & is not redundant here as it is at a binding destination.
         SlotScope ss(*this, true);
         v = CheckV(a->rhs, target);
-        if (BindsRef(v, target)) a->rhs = AutoRef(a->rhs, v, !target->cq);
+        if (BindsRef(v, target)) {
+            a->rhs->exprtype = v.type;
+            a->rhs = AutoRef(a->rhs, v, !target->cq);
+        }
         wasplain = IsPlainRef(v.type);
+        if (IsSelfRelRef(target)) curdst.sameelement = SameElementRebind(a->lval, a->rhs);
         MustFit(v, a->rhs, target);
     }
     a->rhs->exprtype = v.type;
     if (lv.var) {
         NoLetReassign(a, lv.var, "rebind", "bound");
+        ForgetReboundTarget(lv.var);
         BindLiveTarget(lv.var, a->rhs, v);
         if (!lv.var->refrootknown || lv.var->ref.Unknown()) BindRefProvenance(lv.var, v);
         else if (!v.isnull) CheckRefRebindRoot(a, lv.var, v);

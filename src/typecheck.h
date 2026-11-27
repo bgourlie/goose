@@ -309,10 +309,14 @@ struct TypeCheck {
             }
         };
         map<Part, Write, std::less<>> live;
-        // Successful index evaluations and immutable reference bindings known
+        // Successful index evaluations and reference bindings known
         // to address a live element of a particular limited array on this path.
         using Target = variant<Node *, VarDef *, pair<Node *, size_t>>;
         map<Target, LiveTarget> targets;
+        LiveTarget GetTarget(Target key) const {
+            auto it = targets.find(key);
+            return it == targets.end() ? LiveTarget() : it->second;
+        }
         void SetTarget(Target key, LiveTarget prefix) {
             if (prefix.Known()) targets[key] = prefix;
             else targets.erase(key);
@@ -484,6 +488,7 @@ struct TypeCheck {
         // A resize's fill value: built once and copied into each slot the
         // resize adds, so no position in the array is its own (§3.9).
         bool fill = false;
+        bool sameelement = false;    // A rebind between inline locations in the same array element.
         bool appended = false;       // New elements at the end of a grow-only array.
         Construction *construction = nullptr;
         ArrayCountDest countdest = ArrayCountDest::Storage;
@@ -524,6 +529,7 @@ struct TypeCheck {
         vector<FnRecord::StorageRead> reads;
         vector<FnRecord::StorageWrite> writes;
         vector<pair<VarDef *, RefPlace>> bindings; // Captures rebound on normal completion.
+        set<VarDef *> reboundtargets; // A rebind can change the element even at the same field path.
         vector<pair<LinkShrink, LinkEffects>> shrinks;
         LinkEffects exit;
         bool completes = true;
@@ -2108,6 +2114,8 @@ struct TypeCheck {
     LiveTarget LivePrefixTarget(Node *n, size_t result = 0);
     void ForwardLiveTarget(Node *result, Node *source, const Val *value = nullptr);
     Roots NonNullRefRoots(const Roots &roots, TypeExpr *type, bool writable);
+    void ReadBindingTarget(Ident *id);
+    void ForgetReboundTarget(VarDef *binding);
     void BindLiveTarget(VarDef *binding, Node *source, const Val &value, size_t result = 0);
     void NoteLiveElement(LinkFlow::Target key, const Roots &roots, const RefPlace &place, TypeExpr *array);
     LiveTarget ArgumentLiveTarget(FnSpec *spec, span<Node *const> argnodes, VarDef *base, VarDef *owner);
@@ -2927,7 +2935,8 @@ struct TypeCheck {
     // Builtins (§3.7, §9.3, §11.2) and array members (§3.3, §5.4).
 
     Val CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> &args, Val *precv);
-    enum class SlotRemoval { None, Possible, All, NamedZeroPop, NamedZeroResize };
+    bool ReadOnlyResizeFill(Node *n);
+    enum class SlotRemoval { None, ToCapacity, Possible, All, NamedZeroPop, NamedZeroResize };
     SlotRemoval CountedRemoval(BuiltinKind op, const vector<Node *> &args, const Val &count, TypeExpr *array);
     void CheckByteOut(Call *c, Node *out, const string &form);
     // Later passes walk only the arguments that can execute. Overload
@@ -3208,6 +3217,7 @@ struct TypeCheck {
     enum class PathInterval { ConsecutiveReads, AcrossStatements };
     bool SamePath(Node *a, Node *b, PathInterval interval);
     bool SameIndexValue(Node *a, Node *b);
+    bool SameElementRebind(Node *slot, Node *value);
     // An array a shrink may free (§5.1, §5.2): the one in root's own storage,
     // or, where root cannot hold one, one its storage leads to through the
     // references it holds (`bound`: root only bounds that array's lifetime).
@@ -3378,6 +3388,11 @@ struct TypeCheck {
         if (probebody == (int)outerbodies.size()) return;
         for (auto &frame : frames)
             if (frame.bodyidx > probebody && frame.spec) provisionalspecs.insert(frame.spec);
+    }
+    bool ProbedBinding(VarDef *v) {
+        if (probebody < 0 || (!cur.probingtypes && !v->isglobal && v->ownerspec == CurRealFrame().spec)) return false;
+        MarkProbeCallees();
+        return true;
     }
     bool JumpLeavesProbe(int target) {
         if (probebody < 0) return false;

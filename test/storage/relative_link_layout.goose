@@ -49,7 +49,19 @@ fn entries() -> Entry[] {
     return xs;
 }
 
+struct Bucket { value: i64 = 7, owner: Bucket&<u32>?, selected: i64&<u32>? }
+fn same_element(i: i64) {
+    var nodes: Bucket[>..] = [Bucket {}, Bucket {}];
+    nodes[i].owner .= nodes[i];
+    nodes[i].selected .= nodes[i].value;
+    nodes.pop_n(1);
+    if i == 0 { assert(nodes[0].owner .== nodes[0] && nodes[0].selected .== nodes[0].value); }
+    else { assert(nodes[0].owner == null); }
+}
+
 fn main() {
+    same_element(0);
+    same_element(1);
     let converted: Node[] = as_limited();
     assert(converted.len == 2 && converted[0].next .== converted[1]);
     let pair: Node[] = forward_pair();

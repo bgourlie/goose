@@ -40,6 +40,8 @@ fn format(out: u8[>..]&, s: MaybeStop) {
 // still resolve it using all four original arguments.
 fn format(out: u8[>..]&, n: i64, s: Stop) { abort("wrong overload"); }
 fn format(out: u8[>..]&, s: Stop, other: MaybeStop) { abort("wrong overload"); }
+let format_count = 2;
+fn touch_count(n: i64&) -> i64 { n = 9; return n; }
 fn number(n: i64) -> i64 { n }
 fn stop_index() -> i64 { print(Stop {}); return 0; }
 
@@ -74,6 +76,11 @@ fn choose(mode: i64, flag: bool) -> i64 {
     if mode == 7 { format(out, 1, Stop {}, read_later()); }
     if mode == 8 { format(out, Stop {}, read_later()); }
     if mode == 9 { format(out, Stop {}, inferred_later() + 1); }
+    if mode == 10 {
+        let fixed: i64[format_count] = [11, 12];
+        format(out, Stop {}, touch_count(&format_count));
+        return fixed.len;
+    }
     let text = str(MaybeStop { stop: flag }, if flag { 1 } else { 2 });
     assert(text == "x2");
     return 42;
@@ -128,5 +135,6 @@ fn main() {
     assert(choose(5, true) == 7 && choose(5, false) == 42);
     assert(choose(6, true) == 7 && choose(6, false) == 7 && choose(7, false) == 7);
     assert(choose(8, false) == 7 && choose(9, false) == 7);
+    assert(choose(10, false) == 7);
     print("ok");
 }

@@ -11,7 +11,7 @@ namespace goose {
 
 // These expressions only read their operands. A call (including an implicit
 // constructor default) can run user code between reading the count and resizing.
-inline bool ReadOnlyResizeFill(Node *n) {
+inline bool TypeCheck::ReadOnlyResizeFill(Node *n) {
     if (Is<Ident>(n) || Is<IntLit>(n) || Is<FltLit>(n) || Is<BoolLit>(n) || Is<StrLit>(n) || Is<NullLit>(n))
         return true;
     if (auto u = Is<Unary>(n)) return ReadOnlyResizeFill(u->child);
@@ -26,15 +26,18 @@ inline bool ReadOnlyResizeFill(Node *n) {
                ReadOnlyResizeFill(cond->elseb);
     if (auto m = Is<MatchExpr>(n))
         return ReadOnlyResizeFill(m->scrutinee) && all_of(m->arms.begin(), m->arms.end(),
-            [](const MatchArm &arm) { return ReadOnlyResizeFill(arm.body); });
+            [&](const MatchArm &arm) { return ReadOnlyResizeFill(arm.body); });
     if (Is<StructLit>(n) || Is<ArrayLit>(n)) {
         // CheckInits has already installed every field default that will run.
         bool readonly = true;
         n->Children([&](Node *child) { readonly = readonly && ReadOnlyResizeFill(child); });
         return readonly;
     }
-    if (auto c = Is<Call>(n); c && c->builtin == B_DEFAULT)
-        return !c->defaultinit || ReadOnlyResizeFill(c->defaultinit);
+    if (auto c = Is<Call>(n)) {
+        if (c->builtin == B_DEFAULT) return !c->defaultinit || ReadOnlyResizeFill(c->defaultinit);
+        set<FnSpec *> visiting;
+        return InitOrderSafe(c, visiting);
+    }
     return false;
 }
 
@@ -42,11 +45,14 @@ inline bool ReadOnlyResizeFill(Node *n) {
 inline TypeCheck::SlotRemoval TypeCheck::CountedRemoval(BuiltinKind op, const vector<Node *> &args,
                                                         const Val &count, TypeExpr *array) {
     assert(op == B_POP_N || op == B_RESIZE);
-    auto len = Is<Dot>(args[1]);
-    if (len && len->member == B_LEN && SamePath(args[0], len->obj, PathInterval::ConsecutiveReads)) {
+    auto countprop = Is<Dot>(args[1]);
+    bool capacity = countprop && countprop->member == B_CAP && op == B_RESIZE && IsArrayKind(array, A_LIMITED);
+    if (countprop && (countprop->member == B_LEN || capacity) &&
+        SamePath(args[0], countprop->obj, PathInterval::ConsecutiveReads)) {
         if (op == B_POP_N) return SlotRemoval::All;
         // A fill can change the receiver after its length was read.
-        if (args.size() == 2 || ReadOnlyResizeFill(args[2])) return SlotRemoval::None;
+        if (args.size() == 2 || ReadOnlyResizeFill(args[2]))
+            return capacity ? SlotRemoval::ToCapacity : SlotRemoval::None;
     }
     int64_t lo, hi;
     if (!IntConsts(count, lo, hi) || lo != 0 || hi != 0) return SlotRemoval::Possible;
@@ -744,9 +750,17 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
     }
     // Record a write even if its count preserves every limited-array slot.
     if (d.flags & BF_WRITE) {
-        auto write = removal == SlotRemoval::None ? StorageWrite::Storage : StorageWrite::MayDropSlots;
+        auto preserves = removal == SlotRemoval::None || removal == SlotRemoval::ToCapacity;
+        auto write = preserves ? StorageWrite::Storage : StorageWrite::MayDropSlots;
         NoteStorageWrite(rv, recvarr, rv.refplace, reachable || writesduringargs, write,
                          removal == SlotRemoval::NamedZeroPop && ak == A_LIMITED ? zerocount : nullptr);
+    }
+    // On successful completion every slot of this particular limited array
+    // is live, even if an earlier shrink discarded its original prefix proof.
+    if (reachable && removal == SlotRemoval::ToCapacity && rv.Exact()) {
+        auto owner = rv.Root();
+        if (owner && owner->ownerspec == CurRealFrame().spec && LimitedPrefix(owner, rv.refplace, recvarr) == owner)
+            owner->intactprefix = true;
     }
     // Emptying a limited array unpublishes its whole live prefix, just as
     // assigning [] does. Existing slot views keep their storage (§5.3).
@@ -4067,6 +4081,24 @@ inline bool TypeCheck::SameIndexValue(Node *a, Node *b) {
                TopConstEq(x->totype, y->totype) && SameIndexValue(x->child, y->child);
     }
     return SamePath(a, b, PathInterval::ConsecutiveReads);
+}
+
+// Both ends of a rebind lie in one element if only inline field selections
+// separate them from the same pure subscript. A load of a stored reference
+// follows its pointee out of the element.
+inline bool TypeCheck::SameElementRebind(Node *slot, Node *value) {
+    auto u = Is<Unary>(value);
+    if (!u || u->op != T_BITAND) return false;
+    auto target = AddressedPath(u);
+    auto element = [](Node *n) -> Index * {
+        while (auto d = Is<Dot>(n)) {
+            if (d->fieldidx < 0 || !d->obj->exprtype || IsRefOrSlice(d->obj->exprtype)) return nullptr;
+            n = d->obj;
+        }
+        return Is<Index>(n);
+    };
+    auto a = element(slot), b = element(target);
+    return a && b && SamePath(a, b, PathInterval::ConsecutiveReads);
 }
 
 // Consecutive reads can follow the same subscript when evaluating the path

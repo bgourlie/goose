@@ -22,7 +22,19 @@ fn reserved() -> Node[..] {
     return nodes;
 }
 
+fn full_again() -> Node[..] {
+    var nodes: Node[..] = [Node {}; 2];
+    let last .= nodes[1];
+    nodes.pop_n(1);
+    nodes.push(Node {});
+    nodes.resize(nodes.cap);
+    nodes[0].next .= last;
+    return nodes;
+}
+
 fn main() {
+    let full: Node[] = full_again();
+    assert(full.len == 2 && full[0].next .== full[1]);
     for shrink in [true, false] {
         let live: Node[] = pair(shrink);
         assert(live.len == 2 && live[0].next .== live[1]);

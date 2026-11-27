@@ -89,6 +89,7 @@ inline Val Ident::Check(TypeCheck &tc, TypeExpr *) {
     if (auto vd = tc.LookupVar(name, ns, this)) {
         vdef = vd;
         tc.RequireAssigned(vd, this);
+        tc.ReadBindingTarget(this);
         Val v;
         auto t = vd->narrowed ? vd->narrowed : vd->type;
         v.type = tc.LoadType(t);
