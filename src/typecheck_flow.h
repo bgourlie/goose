@@ -1004,7 +1004,8 @@ inline TypeCheck::FlowState TypeCheck::JoinFlow(const FlowState &a, const FlowSt
                     narrow(aa.narrowed, bb.narrowed),
                     !a.reachable ? bb.refplace : !b.reachable ? aa.refplace
                                                               : aa.refplace.Common(bb.refplace, ast.places, backedge),
-                    (!a.reachable || aa.intactprefix) && (!b.reachable || bb.intactprefix) };
+                    !a.reachable ? bb.intactprefix : !b.reachable ? aa.intactprefix
+                                                                  : aa.intactprefix.Both(bb.intactprefix) };
     }
     // A global stays narrowed where every reachable side narrowed it.
     if (!a.reachable) joined.globals = b.globals;
@@ -1199,7 +1200,7 @@ inline Val TypeCheck::MergeVals(const Val &a, bool areach, const Val &b, bool br
     if (v.type && v.type->kind == TY_SLICE) v.sliceplace = a.sliceplace.Common(b.sliceplace, ast.places);
     v.elementlinks = a.elementlinks;
     v.elementlinks.Include(b.elementlinks);
-    v.intactprefix = a.intactprefix && b.intactprefix;
+    v.intactprefix = a.intactprefix.Both(b.intactprefix);
     v.extent = a.extent.Common(b.extent);
     v.TakeAlts(a);
     v.Add(b);
@@ -2800,14 +2801,15 @@ inline void TypeCheck::RecordStorageWrite(FnRecord::StorageWrite write, Defer *e
     auto spec = CurRealFrame().spec;
     if (!spec || !write.root || write.root->isglobal || IsTemp(write.root)) return;
     if (write.effect != StorageWrite::Storage) {
+        auto retained = write.zeropop ? PrefixProof::IfZero(zeroconditions, write.zeropop) : PrefixProof();
         if (write.root->type && write.root->ownerspec == spec && TopConstEq(write.root->type, write.type))
-            write.root->intactprefix = false;
+            write.root->intactprefix = write.root->intactprefix.Both(retained);
         cur.links.DropPrefixes([&](VarDef *prefix) {
             auto t = prefix->type;
             if (t && IsAddressRef(t)) t = t->ref->sub;
             return (!t || TopConstEq(t, write.type)) &&
                    MayAliasRoots(PrefixOwner(prefix), true, write.root, write.exact) != AL_NO;
-        });
+        }, retained);
     }
     if (!cur.deferring && write.root->ownerspec == spec) {
         if (!executing || write.effect == StorageWrite::PrefixOnly) return;
@@ -2825,7 +2827,7 @@ inline void TypeCheck::RecordStorageWrite(FnRecord::StorageWrite write, Defer *e
 }
 
 inline void TypeCheck::NoteStorageWrite(const Roots &storage, TypeExpr *type, const RefPlace &place,
-                                        bool canwrite, StorageWrite::Effect effect) {
+                                        bool canwrite, StorageWrite::Effect effect, VarDef *zeropop) {
     // Writes to a limited-array header can invalidate a live-prefix proof
     // across a call even in a program with no deferred writes.
     if (!type || !IsArrayKind(type, A_LIMITED)) effect = StorageWrite::Storage;
@@ -2833,11 +2835,11 @@ inline void TypeCheck::NoteStorageWrite(const Roots &storage, TypeExpr *type, co
     for (auto &a : OwnersAtPlace(storage, place).alts) {
         if (!a.root || a.root->isglobal) continue; // No global can point into the local result.
         if (a.exact || IsClassRoot(a.root)) {
-            RecordStorageWrite({ a.root, type, a.exact, !a.exact && a.from == a.root, place, effect });
+            RecordStorageWrite({ a.root, type, a.exact, !a.exact && a.from == a.root, place, effect, zeropop });
         } else {
             // A lifetime bound can cover more than one storage owner.
             auto candidates = RootCandidates(type, Depth(a.root), false, true, true);
-            for (auto &c : candidates.alts) RecordStorageWrite({ c.root, type, c.exact, false, {}, effect });
+            for (auto &c : candidates.alts) RecordStorageWrite({ c.root, type, c.exact, false, {}, effect, zeropop });
         }
     }
 }
@@ -2883,7 +2885,7 @@ inline void TypeCheck::ApplyCalleeWrites(FnSpec *spec, const vector<Val> &args) 
         // A write through a stored reference follows its pointee. The
         // caller's field holding that reference does not locate the write.
         auto place = w.indirect ? RefPlace {} : CallerPlace(w.place, spec, args);
-        NoteStorageWrite(roots, w.type, place, reachable, w.effect);
+        NoteStorageWrite(roots, w.type, place, reachable, w.effect, w.zeropop);
     }
 }
 
@@ -3063,10 +3065,10 @@ inline void TypeCheck::CheckVarDecl(VarDecl *vd, bool global) {
         if (t->kind == TY_FN)
             Error(vd, "function values are compile-time only and cannot be stored (§7.6)");
         d->type = t;
-        d->intactprefix = !global && IsArrayKind(t, A_LIMITED) && v && v->intactprefix;
+        d->intactprefix = !global && IsArrayKind(t, A_LIMITED) && v ? v->intactprefix : PrefixProof();
         if (IsArrayKind(t, A_LIMITED) && v) d->limitedcapacity = v->extent.capacity;
         if (v && !global && !d->isvar && IsAddressRef(t) && v->Exact())
-            if (auto prefix = LivePrefixTarget(init, result); prefix && PrefixOwner(prefix) == v->Root())
+            if (auto prefix = LivePrefixTarget(init, result); prefix.array && PrefixOwner(prefix.array) == v->Root())
                 cur.links.targets[d] = prefix;
         if (global) CheckVarExtent(d, vd);
         if (v && IsRefOrSlice(t)) {

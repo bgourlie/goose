@@ -276,7 +276,7 @@ struct TypeCheck {
         bool maybeassigned = false;
         TypeExpr *narrowed = nullptr;
         RefPlace refplace;
-        bool intactprefix = false;
+        PrefixProof intactprefix;
         bool operator==(const VarFlow &) const = default;
     };
     struct FlowEntry {
@@ -311,15 +311,21 @@ struct TypeCheck {
         // Successful index evaluations and immutable reference bindings known
         // to address a live element of a particular limited array on this path.
         using Target = variant<Node *, VarDef *, pair<Node *, size_t>>;
-        map<Target, VarDef *> targets;
-        void SetTarget(Target key, VarDef *prefix) {
-            if (prefix) targets[key] = prefix;
+        map<Target, LiveTarget> targets;
+        void SetTarget(Target key, LiveTarget prefix) {
+            if (prefix.array) targets[key] = prefix;
             else targets.erase(key);
         }
-        template<typename F> void DropPrefixes(F matches) {
-            erase_if(targets, [&](const auto &p) { return matches(p.second); });
-            for (auto &[part, write] : live)
-                if (write.liveprefix && matches(write.liveprefix)) write.liveprefix = nullptr;
+        template<typename F> void DropPrefixes(F matches, PrefixProof retained = false) {
+            auto weaken = [&](LiveTarget &target) {
+                if (target.array && matches(target.array)) target = { target.array, target.proof.Both(retained) };
+            };
+            for (auto it = targets.begin(); it != targets.end();) {
+                weaken(it->second);
+                if (!it->second.array) it = targets.erase(it);
+                else ++it;
+            }
+            for (auto &[part, write] : live) weaken(write.liveprefix);
         }
         vector<RelativeStore> resultlinks; // Writes into the result under construction on this path.
         // A repeated literal captures its operand before installing any
@@ -354,7 +360,7 @@ struct TypeCheck {
         template<typename F> void ForgetBindings(F expired) {
             erase_if(targets, [&](const auto &p) {
                 auto var = get_if<VarDef *>(&p.first);
-                return expired(p.second) || (var && expired(*var));
+                return expired(p.second.array) || (var && expired(*var));
             });
             for (auto it = live.begin(); it != live.end();) {
                 auto field = it->first.boundfield;
@@ -369,10 +375,11 @@ struct TypeCheck {
             }
         }
         void Join(const LinkFlow &other) {
-            erase_if(targets, [&](const auto &p) {
-                auto it = other.targets.find(p.first);
-                return it == other.targets.end() || it->second != p.second;
-            });
+            for (auto it = targets.begin(); it != targets.end();) {
+                auto p = other.targets.find(it->first);
+                if (p == other.targets.end() || it->second.array != p->second.array) it = targets.erase(it);
+                else { it->second = it->second.Common(p->second); ++it; }
+            }
             for (auto &link : other.resultlinks) link.AddTo(resultlinks);
             for (auto &[fill, links] : other.fills) fills[fill].Join(links);
             for (auto &[part, write] : other.live) {
@@ -2059,9 +2066,10 @@ struct TypeCheck {
     static LinkFlow::Target ResultTarget(Node *n, size_t result) {
         return result ? LinkFlow::Target(std::pair { n, result }) : LinkFlow::Target(n);
     }
-    VarDef *LivePrefixTarget(Node *n, size_t result = 0);
+    set<ZeroCondition> zeroconditions;
+    LiveTarget LivePrefixTarget(Node *n, size_t result = 0);
     void NoteLiveElement(LinkFlow::Target key, const Roots &roots, const RefPlace &place, TypeExpr *array);
-    VarDef *CallerPrefix(VarDef *prefix, FnSpec *spec, span<const Val> args, VarDef *owner);
+    LiveTarget CallerPrefix(LiveTarget target, FnSpec *spec, span<const Val> args, VarDef *owner);
     static VarDef *PrefixOwner(VarDef *prefix) {
         return prefix->type && IsAddressRef(prefix->type) ? prefix->ref.Root() : prefix;
     }
@@ -2798,7 +2806,7 @@ struct TypeCheck {
     static Roots OwnersAtPlace(const Roots &storage, const RefPlace &place);
     bool SameStorageWrite(const FnRecord::StorageWrite &a, const FnRecord::StorageWrite &b) {
         return a.root == b.root && a.exact == b.exact && a.indirect == b.indirect &&
-               a.place == b.place && a.effect == b.effect && TypeEq(a.type, b.type);
+               a.place == b.place && a.effect == b.effect && a.zeropop == b.zeropop && TypeEq(a.type, b.type);
     }
     void RecordStorageWrite(FnRecord::StorageWrite write, Defer *executing = nullptr);
     using StorageWrite = FnRecord::StorageWrite;
@@ -2813,7 +2821,7 @@ struct TypeCheck {
     void ApplyCalleeReads(FnSpec *spec, const vector<Val> &args);
     void CheckDeferredReads(const DeferEffects &effects, const FnRecord::InterruptedAssign &assignment);
     void NoteStorageWrite(const Roots &storage, TypeExpr *type, const RefPlace &place, bool canwrite,
-                          StorageWrite::Effect effect = StorageWrite::MayDropSlots);
+                          StorageWrite::Effect effect = StorageWrite::MayDropSlots, VarDef *zeropop = nullptr);
     void NoteStorageWrite(const Roots &storage, TypeExpr *type, const RefPlace &place = {}) {
         NoteStorageWrite(storage, type, place, reachable);
     }
@@ -2907,6 +2915,7 @@ struct TypeCheck {
     void CheckGrowShrink(Node *at, const char *op, Node *recv, const Val &rv,
                          SlotRemoval removal, VarDef *zerocount);
     bool RelyOnZeroCounts(const set<VarDef *> &counts, Node *at);
+    bool LiveConversionTargets(const ValueLinks &links, PrefixProof whole, Node *at);
     void GrowOnlyAssignKnown(Assign *a, const Roots &built, bool whole);
     bool RetainsRelativeSlot(TypeExpr *part, TypeExpr *array, TypeExpr *replaced);
     bool LinkMayReachElements(TypeExpr *array, TypeExpr *pointee);
@@ -3027,7 +3036,7 @@ struct TypeCheck {
     void RecordElementLinks(const Dest &dest, TypeExpr *type, const ValueLinks &links, Node *at);
     void StoreElementLink(const Dest &dest, TypeExpr *type, ElementLink link, Node *at,
                           const Roots &borrowed, string_view path = {}, const LinkField &target = {},
-                          VarDef *liveprefix = nullptr);
+                          LiveTarget liveprefix = {});
     void FinishFill(ArrayLit *fill, const Dest &dest);
     void RecordLinkStore(const Roots &owners, TypeExpr *reached, ElementLink link, Node *at,
                          LinkLocation place = {}, const LinkField &field = {}, const LinkField &target = {},

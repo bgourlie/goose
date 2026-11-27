@@ -45,7 +45,7 @@ inline TypeCheck::SlotRemoval TypeCheck::CountedRemoval(BuiltinKind op, const ve
     if (binding == ConstantBinding::Immutable) return zero;
     // A helper may not know whether its caller retains a link. Carry the
     // count to the shrink check that needs to rely on its initializer.
-    if (op == B_POP_N && array->arr->akind == A_GROW) return SlotRemoval::NamedZeroPop;
+    if (op == B_POP_N && array->arr->akind != A_GROWSHRINK) return SlotRemoval::NamedZeroPop;
     if (op == B_RESIZE && reachable && array->arr->akind != A_GROWSHRINK &&
         HasRelRefT(array->arr->sub)) {
         auto owner = receiver.Exact() ? receiver.Root() : nullptr;
@@ -737,7 +737,8 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
     // Record a write even if its count preserves every limited-array slot.
     if (d.flags & BF_WRITE) {
         auto write = removal == SlotRemoval::None ? StorageWrite::Storage : StorageWrite::MayDropSlots;
-        NoteStorageWrite(rv, recvarr, rv.refplace, reachable || writesduringargs, write);
+        NoteStorageWrite(rv, recvarr, rv.refplace, reachable || writesduringargs, write,
+                         ak == A_LIMITED ? zerocount : nullptr);
     }
     // Emptying a limited array unpublishes its whole live prefix, just as
     // assigning [] does. Existing slot views keep their storage (§5.3).
@@ -1481,7 +1482,7 @@ inline ValueLinks TypeCheck::LiveElementLinks(VarDef *owner, TypeExpr *target, T
     auto limited = !target && t && IsArrayKind(t, A_LIMITED);
     ValueLinks links;
     auto retain = [&](ElementLink link, const LinkField &field, const LinkField &to,
-                      std::optional<string_view> suffix = {}, bool livetarget = false) {
+                      std::optional<string_view> suffix = {}, PrefixProof livetarget = false) {
         if (!link || (emptiestail && link.intail) || !LinkMayReachElements(arr, link.pointee)) return;
         if (target && target->kind == TY_ARRAY && InRetainedField(owner, link.pointee, to.base, to.path)) return;
         if (shrink && suffix) {
@@ -1491,7 +1492,7 @@ inline ValueLinks TypeCheck::LiveElementLinks(VarDef *owner, TypeExpr *target, T
                                             link.direction == EL_ANY ? globalSlots : nullptr)) return;
         }
         link.suffixonly = limited && field.base == owner && suffix && suffix->empty();
-        link.livetarget = limited && livetarget;
+        link.livetarget = limited ? livetarget : PrefixProof();
         // A value read out of its owner carries its field paths with it.
         // Shrink queries only need the types and directions of retained links.
         auto path = [&](const LinkField &part) -> string_view {
@@ -1502,7 +1503,8 @@ inline ValueLinks TypeCheck::LiveElementLinks(VarDef *owner, TypeExpr *target, T
     for (auto &[part, write] : cur.links.live) {
         if (part.owner != owner) continue;
         if (storage && cleared && write.at < since) continue;
-        retain(part.link, part.field, part.target, write.suffix, write.liveprefix == owner);
+        retain(part.link, part.field, part.target, write.suffix,
+               write.liveprefix.array == owner ? write.liveprefix.proof : PrefixProof());
     }
     auto spec = CurRealFrame().spec;
     // A named callee records shrinks of captured owners as external shrinks.
@@ -2263,6 +2265,24 @@ inline void TypeCheck::GrowOnlyShrinkAt(Node *c, const string &op, VarDef *vd,
     NoteLiveViews(c, cat("cannot ", op, " ", what), vd, what, true, bound);
 }
 
+// A conversion can use the whole array's intact prefix or the individual
+// targets' proofs. Prefer the proof with fewer named-constant obligations.
+inline bool TypeCheck::LiveConversionTargets(const ValueLinks &links, PrefixProof whole, Node *at) {
+    PrefixProof targets = true;
+    for (auto &slot : links.slots)
+        if (slot.link.direction == EL_ANY) targets = targets.Both(slot.link.livetarget);
+    auto available = [](const ZeroCondition *c) {
+        if (!c) return false;
+        for (auto name : c->names) for (auto d = name; d; d = d->constfrom)
+            if (d->refwrite) return false;
+        return true;
+    };
+    auto proof = whole.condition;
+    if (!available(proof) || (available(targets.condition) && targets.condition->names.size() < proof->names.size()))
+        proof = targets.condition;
+    return available(proof) && (proof->names.empty() || RelyOnZeroCounts(proof->names, at));
+}
+
 inline bool TypeCheck::RelyOnZeroCounts(const set<VarDef *> &counts, Node *at) {
     if (counts.empty()) return false;
     if (unifytrial) return true;
@@ -2477,9 +2497,10 @@ inline void TypeCheck::RecordElementLinks(const Dest &dest, TypeExpr *type, cons
         link.intail |= IsArrayKind(type, A_GROW);
         // A returned proof describes this whole array's length.
         auto base = dest.field.base;
-        auto prefix = link.livetarget && IsArrayKind(type, A_LIMITED) && dest.fieldsteps &&
-                      dest.field.path.empty() && base && base->ownerspec && !base->isglobal &&
-                      base == dest.roots.Root() ? base : nullptr;
+        LiveTarget prefix;
+        if (IsArrayKind(type, A_LIMITED) && dest.fieldsteps && dest.field.path.empty() &&
+            base && base->ownerspec && !base->isglobal && base == dest.roots.Root())
+            prefix = { base, link.livetarget };
         link.livetarget = false;
         auto to = dest.field;
         if (to.base && dest.fieldsteps) to.path += target;
@@ -2489,7 +2510,7 @@ inline void TypeCheck::RecordElementLinks(const Dest &dest, TypeExpr *type, cons
 
 inline void TypeCheck::StoreElementLink(const Dest &dest, TypeExpr *type, ElementLink link, Node *at,
                                        const Roots &borrowed, string_view path, const LinkField &target,
-                                       VarDef *liveprefix) {
+                                       LiveTarget liveprefix) {
     if (!reachable || dest.discarded || dest.roots.None()) return;
     auto reached = dest.reached ? dest.reached : type;
     std::optional<string_view> suffix;

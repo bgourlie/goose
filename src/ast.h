@@ -1004,12 +1004,52 @@ struct RefPlace {
     bool operator==(const RefPlace &) const = default;
 };
 
+// A proof can depend on named integer initializers remaining zero. Keep
+// conditions canonical across flow joins and recursive summary rounds.
+struct ZeroCondition {
+    set<VarDef *> names;
+    set<ZeroCondition> *pool = nullptr;
+    bool operator<(const ZeroCondition &other) const { return names < other.names; }
+};
+
+struct PrefixProof {
+    const ZeroCondition *condition = nullptr; // No proof. An empty condition is unconditional.
+    PrefixProof(bool known = false) {
+        static const ZeroCondition always;
+        if (known) condition = &always;
+    }
+    explicit PrefixProof(const ZeroCondition *c) : condition(c) {}
+    static PrefixProof IfZero(set<ZeroCondition> &pool, VarDef *name) {
+        return PrefixProof(&*pool.insert({ { name }, &pool }).first);
+    }
+    PrefixProof Both(PrefixProof other) const {
+        if (!condition || !other.condition) return false;
+        if (condition == other.condition || other.condition->names.empty()) return *this;
+        if (condition->names.empty()) return other;
+        auto joined = *condition;
+        joined.names.insert(other.condition->names.begin(), other.condition->names.end());
+        return PrefixProof(&*condition->pool->insert(std::move(joined)).first);
+    }
+    auto operator<=>(const PrefixProof &) const = default;
+};
+
+struct LiveTarget {
+    VarDef *array = nullptr;
+    PrefixProof proof;
+    LiveTarget(VarDef *array = nullptr, PrefixProof proof = true)
+        : array(proof.condition ? array : nullptr), proof(array ? proof : PrefixProof()) {}
+    LiveTarget Common(LiveTarget other) const {
+        return array == other.array ? LiveTarget(array, proof.Both(other.proof)) : LiveTarget();
+    }
+    bool operator==(const LiveTarget &) const = default;
+};
+
 struct ElementLink {
     TypeExpr *pointee = nullptr; // One representative per loaded type (LinkPointee).
     ElementLinks direction = EL_NONE;
     bool intail = false; // The receiving slot lies in its owner's resizable tail.
     bool suffixonly = false; // In a limited-array value, this slot is outside its live length.
-    bool livetarget = false; // Its target is within this limited-array value's current length.
+    PrefixProof livetarget; // Its target is within this limited-array value's current length.
     explicit operator bool() const { return direction != EL_NONE; }
     auto operator<=>(const ElementLink &) const = default;
     bool SameSlotKind(ElementLink other) const {
@@ -1086,7 +1126,7 @@ struct Val : Prov {
     bool uns = false;            // CK_INT: ival's bits are a u64 above i64.max.
     bool strlit = false;         // String literal: adaptable to u8 array types.
     bool emptyarr = false;       // [] with as yet unknown element type.
-    bool intactprefix = false;   // Every previously addressable slot is still live (§5.3).
+    PrefixProof intactprefix;   // Every previously addressable slot is still live (§5.3).
     ArrayExtent extent;
     int64_t ival = 0;
     double fval = 0;
@@ -2338,7 +2378,7 @@ struct VarDef {
     bool assigned = false;
     bool maybeassigned = false;
     TypeExpr *narrowed = nullptr;  // T? narrowed to T& in the current region.
-    bool intactprefix = false;      // Every previously addressable limited-array slot is currently live.
+    PrefixProof intactprefix;      // Every previously addressable limited-array slot is currently live.
     int64_t limitedcapacity = -1;   // Set at construction and independent of subsequent length changes.
     bool captured = false;         // Accessed from a nested fn / function value.
     // The first comparison relying on the variable being non-negative
@@ -2799,11 +2839,11 @@ struct RelativeStore {
 struct RetRoot {
     Roots alts;                // Every root the checked returns give.
     RefPlace place;            // Pointee or viewed elements common to those returns.
-    VarDef *liveprefix = nullptr; // Each completing return points into the live length of this array.
+    LiveTarget liveprefix; // Each completing return points into the live length of this array.
     bool writable = true;      // Writable only where every return is (§9.5).
     bool byteview = false;
     bool freshview = false;    // Prov::freshview.
-    std::optional<bool> intactprefix; // Whether all completing limited-array results preserve their slots.
+    std::optional<PrefixProof> intactprefix; // Whether all completing limited-array results preserve their slots.
     ValueLinks elementlinks; // Any return may give an array with Val::elementlinks.
     vector<RelativeStore> resultlinks; // Links written into a result that reaches its caller.
     bool set = false;          // A return supplied provenance, including a known null.
@@ -2824,10 +2864,10 @@ struct RetRoot {
 
     void Include(const RetRoot &other, PlacePool &pool) {
         elementlinks.Include(other.elementlinks);
-        if (other.intactprefix) intactprefix = intactprefix.value_or(true) && *other.intactprefix;
+        if (other.intactprefix) intactprefix = intactprefix.value_or(true).Both(*other.intactprefix);
         for (auto &link : other.resultlinks) link.AddTo(resultlinks);
         if (!other.set) return;
-        liveprefix = !set || liveprefix == other.liveprefix ? other.liveprefix : nullptr;
+        liveprefix = set ? liveprefix.Common(other.liveprefix) : other.liveprefix;
         alts.Add(other.alts);
         place = set ? place.Common(other.place, pool) : other.place;
         heldparam = !set || heldparam == other.heldparam ? other.heldparam : -1;
@@ -2887,6 +2927,7 @@ struct FnRecord {
         bool exact, indirect;
         RefPlace place;  // A field of the owner or of a particular argument.
         Effect effect;
+        VarDef *zeropop = nullptr; // A limited-array pop preserves the prefix if this count stays zero.
     };
     vector<StorageWrite> storagewrites;
     // Storage observed by reading a capture. The place and owner are those
@@ -2982,11 +3023,11 @@ struct FnRecord {
     }
     struct LinkState {
         std::optional<string_view> suffix; // The slot only survives outside this field's live length.
-        VarDef *liveprefix = nullptr;      // The target is live in this array or array parameter.
+        LiveTarget liveprefix;             // The target is live in this array or array parameter.
 
         void Include(const LinkState &other) {
             if (suffix != other.suffix) suffix.reset();
-            if (liveprefix != other.liveprefix) liveprefix = nullptr;
+            liveprefix = liveprefix.Common(other.liveprefix);
         }
         bool operator==(const LinkState &) const = default;
     };

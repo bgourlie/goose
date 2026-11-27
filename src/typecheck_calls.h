@@ -1456,7 +1456,7 @@ inline Val TypeCheck::TryDispatch(Call *c, vector<SFunction *> &cands, FnSpec *e
     // no provenance to the result.
     vector<Val> results;
     vector<bool> reached;
-    vector<VarDef *> prefixes;
+    vector<LiveTarget> prefixes;
     for (auto spec : c->dispatch) {
         CallResult(c, spec, argvals);
         results.resize(lastcallrets.size());
@@ -1467,7 +1467,7 @@ inline Val TypeCheck::TryDispatch(Call *c, vector<SFunction *> &cands, FnSpec *e
                            (r < spec->record.retroots.size() && spec->record.retroots[r].set);
             auto prefix = LivePrefixTarget(c, r);
             if (!reached[r]) prefixes[r] = prefix;
-            else if (reaches && prefixes[r] != prefix) prefixes[r] = nullptr;
+            else if (reaches) prefixes[r] = prefixes[r].Common(prefix);
             if (!reached[r]) results[r] = lastcallrets[r];
             else if (reaches) results[r] = MergeVals(results[r], true, lastcallrets[r], true, c, true);
             reached[r] = reached[r] || reaches;
@@ -2096,7 +2096,7 @@ inline void TypeCheck::NoteExit(int tf, Node *at, vector<RetRoot> results,
         if (!IsAddressRef(frames[tf].spec->rets[i]) || !results[i].alts.Exact()) continue;
         auto prefix = expressions.size() == 1 ? LivePrefixTarget(expressions[0], i)
                                               : LivePrefixTarget(expressions[i]);
-        if (prefix && PrefixOwner(prefix) == results[i].alts.Root()) results[i].liveprefix = prefix;
+        if (prefix.array && PrefixOwner(prefix.array) == results[i].alts.Root()) results[i].liveprefix = prefix;
     }
     auto merge = [&](vector<RetRoot> &to) {
         if (to.size() < results.size()) to.resize(results.size());
@@ -4028,7 +4028,7 @@ inline Val TypeCheck::CallResult(Call *c, FnSpec *spec, vector<Val> &argvals) {
             v.writable = false;
         }
         v.elementlinks = ri.elementlinks;
-        v.intactprefix = ri.intactprefix.value_or(false) && !spec->inprogress;
+        if (!spec->inprogress) v.intactprefix = ri.intactprefix.value_or(false);
         auto prefix = !spec->inprogress && v.Exact() ? CallerPrefix(ri.liveprefix, spec, argvals, v.Root()) : nullptr;
         cur.links.SetTarget(ResultTarget(c, i), prefix);
         lastcallrets.push_back(v);

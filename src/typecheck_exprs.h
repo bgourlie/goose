@@ -22,7 +22,7 @@ inline VarDef *TypeCheck::LimitedPrefix(VarDef *owner, const RefPlace &place, Ty
     return nullptr;
 }
 
-inline VarDef *TypeCheck::LivePrefixTarget(Node *n, size_t result) {
+inline LiveTarget TypeCheck::LivePrefixTarget(Node *n, size_t result) {
     if (!n || cur.links.targets.empty()) return nullptr;
     if (auto u = Is<Unary>(n); u && u->op == T_BITAND) n = u->child;
     auto id = Is<Ident>(n);
@@ -39,11 +39,12 @@ inline void TypeCheck::NoteLiveElement(LinkFlow::Target key, const Roots &roots,
     cur.links.SetTarget(key, prefix);
 }
 
-inline VarDef *TypeCheck::CallerPrefix(VarDef *prefix, FnSpec *spec, span<const Val> args, VarDef *owner) {
+inline LiveTarget TypeCheck::CallerPrefix(LiveTarget target, FnSpec *spec, span<const Val> args, VarDef *owner) {
+    auto prefix = target.array;
     if (!prefix || !owner) return nullptr;
-    if (prefix->ownerspec != spec) return PrefixOwner(prefix) == owner ? prefix : nullptr;
+    if (prefix->ownerspec != spec) return PrefixOwner(prefix) == owner ? target : LiveTarget();
     if (!prefix->isparam || !IsAddressRef(prefix->type)) return nullptr;
-    return LimitedPrefix(owner, ArgumentPlace(spec, prefix, args), prefix->type->ref->sub);
+    return { LimitedPrefix(owner, ArgumentPlace(spec, prefix, args), prefix->type->ref->sub), target.proof };
 }
 
 inline TypeCheck::LVal TypeCheck::CheckLValue(Node *n, PathUse use) {
@@ -784,7 +785,7 @@ inline void TypeCheck::ResolveMemberLValue(LVal &lv, Dot *d) {
             lv.type = (*run.ftypes)[i];
             if (!cur.links.targets.empty()) {
                 cur.links.targets.erase(d);
-                if (auto owner = LivePrefixTarget(d->obj); owner && !IsRefOrSlice(lv.type))
+                if (auto owner = LivePrefixTarget(d->obj); owner.array && !IsRefOrSlice(lv.type))
                     cur.links.targets[d] = owner;
             }
             ProjectField(lv, lv.place, t, run, i);
@@ -1509,8 +1510,7 @@ inline bool TypeCheck::FitsAt(Val &v, TypeExpr *dt, bool delivered) {
                               "reference still names (§5.2)");
                 return false;
             }
-            if (IsArrayKind(t, A_LIMITED) && !v.intactprefix &&
-                links.Any([](auto link) { return link.direction == EL_ANY && !link.livetarget; })) {
+            if (IsArrayKind(t, A_LIMITED) && !LiveConversionTargets(links, v.intactprefix, fitnode)) {
                 fitfail = cat("cannot construct ", TypeStr(dt), " from ", TypeStr(t),
                               ": a self-relative link may name a slot beyond the live length "
                               "that the conversion would discard (§5.3)");
@@ -1601,7 +1601,7 @@ inline bool TypeCheck::FitsAt(Val &v, TypeExpr *dt, bool delivered) {
                 if (recordingrelative && !dt->ref->pool && !curdst.result) {
                     ElementLink link { pointee, curdst.appended ? EL_BACKWARD : EL_ANY };
                     auto prefix = LivePrefixTarget(fitnode);
-                    if (prefix && (PrefixOwner(prefix) != have || have != want)) prefix = nullptr;
+                    if (prefix.array && (PrefixOwner(prefix.array) != have || have != want)) prefix = {};
                     StoreElementLink(curdst, dt, link, fitnode, links, {}, target, prefix);
                 }
                 v.type = dt;

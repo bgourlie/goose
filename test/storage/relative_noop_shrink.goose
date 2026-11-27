@@ -6,6 +6,7 @@ const ALSO_ZERO = ZERO + 0;
 let zero_count = 0;
 let other_zero = 0;
 let unused_zero = 0;
+let unused_limited_count = 0;
 
 fn keep_named(nodes: Node[>..]&) {
     nodes.pop_n(zero_count);
@@ -25,6 +26,18 @@ fn limited_pair() -> Node[..] {
     var nodes: Node[..] = [Node {}, Node {}];
     nodes[0].next .= nodes[1];
     nodes.pop_n(ALSO_ZERO);
+    nodes.pop_n(zero_count);
+    return nodes;
+}
+
+fn pop_limited(nodes: Node[..]&) { nodes.pop_n(other_zero); }
+
+fn shortened_pair() -> Node[..] {
+    var nodes: Node[..] = [Node {}; 3];
+    nodes.pop_n(1);
+    let last .= nodes[1];
+    pop_limited(nodes);
+    nodes[0].next .= last;
     return nodes;
 }
 
@@ -61,6 +74,11 @@ export fn keep_shared() { shared.resize(shared.len); }
 export fn pop_shared() { shared.pop_n(zero_count); }
 
 fn main() {
+    var limited: Node[..] = [Node {}, Node {}];
+    limited[0].next .= limited[1];
+    limited.pop_n(unused_limited_count);
+    assert(limited.len == 2);
+    change(unused_limited_count);
     var unlinked: Node[>..] = [Node {}];
     pop_unlinked(unlinked);
     change(unused_zero);
@@ -78,6 +96,8 @@ fn main() {
     through_mutable_ref();
     let pair: Node[] = limited_pair();
     assert(pair.len == 2 && pair[0].next .== pair[1]);
+    let shortened: Node[] = shortened_pair();
+    assert(shortened.len == 2 && shortened[0].next .== shortened[1]);
     var nodes: Node[>..] = [Node {}, Node {}, Node {}];
     trim_then_link(nodes);
     keep_named(nodes);

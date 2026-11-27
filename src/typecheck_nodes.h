@@ -113,7 +113,7 @@ inline Val Ident::Check(TypeCheck &tc, TypeExpr *) {
             if (!vd->istemp) v.refplace = tc.OwnedPlace(vd);
             v.byteview = vd->contentbyteview;
             v.elementlinks = tc.LiveElementLinks(vd);
-            v.intactprefix = vd->intactprefix && vd->ownerspec && vd->ownerspec == tc.CurRealFrame().spec;
+            if (vd->ownerspec && vd->ownerspec == tc.CurRealFrame().spec) v.intactprefix = vd->intactprefix;
             v.writable = !vd->copybind && !(vd->type && vd->type->cq);
             v.reusable = vd->reusable;
             v.nonneg = vd->nonneg;
