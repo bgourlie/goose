@@ -32,7 +32,19 @@ fn full_again() -> Node[..] {
     return nodes;
 }
 
+fn constant_capacity() -> Node[..] {
+    var nodes: Node[..] = [Node {}; 3];
+    let last .= nodes[2];
+    nodes.pop_n(1);
+    nodes.push(Node {});
+    nodes.resize(3);
+    nodes[0].next .= last;
+    return nodes;
+}
+
 fn main() {
+    let restored: Node[] = constant_capacity();
+    assert(restored.len == 3 && restored[0].next .== restored[2]);
     let full: Node[] = full_again();
     assert(full.len == 2 && full[0].next .== full[1]);
     for shrink in [true, false] {

@@ -2874,7 +2874,7 @@ struct RelativeStore {
 struct RetRoot {
     Roots alts;                // Every root the checked returns give.
     RefPlace place;            // Pointee or viewed elements common to those returns.
-    LiveTarget liveprefix; // Each completing return points into the live length of this array.
+    LiveTarget liveprefix;     // Returned pointee or slice elements inside this array's live length.
     bool writable = true;      // Writable only where every return is (§9.5).
     bool byteview = false;
     bool freshview = false;    // Prov::freshview.

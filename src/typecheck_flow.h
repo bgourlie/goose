@@ -3403,7 +3403,7 @@ inline Val TypeCheck::CheckAssignedValue(Assign *a, TypeExpr *target, TypeExpr *
     if (reachable && IsArrayKind(target, A_LIMITED) && v.extent.length >= 0) {
         auto owner = built.Exact() ? built.Root() : nullptr;
         bool whole = owner && owner->type && TopConstEq(owner->type, target);
-        auto capacity = target->arr->sizeexpr ? ArraySize(target->arr) : whole ? owner->limitedcapacity : -1;
+        auto capacity = LimitedCapacity(target, whole ? owner : nullptr);
         full = v.extent.length == capacity;
         if (full && whole && owner->ownerspec == CurRealFrame().spec) owner->intactprefix = true;
     }

@@ -22,8 +22,9 @@ inline VarDef *TypeCheck::LimitedPrefix(VarDef *owner, const RefPlace &place, Ty
     return nullptr;
 }
 
-inline LiveTarget TypeCheck::LivePrefixTarget(Node *n, size_t result) {
+inline LiveTarget TypeCheck::LivePrefixTarget(Node *n, size_t result, TypeExpr *type) {
     if (!n || cur.links.targets.empty()) return nullptr;
+    if (type && type->kind == TY_SLICE) return cur.links.GetTarget(SliceElements { n, result });
     if (auto u = Is<Unary>(n); u && u->op == T_BITAND) n = u->child;
     auto id = Is<Ident>(n);
     if (id && id->vdef && !id->vdef->isvar) return cur.links.GetTarget(id->vdef);
@@ -80,8 +81,8 @@ inline void TypeCheck::ForgetReboundTarget(VarDef *binding) {
 
 inline void TypeCheck::BindLiveTarget(VarDef *binding, Node *source, const Val &value, size_t result) {
     if (binding->isglobal) return;
-    if (binding->type->kind == TY_SLICE && !binding->slotref && !result)
-        cur.links.SetTarget(SliceElements { binding }, cur.links.GetTarget(SliceElements { source }));
+    if (binding->type->kind == TY_SLICE && !binding->slotref)
+        cur.links.SetTarget(SliceElements { binding }, LivePrefixTarget(source, result, binding->type));
     if (!IsAddressRef(binding->type)) return;
     auto prefix = value.isnull || value.refplace.nullonly ? LiveTarget::Null() : LivePrefixTarget(source, result);
     if (prefix.array) {
@@ -104,25 +105,28 @@ inline void TypeCheck::NoteLiveElement(LinkFlow::Target key, const Roots &roots,
 // currently covers. Fixed arrays lie inline, slices retain a captured range,
 // and indexing a limited array checks its current length.
 inline void TypeCheck::NoteSequenceElement(LinkFlow::Target key, Node *sequence, const Roots &roots,
-                                           const RefPlace &place, TypeExpr *type) {
+                                           const RefPlace &place, TypeExpr *type, size_t result) {
     if (type->kind == TY_SLICE)
-        cur.links.SetTarget(key, cur.links.GetTarget(SliceElements { sequence }));
+        cur.links.SetTarget(key, IsRefOrSlice(type->sub) ? LiveTarget() : LivePrefixTarget(sequence, result, type));
     else if (IsArrayKind(type, A_FIXED) && !IsRefOrSlice(type->arr->sub))
-        cur.links.SetTarget(key, LivePrefixTarget(sequence));
+        cur.links.SetTarget(key, LivePrefixTarget(sequence, result));
     else
         NoteLiveElement(key, roots, place, type);
 }
 
-// A fixed argument's inline storage stays inside its element. Identify the
-// argument by its formal, since several formals may share one array root.
+// Inline storage stays inside a fixed argument; a slice parameter's elements
+// stay inside its evaluated range. Several formals may share one lifetime root.
 inline LiveTarget TypeCheck::ArgumentLiveTarget(FnSpec *spec, span<Node *const> argnodes,
-                                               VarDef *base, VarDef *owner) {
-    if (!base || !base->isparam || base->isvar || !IsAddressRef(base->type) || !owner ||
-        spec->inprogress || ClassOf(base->type->ref->sub) != SC_FIXED) return {};
+                                               PlacePath path, VarDef *owner) {
+    auto base = path.base;
+    if (!base || !base->isparam || base->isvar || !owner || spec->inprogress) return {};
+    if (base->type->kind == TY_SLICE) {
+        if (!path.enclosing || IsRefOrSlice(base->type->sub)) return {};
+    } else if (!IsAddressRef(base->type) || ClassOf(base->type->ref->sub) != SC_FIXED) return {};
     auto it = find(spec->params.begin(), spec->params.end(), base);
     auto i = (size_t)(it - spec->params.begin());
     if (it == spec->params.end() || i >= argnodes.size()) return {};
-    auto target = LivePrefixTarget(argnodes[i]);
+    auto target = LivePrefixTarget(argnodes[i], 0, base->type);
     return target.NullOnly() || (target.array && PrefixOwner(target.array) == owner) ? target : LiveTarget();
 }
 
@@ -143,7 +147,7 @@ inline LiveTarget TypeCheck::CallerLiveTarget(LiveTarget recorded, const PlacePa
     }
     if (!fields.Known() || argnodes.empty() || cur.links.targets.empty()) return {};
     auto common = LiveTarget::Null();
-    fields.Each([&](PlacePath p) { common = common.Common(ArgumentLiveTarget(spec, argnodes, p.base, owner)); });
+    fields.Each([&](PlacePath p) { common = common.Common(ArgumentLiveTarget(spec, argnodes, p, owner)); });
     return common;
 }
 
@@ -1307,7 +1311,7 @@ inline Val TypeCheck::LoadOperand(Node *n, const Val &raw) {
     return v;
 }
 
-inline void TypeCheck::MustFit(Val &v, Node *n, TypeExpr *dt) {
+inline void TypeCheck::MustFit(Val &v, Node *n, TypeExpr *dt, size_t result) {
     FlagScope recording(recordingrelative, true);
     auto vt = DecayedType(v);
     if (vt->kind == TY_ARRAY && vt->arr->akind == A_FIXED)
@@ -1318,7 +1322,7 @@ inline void TypeCheck::MustFit(Val &v, Node *n, TypeExpr *dt) {
     fitfail.clear();
     fitnode = n;
     auto from = LoadType(v.type);
-    if (FitsAt(v, dt, reachable, n)) {
+    if (FitsAt(v, dt, reachable, n, result)) {
         if (v.elementlinks && !curdst.discarded && !IsRefOrSlice(dt) && !curdst.roots.None())
             RecordElementLinks(curdst, dt, v.elementlinks, n);
         if (IsIntT(dt) && !TypeEq(from, dt)) {
@@ -1359,7 +1363,7 @@ inline void TypeCheck::MustFit(Val &v, Node *n, TypeExpr *dt) {
 // owned by curdst must be rooted at least as shallow (call-site argument
 // slots pass curdst null: parameters always die before their arguments'
 // roots).
-inline bool TypeCheck::FitsAt(Val &v, TypeExpr *dt, bool delivered, Node *conversion) {
+inline bool TypeCheck::FitsAt(Val &v, TypeExpr *dt, bool delivered, Node *conversion, size_t result) {
     auto t = v.type;
     if (!delivered) v.elementlinks = {};
     // An lvalue at a reference destination is the reference to it (§4.1),
@@ -1384,6 +1388,8 @@ inline bool TypeCheck::FitsAt(Val &v, TypeExpr *dt, bool delivered, Node *conver
         auto at = IsPlainRef(t) && t->ref->sub->kind == TY_ARRAY ? t->ref->sub : t;
         if (at->kind == TY_ARRAY && TypeEq(at->arr->sub, dt->sub)) {
             if (at != t) v.ClearReads();   // As DerefLValue.
+            if (conversion && delivered)
+                NoteSequenceElement(SliceElements { conversion, result }, conversion, v, v.refplace, at, result);
             v.sliceplace = v.refplace.Inside(ast.places, IsArrayKind(at, A_GROW));
             t = v.type = ast.SliceOf(at->arr->sub, dt->line);
             t->cq = !v.writable;
@@ -3291,13 +3297,13 @@ inline bool TypeCheck::InitOrderStoreSafe(Node *n, TypeExpr *dest) {
     return from && TypeEq(from, dest);
 }
 
-// Source-order flexibility must not depend on optimization or debug mode.
-// Prove that an initializer neither changes observable state nor can abort
-// or leave its enclosing function. Unknown forms/calls are conservative.
-// Two such expressions may read shared mutable state: neither can change it.
-inline bool TypeCheck::InitOrderSafe(Node *n, set<FnSpec *> &visiting, FnSpec *callee) {
+// A resize fill must leave storage unchanged on paths reaching the resize.
+// Reordering initializers also requires that no runtime check can abort.
+inline bool TypeCheck::ReadOnlyExpr(Node *n, EvalRequirement requirement, set<FnSpec *> &visiting, FnSpec *callee) {
     if (!n) return true;
-    auto safe = [&](Node *child) { return InitOrderSafe(child, visiting, callee); };
+    auto reorder = requirement == EvalRequirement::Reorderable;
+    auto safe = [&](Node *child) { return ReadOnlyExpr(child, requirement, visiting, callee); };
+    auto store = [&](Node *value, TypeExpr *dest) { return !reorder || InitOrderStoreSafe(value, dest); };
     if (Is<IntLit>(n) || Is<FltLit>(n) || Is<BoolLit>(n) || Is<StrLit>(n) ||
         Is<NullLit>(n) || Is<SelfRef>(n) || Is<Ident>(n)) return true;
     if (auto d = Is<Dot>(n)) return d->variantconst || safe(d->obj);
@@ -3305,7 +3311,7 @@ inline bool TypeCheck::InitOrderSafe(Node *n, set<FnSpec *> &visiting, FnSpec *c
         // Implicit reference conversions have a typed unary node but need not
         // type its synthesized operand. Only negation needs the operand's type
         // to prove that initializer reordering cannot cross an overflow check.
-        if (u->op == T_MINUS) {
+        if (reorder && u->op == T_MINUS) {
             auto t = LoadType(u->child->exprtype);
             if (!IsIntT(t) && t->kind != TY_FLT) return false;
             if (IsIntT(t) && !IsUnsigned(t->intstorage)) return false;
@@ -3313,6 +3319,7 @@ inline bool TypeCheck::InitOrderSafe(Node *n, set<FnSpec *> &visiting, FnSpec *c
         return safe(u->child);
     }
     if (auto b = Is<Binary>(n)) {
+        if (!reorder) return safe(b->left) && safe(b->right);
         auto t = LoadType(b->left->exprtype);
         if (b->op == T_ANDAND || b->op == T_OROR || b->op == T_EQ || b->op == T_NEQ ||
             b->op == T_DOTEQ || b->op == T_DOTNEQ) return safe(b->left) && safe(b->right);
@@ -3324,6 +3331,7 @@ inline bool TypeCheck::InitOrderSafe(Node *n, set<FnSpec *> &visiting, FnSpec *c
         return safe(b->left) && safe(b->right);
     }
     if (auto c = Is<AsCast>(n)) {
+        if (!reorder) return safe(c->child);
         auto from = LoadType(c->child->exprtype), to = c->totype;
         // Into an index or bound type the conversion is a bounds check, in
         // every build, whatever the widths (§3.11).
@@ -3337,15 +3345,16 @@ inline bool TypeCheck::InitOrderSafe(Node *n, set<FnSpec *> &visiting, FnSpec *c
                safe(c->child);
     }
     if (auto c = Is<Call>(n)) {
-        if (c->defaultinit) return safe(c->defaultinit);
+        if (c->builtin == B_DEFAULT) return (c->defaultinit || !reorder) && safe(c->defaultinit);
+        if (c->builtin >= 0) return false;
         auto sp = c->spec;
         if (!sp || !sp->body || sp->inprogress || !visiting.insert(sp).second) return false;
         auto args = c->ArgNodes();
         bool ok = args.size() == sp->argtypes.size() && sp->rets.size() <= 1;
         for (size_t i = 0; ok && i < args.size(); i++)
-            ok = InitOrderStoreSafe(args[i], sp->argtypes[i]) && safe(args[i]);
-        if (!sp->rets.empty()) ok = ok && InitOrderStoreSafe(sp->body, sp->rets[0]);
-        ok = ok && InitOrderSafe(sp->body, visiting, sp);
+            ok = store(args[i], sp->argtypes[i]) && safe(args[i]);
+        if (!sp->rets.empty()) ok = ok && store(sp->body, sp->rets[0]);
+        ok = ok && ReadOnlyExpr(sp->body, requirement, visiting, sp);
         visiting.erase(sp);
         return ok;
     }
@@ -3353,7 +3362,7 @@ inline bool TypeCheck::InitOrderSafe(Node *n, set<FnSpec *> &visiting, FnSpec *c
         if (!callee || r->target != callee->sf) return false;
         if (r->vals.size() != callee->rets.size()) return false;
         for (size_t i = 0; i < r->vals.size(); i++)
-            if (!InitOrderStoreSafe(r->vals[i], callee->rets[i]) || !safe(r->vals[i])) return false;
+            if (!store(r->vals[i], callee->rets[i]) || !safe(r->vals[i])) return false;
         return true;
     }
     if (auto d = Is<VarDecl>(n)) {
@@ -3363,28 +3372,35 @@ inline bool TypeCheck::InitOrderSafe(Node *n, set<FnSpec *> &visiting, FnSpec *c
         if (d->inits.empty()) return true;
         if (d->inits.size() != d->defs.size()) return false;
         for (size_t i = 0; i < d->inits.size(); i++)
-            if (!InitOrderStoreSafe(d->inits[i], d->defs[i]->type) || !safe(d->inits[i]))
+            if (!store(d->inits[i], d->defs[i]->type) || !safe(d->inits[i]))
                 return false;
         return true;
     }
+    auto children = [&] {
+        bool ok = true;
+        n->Children([&](Node *child) { ok = ok && safe(child); });
+        return ok;
+    };
+    // With no reordering, bounds and destination checks run in place.
+    // Field defaults inserted by CheckInits are operands too.
+    if (!reorder && (Is<Index>(n) || Is<SliceExpr>(n) || Is<StructLit>(n) || Is<ArrayLit>(n)))
+        return children();
     if (auto a = Is<ArrayLit>(n)) {
         // Dynamic capacities/counts need checks and can fail.
         if (a->capexpr || (a->fillcount && !Is<IntLit>(a->fillcount))) return false;
         auto elem = a->exprtype->kind == TY_ARRAY ? a->exprtype->arr->sub : a->exprtype->sub;
-        if (!InitOrderStoreSafe(a->fillval, elem)) return false;
-        for (auto e : a->elems) if (!InitOrderStoreSafe(e, elem)) return false;
+        if (!store(a->fillval, elem)) return false;
+        for (auto e : a->elems) if (!store(e, elem)) return false;
     } else if (auto s = Is<StructLit>(n)) {
         const auto &types = s->sinst ? s->sinst->ftypes
             : s->einst->vftypes[s->einst->en->VariantIndex(s->variant)];
         for (size_t i = 0; i < s->inits.size(); i++)
-            if (!InitOrderStoreSafe(s->inits[i].val, types[s->fieldindices[i]])) return false;
+            if (!store(s->inits[i].val, types[s->fieldindices[i]])) return false;
     } else if (!Is<Block>(n) && !Is<IfExpr>(n) && !Is<MatchExpr>(n)) {
         // Includes indexing/slicing, mutation, loops and nonlocal exits.
         return false;
     }
-    bool ok = true;
-    n->Children([&](Node *child) { ok = ok && safe(child); });
-    return ok;
+    return children();
 }
 
 // `selft` is the type of the value this literal constructs (the enum type
@@ -3489,7 +3505,7 @@ inline TypeCheck::LitDeep TypeCheck::CheckInits(StructLit *sl, vector<Field> &fi
                 set<FnSpec *> visiting;
                 auto init = sl->InitFor(idx);
                 reorderable[idx] = InitOrderStoreSafe(init, ftypes[idx]) &&
-                                   InitOrderSafe(init, visiting);
+                                   ReadOnlyExpr(init, EvalRequirement::Reorderable, visiting);
             }
             return reorderable[idx] != 0;
         };

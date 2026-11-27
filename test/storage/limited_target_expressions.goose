@@ -25,6 +25,25 @@ fn slice_targets(use_first: bool) -> Node[..] {
     return nodes;
 }
 
+fn live_slice(nodes: Node[..]&) -> Node[:] { nodes[..] }
+fn with_nodes<F>(nodes: Node[..]&) -> Node[:] { F(nodes) }
+fn pass_slice(s: Node[:]) -> Node[:] { s[..] }
+fn slices(nodes: Node[..]&) -> Node[:], Node[:] { return nodes[1..], live_slice(nodes); }
+fn forward_slices(nodes: Node[..]&) -> Node[:], Node[:] { return slices(nodes); }
+
+fn returned_slices() -> Node[..] {
+    var nodes: Node[..] = [Node {}; 5];
+    nodes.pop_n(1);
+    let implicit: Node[:] = nodes;
+    nodes[0].next .= implicit[1];
+    let tail, whole = forward_slices(nodes);
+    nodes[1].next .= tail[1];
+    nodes[2].next .= pass_slice(whole)[0];
+    let by_block = with_nodes(nodes) { it[..] };
+    nodes[3].next .= pass_slice(by_block)[1];
+    return nodes;
+}
+
 fn field_element() -> Cell[..] {
     var cells: Cell[..] = [Cell {}; 3];
     cells.pop_n(1);
@@ -100,6 +119,9 @@ fn evaluated_target() -> Node[..] {
 }
 
 fn main() {
+    let views: Node[] = returned_slices();
+    assert(views[0].next .== views[1] && views[1].next .== views[2] && views[2].next .== views[0]);
+    assert(views[3].next .== views[1]);
     for first in [false, true] {
         let sliced: Node[] = slice_targets(first);
         assert(sliced[0].next .== sliced[1] && sliced[1].next .== sliced[2]);

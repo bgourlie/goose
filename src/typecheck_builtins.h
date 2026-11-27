@@ -9,41 +9,9 @@ namespace goose {
 // ------------------------------------------------------------------
 // Builtins (§3.7, §9.3, §11.2) and array members (§3.3, §5.4).
 
-// These expressions only read their operands. A call (including an implicit
-// constructor default) can run user code between reading the count and resizing.
-inline bool TypeCheck::ReadOnlyResizeFill(Node *n) {
-    if (Is<Ident>(n) || Is<IntLit>(n) || Is<FltLit>(n) || Is<BoolLit>(n) || Is<StrLit>(n) || Is<NullLit>(n))
-        return true;
-    if (auto u = Is<Unary>(n)) return ReadOnlyResizeFill(u->child);
-    if (auto b = Is<Binary>(n)) return ReadOnlyResizeFill(b->left) && ReadOnlyResizeFill(b->right);
-    if (auto d = Is<Dot>(n)) return ReadOnlyResizeFill(d->obj);
-    if (auto ix = Is<Index>(n)) return ReadOnlyResizeFill(ix->obj) && ReadOnlyResizeFill(ix->idx);
-    if (auto cast = Is<AsCast>(n)) return ReadOnlyResizeFill(cast->child);
-    if (auto block = Is<Block>(n))
-        return block->stmts.empty() && block->tail && ReadOnlyResizeFill(block->tail);
-    if (auto cond = Is<IfExpr>(n))
-        return cond->elseb && ReadOnlyResizeFill(cond->cond) && ReadOnlyResizeFill(cond->thenb) &&
-               ReadOnlyResizeFill(cond->elseb);
-    if (auto m = Is<MatchExpr>(n))
-        return ReadOnlyResizeFill(m->scrutinee) && all_of(m->arms.begin(), m->arms.end(),
-            [&](const MatchArm &arm) { return ReadOnlyResizeFill(arm.body); });
-    if (Is<StructLit>(n) || Is<ArrayLit>(n)) {
-        // CheckInits has already installed every field default that will run.
-        bool readonly = true;
-        n->Children([&](Node *child) { readonly = readonly && ReadOnlyResizeFill(child); });
-        return readonly;
-    }
-    if (auto c = Is<Call>(n)) {
-        if (c->builtin == B_DEFAULT) return !c->defaultinit || ReadOnlyResizeFill(c->defaultinit);
-        set<FnSpec *> visiting;
-        return InitOrderSafe(c, visiting);
-    }
-    return false;
-}
-
 // The count and, for resize, the fill have already been checked in evaluation order.
 inline TypeCheck::SlotRemoval TypeCheck::CountedRemoval(BuiltinKind op, const vector<Node *> &args,
-                                                        const Val &count, TypeExpr *array) {
+                                                        const Val &count, TypeExpr *array, const Val &receiver) {
     assert(op == B_POP_N || op == B_RESIZE);
     auto countprop = Is<Dot>(args[1]);
     bool capacity = countprop && countprop->member == B_CAP && op == B_RESIZE && IsArrayKind(array, A_LIMITED);
@@ -51,13 +19,19 @@ inline TypeCheck::SlotRemoval TypeCheck::CountedRemoval(BuiltinKind op, const ve
         SamePath(args[0], countprop->obj, PathInterval::ConsecutiveReads)) {
         if (op == B_POP_N) return SlotRemoval::All;
         // A fill can change the receiver after its length was read.
-        if (args.size() == 2 || ReadOnlyResizeFill(args[2]))
+        set<FnSpec *> visiting;
+        if (args.size() == 2 || ReadOnlyExpr(args[2], EvalRequirement::ReadOnly, visiting))
             return capacity ? SlotRemoval::ToCapacity : SlotRemoval::None;
     }
     int64_t lo, hi;
-    if (!IntConsts(count, lo, hi) || lo != 0 || hi != 0) return SlotRemoval::Possible;
-    auto zero = op == B_POP_N ? SlotRemoval::None : SlotRemoval::All;
+    if (!IntConsts(count, lo, hi) || lo != hi || lo < 0) return SlotRemoval::Possible;
     auto binding = ConstantBindings(count);
+    if (op == B_RESIZE && IsArrayKind(array, A_LIMITED) && binding == ConstantBinding::Immutable) {
+        auto whole = receiver.Exact() ? LimitedPrefix(receiver.Root(), receiver.refplace, array) : nullptr;
+        if (lo == LimitedCapacity(array, whole)) return SlotRemoval::ToCapacity;
+    }
+    if (lo != 0) return SlotRemoval::Possible;
+    auto zero = op == B_POP_N ? SlotRemoval::None : SlotRemoval::All;
     if (binding == ConstantBinding::Aliased) return SlotRemoval::Possible;
     if (binding == ConstantBinding::Immutable) return zero;
     // A helper may not know whether its caller retains a link. Keep the
@@ -553,7 +527,7 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
                                    "contains self-relative references, is not supported; push "
                                    "the elements, which constructs each in place"));
         }
-        removal = CountedRemoval(d.kind, args, length, recvarr);
+        removal = CountedRemoval(d.kind, args, length, recvarr, rv);
         if (removal == SlotRemoval::NamedZeroResize) zerocount = length.constfrom;
     }
     // index_of recovers the element index a reference stands for (§3.3).
@@ -666,7 +640,7 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
             case 'i': {
                 auto count = CheckIntAny(an);
                 if (d.kind == B_POP_N) {
-                    removal = CountedRemoval(d.kind, args, count, recvarr);
+                    removal = CountedRemoval(d.kind, args, count, recvarr, rv);
                     if (removal == SlotRemoval::NamedZeroPop) zerocount = count.constfrom;
                 }
                 break;

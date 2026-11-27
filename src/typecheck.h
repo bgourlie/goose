@@ -290,6 +290,7 @@ struct TypeCheck {
     // where the slice descriptor itself is stored.
     struct SliceElements {
         variant<Node *, VarDef *> of;
+        size_t result = 0;
         auto operator<=>(const SliceElements &) const = default;
     };
     // A may-write fact is local to a control-flow path. Keep the latest
@@ -1185,6 +1186,9 @@ struct TypeCheck {
     ArrayExtent ConstructedExtent(TypeExpr *t, int64_t length) {
         if (!IsArrayKind(t, A_LIMITED)) return { length };
         return { length, t->arr->sizeexpr ? ArraySize(t->arr) : length };
+    }
+    int64_t LimitedCapacity(TypeExpr *array, VarDef *whole) {
+        return array->arr->sizeexpr ? ArraySize(array->arr) : whole ? whole->limitedcapacity : -1;
     }
 
     // What a type is that takes no bytes of a layout, though C has no empty
@@ -2117,10 +2121,11 @@ struct TypeCheck {
 
     enum class PathUse { Evaluate, ComparisonView, Reread };
     LVal CheckLValue(Node *n, PathUse use = PathUse::Evaluate);
-    static LinkFlow::Target ResultTarget(Node *n, size_t result) {
+    static LinkFlow::Target ResultTarget(Node *n, size_t result, TypeExpr *type = nullptr) {
+        if (type && type->kind == TY_SLICE) return SliceElements { n, result };
         return result ? LinkFlow::Target(std::pair { n, result }) : LinkFlow::Target(n);
     }
-    LiveTarget LivePrefixTarget(Node *n, size_t result = 0);
+    LiveTarget LivePrefixTarget(Node *n, size_t result = 0, TypeExpr *type = nullptr);
     void ForwardLiveTarget(Node *result, Node *source, const Val *value = nullptr);
     Roots NonNullRefRoots(const Roots &roots, TypeExpr *type, bool writable);
     void ReadBindingTarget(Ident *id);
@@ -2128,8 +2133,8 @@ struct TypeCheck {
     void BindLiveTarget(VarDef *binding, Node *source, const Val &value, size_t result = 0);
     void NoteLiveElement(LinkFlow::Target key, const Roots &roots, const RefPlace &place, TypeExpr *array);
     void NoteSequenceElement(LinkFlow::Target key, Node *sequence, const Roots &roots,
-                             const RefPlace &place, TypeExpr *type);
-    LiveTarget ArgumentLiveTarget(FnSpec *spec, span<Node *const> argnodes, VarDef *base, VarDef *owner);
+                             const RefPlace &place, TypeExpr *type, size_t result = 0);
+    LiveTarget ArgumentLiveTarget(FnSpec *spec, span<Node *const> argnodes, PlacePath path, VarDef *owner);
     LiveTarget CallerLiveTarget(LiveTarget recorded, const PlacePaths &fields, VarDef *owner, FnSpec *spec,
                                 span<const Val> args, span<Node *const> argnodes);
     static VarDef *PrefixOwner(VarDef *prefix) {
@@ -2415,7 +2420,7 @@ struct TypeCheck {
 
     string fitfail;  // A specific reason from the last failing FitsAt, if any.
 
-    void MustFit(Val &v, Node *n, TypeExpr *dt);
+    void MustFit(Val &v, Node *n, TypeExpr *dt, size_t result = 0);
     void CheckArrayCount(Node *n, TypeExpr *t, int64_t count) {
         if (!t || t->kind != TY_ARRAY) return;
         auto a = t->arr;
@@ -2425,7 +2430,7 @@ struct TypeCheck {
             (uint64_t)count >= (1ull << IntBits(ls)))
             Error(n, cat("array length ", count, " exceeds storage range of ", TypeStr(t)));
     }
-    bool FitsAt(Val &v, TypeExpr *dt, bool delivered = true, Node *conversion = nullptr);
+    bool FitsAt(Val &v, TypeExpr *dt, bool delivered = true, Node *conversion = nullptr, size_t result = 0);
     static string ConstStr(const Val &v);
     Val CheckCond(Node *n);
     TypeExpr *UnifyBranch(TypeExpr *a, TypeExpr *b, Node *at, bool wantvalue);
@@ -2838,7 +2843,8 @@ struct TypeCheck {
         ValueLinks elementlinks;
     };
     bool InitOrderStoreSafe(Node *n, TypeExpr *dest);
-    bool InitOrderSafe(Node *n, set<FnSpec *> &visiting, FnSpec *callee = nullptr);
+    enum class EvalRequirement { ReadOnly, Reorderable };
+    bool ReadOnlyExpr(Node *n, EvalRequirement requirement, set<FnSpec *> &visiting, FnSpec *callee = nullptr);
     LitDeep CheckInits(StructLit *sl, vector<Field> &fields, vector<TypeExpr *> &ftypes,
                        string_view what, TypeExpr *selft);
     void CheckSelfInit(Node *n, TypeExpr *ft, TypeExpr *selft);
@@ -2946,9 +2952,9 @@ struct TypeCheck {
     // Builtins (§3.7, §9.3, §11.2) and array members (§3.3, §5.4).
 
     Val CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> &args, Val *precv);
-    bool ReadOnlyResizeFill(Node *n);
     enum class SlotRemoval { None, ToCapacity, Possible, All, NamedZeroPop, NamedZeroResize };
-    SlotRemoval CountedRemoval(BuiltinKind op, const vector<Node *> &args, const Val &count, TypeExpr *array);
+    SlotRemoval CountedRemoval(BuiltinKind op, const vector<Node *> &args, const Val &count,
+                               TypeExpr *array, const Val &receiver);
     void CheckByteOut(Call *c, Node *out, const string &form);
     // Later passes walk only the arguments that can execute. Overload
     // resolution on a subsequent check still needs the call as written.

@@ -11,6 +11,7 @@ let unused_zero = 0;
 let unused_limited_count = 0;
 
 fn zero() -> i64 { 0 }
+fn plus_one(n: i64) -> i64 { n + 1 }
 
 fn keep_named(nodes: Node[>..]&) {
     nodes.pop_n(zero_count);
@@ -115,6 +116,7 @@ fn main() {
     cells.data.pop_n(zero_count);
     cells.data.resize(cells.data.len, 0);
     cells.data.resize(cells.data.len, zero());
+    cells.data.resize(cells.data.len, plus_one(5));
     cells.data.resize(cells.data.len, cells.data[0] + 1);
     let n: u64 = 3;
     cells.data.resize(cells.data.len, n as i64);

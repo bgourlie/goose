@@ -1465,7 +1465,7 @@ inline Val TypeCheck::TryDispatch(Call *c, vector<SFunction *> &cands, FnSpec *e
         for (size_t r = 0; r < lastcallrets.size(); r++) {
             auto reaches = spec->inprogress || lastcallrets[r].elementlinks ||
                            (r < spec->record.retroots.size() && spec->record.retroots[r].set);
-            auto prefix = LivePrefixTarget(c, r);
+            auto prefix = LivePrefixTarget(c, r, lastcallrets[r].type);
             if (!reached[r]) prefixes[r] = prefix;
             else if (reaches) prefixes[r] = prefixes[r].Common(prefix);
             if (!reached[r]) results[r] = lastcallrets[r];
@@ -1474,7 +1474,8 @@ inline Val TypeCheck::TryDispatch(Call *c, vector<SFunction *> &cands, FnSpec *e
         }
     }
     lastcallrets = results;
-    for (size_t r = 0; r < prefixes.size(); r++) cur.links.SetTarget(ResultTarget(c, r), prefixes[r]);
+    for (size_t r = 0; r < prefixes.size(); r++)
+        cur.links.SetTarget(ResultTarget(c, r, results[r].type), prefixes[r]);
     for (auto &mi : matches) WarnDeprecatedCall(*this, c, name, mi.sf);
     return results.empty() ? VoidVal() : results[0];
 }
@@ -2090,18 +2091,19 @@ inline void TypeCheck::NoteExit(int tf, Node *at, vector<RetRoot> results,
                                   current != tf, std::move(interrupted));
     auto e = frames[tf].exits;
     if (!reachable || !e) return;
-    // The reference was computed before the defers. Only promise a live
-    // target if its proof survived their writes and all later result operands.
+    // The reference or slice was computed before the defers. Only promise
+    // live storage if its proof survived their writes and later result operands.
     if (tf == current && !expressions.empty()) for (size_t i = 0; i < results.size(); i++) {
-        if (!IsAddressRef(frames[tf].spec->rets[i])) continue;
-        if (results[i].place.nullonly) {
+        auto rt = frames[tf].spec->rets[i];
+        if (!IsAddressRef(rt) && rt->kind != TY_SLICE) continue;
+        if (IsAddressRef(rt) && results[i].place.nullonly) {
             results[i].liveprefix = LiveTarget::Null();
             continue;
         }
-        auto prefix = expressions.size() == 1 ? LivePrefixTarget(expressions[0], i)
-                                              : LivePrefixTarget(expressions[i]);
+        auto prefix = expressions.size() == 1 ? LivePrefixTarget(expressions[0], i, rt)
+                                              : LivePrefixTarget(expressions[i], 0, rt);
         if (prefix.array) {
-            auto roots = NonNullRefRoots(results[i].alts, frames[tf].spec->rets[i], results[i].writable);
+            auto roots = NonNullRefRoots(results[i].alts, rt, results[i].writable);
             if (roots.Exact() && PrefixOwner(prefix.array) == roots.Root()) results[i].liveprefix = prefix;
         }
     }
@@ -4037,12 +4039,13 @@ inline Val TypeCheck::CallResult(Call *c, FnSpec *spec, vector<Val> &argvals, sp
         v.elementlinks = ri.elementlinks;
         if (!spec->inprogress) v.intactprefix = ri.intactprefix.value_or(false);
         LiveTarget prefix;
-        if (!spec->inprogress && IsAddressRef(v.type) && (ri.liveprefix.Known() || ri.place.fields.Known())) {
+        if (!spec->inprogress && (IsAddressRef(v.type) || v.type->kind == TY_SLICE) &&
+            (ri.liveprefix.Known() || ri.place.fields.Known())) {
             auto roots = NonNullRefRoots(v, v.type, v.writable);
             prefix = CallerLiveTarget(ri.liveprefix, ri.place.fields, roots.Exact() ? roots.Root() : nullptr,
                                       spec, argvals, argnodes);
         }
-        cur.links.SetTarget(ResultTarget(c, i), prefix);
+        cur.links.SetTarget(ResultTarget(c, i, v.type), prefix);
         lastcallrets.push_back(v);
     }
     if (spec->rets.empty()) return VoidVal();
@@ -4203,7 +4206,7 @@ inline void TypeCheck::CheckReturn(Return *r) {
                             vals[i] = DecayRef(vals[i]);
                             NoRelRefCopy(r->vals[0], rt, i);
                         }
-                        MustFit(vals[i], r->vals[0], rt);
+                        MustFit(vals[i], r->vals[0], rt, i);
                     }
                 }
             } else {
@@ -4389,6 +4392,7 @@ inline Val TypeCheck::CheckFunValCall(Call *c, const FnValBind &fb, TypeExpr *ex
         auto vd = NewVar(params[i].name, ptypes[i], c->line, params[i].isvar);
         vd->assigned = vd->maybeassigned = true;
         if (IsRefOrSlice(ptypes[i])) {
+            BindLiveTarget(vd, c->args[i], argvals[i]);
             BindRefProvenance(vd, argvals[i]);
             if (ptypes[i]->cq) vd->ref.writable = false;
             NoteRefPlace(vd, argvals[i]);
@@ -4436,6 +4440,7 @@ inline Val TypeCheck::CheckFunValCall(Call *c, const FnValBind &fb, TypeExpr *ex
         Error(c, "a block result containing relative links to its destination cannot be a "
                  "resize fill value, which is constructed once and copied");
     if (needslocation && resultdest.used) *resultdest.used = true;
+    ForwardLiveTarget(c, v.HasResultType() ? c->fvbody->tail : nullptr, &v);
     PopScope();
     frames.pop_back();
     erase_if(cur.kills, [](const Kill &k) { return !k.relative; });
@@ -4608,7 +4613,7 @@ inline void TypeCheck::ApplyRelativeStore(Node *call, FnSpec *spec, vector<Val> 
                         target, " to receiving storage ", receiver));
     }
     if (s.result >= 0 && dest.reached && !dest.result && !dest.discarded && !source.None()) {
-        auto prefix = ArgumentLiveTarget(spec, argnodes, s.target.base, source.Exact() ? source.Root() : nullptr);
+        auto prefix = ArgumentLiveTarget(spec, argnodes, { s.target.base }, source.Exact() ? source.Root() : nullptr);
         StoreElementLink(dest, dest.reached, { s.pointee, dest.appended ? EL_BACKWARD : EL_ANY },
                          call, source, {}, targetfield, prefix);
     }
