@@ -2821,6 +2821,7 @@ struct ShrinkEffect {
     TypeExpr *replaced;
     TypeExpr *arrayreceiver = nullptr; // A shrink of this array alone preserves its owner's fixed fields.
     CountProof preserves;          // No slot is removed.
+    bool keepslinks = false;       // Removing a fresh suffix preserves every pre-existing link target.
     CountProof replacesif = true;  // A removing operation empties 'replaced' under this condition.
     ShrinkEffect(ShrinkBalance b = SB_UNBALANCED, TypeExpr *r = nullptr)
         : balance(b), replaced(r) {}

@@ -697,6 +697,9 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
                          "references (§3.9)"));
     }
     // Signature-driven arguments.
+    auto beforestores = storeevents.size();
+    int64_t added = d.kind == B_PUSH ? 1 : 0;
+    int64_t popped = d.kind == B_POP ? 1 : -1;
     auto base = (d.flags & BF_MEMBER) ? 1 : 0;
     for (auto i = 0; d.args[i]; i++) {
         auto &an = args[base + i];
@@ -704,6 +707,7 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
             case 'i': {
                 auto count = CheckIntAny(an);
                 if (d.kind == B_POP_N) {
+                    popped = KnownIndex(an, count);
                     removal = CountedRemoval(d.kind, args, count, recvarr, rv, countcondition);
                 }
                 break;
@@ -754,6 +758,7 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
                 an->exprtype = av.type;
                 auto t2 = av.type;
                 if (IsPlainRef(t2)) t2 = t2->ref->sub;
+                added = IsArrayKind(t2, A_FIXED) ? ArraySize(t2->arr) : av.extent.length;
                 TypeExpr *selem = nullptr;
                 if (t2->kind == TY_ARRAY) selem = t2->arr->sub;
                 if (t2->kind == TY_SLICE) selem = t2->sub;
@@ -806,11 +811,27 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
     // it (§5.1); pop, pop_n and resize also need an element the shrink can
     // find, which a sequential array has not got.
     auto shrink = (d.flags & BF_SHRINKS) != 0;
+    auto header = ak == A_GROW && rv.Exact() && (added > 0 || popped > 0) && reachable && !cur.probingtypes
+                      ? ArrayHeader(rv, recvarr) : nullptr;
+    int64_t fresh = 0;
+    if (header) {
+        auto it = cur.links.fresh.find(header);
+        if (it != cur.links.fresh.end() && it->second.owner == rv.Root()) fresh = it->second.count;
+    }
     if (ak == A_GROW && shrink) {
-        CheckGrowShrink(c, d.name, args[0], rv, removal, countcondition);
+        CheckGrowShrink(c, d.name, args[0], rv, removal, countcondition, popped > 0 && popped <= fresh);
+        if (popped > 0 && popped < fresh) cur.links.fresh[header] = { rv.Root(), fresh - popped };
         if (d.kind != B_CLEAR && ClassOf(elem) != SC_FIXED)
             Error(c, cat(".", d.name, " needs fixed-size elements: ", TypeStr(rv.type),
                          " is sequential (§3.3)"));
+    }
+    if (header && added > 0) {
+        // A link installed during construction could already target the new slot.
+        auto intoarray = [&](const StoreEvent &e) {
+            return e.elementlink.direction == EL_ANY && MayAliasRoots(rv.Root(), true, e.container, !e.bound) != AL_NO;
+        };
+        if (none_of(storeevents.begin() + beforestores, storeevents.end(), intoarray))
+            cur.links.fresh[header] = { rv.Root(), std::min(fresh, INT64_MAX - added) + added };
     }
     // A grow-shrink array shrinks from anywhere, provided nothing in scope
     // refers into it (§5.2).
@@ -1479,7 +1500,7 @@ inline const string *TypeCheck::EmbedShader(Call *c, vector<Node *> &args) {
 // reference is what shrinks, or it is a struct's tail field, which shrinks
 // the storage the struct lies in, as a reference to the field would.
 inline void TypeCheck::CheckGrowShrink(Node *at, const char *op, Node *recv, const Val &rv,
-                                       SlotRemoval removal, CountProof condition) {
+                                       SlotRemoval removal, CountProof condition, bool keepslinks) {
     auto at_type = IsPlainRef(rv.type) ? rv.type->ref->sub : rv.type;
     assert(at_type->kind == TY_ARRAY);
     auto roots = rv.AsRoots();
@@ -1492,6 +1513,7 @@ inline void TypeCheck::CheckGrowShrink(Node *at, const char *op, Node *recv, con
         NoteOverwrite(recv, roots, storeevents.size(), at_type, &rv.refplace, nullptr, replacesif);
     ShrinkEffect effect { SB_UNBALANCED, empties ? at_type : nullptr };
     effect.preserves = removal == SlotRemoval::PreservesIfUnchanged ? condition : CountProof(removal == SlotRemoval::None);
+    effect.keepslinks = keepslinks;
     effect.replacesif = replacesif;
     ShrinkThrough(at, op, ExprStr(recv), roots, at_type, effect);
 }
@@ -2460,7 +2482,7 @@ inline void TypeCheck::CheckLinkShrink(const LinkShrink &s) {
     }
     GlobalSlots slots;
     const auto &effect = s.effect;
-    if (!effect.preserves.Committed()) {
+    if (!effect.keepslinks && !effect.preserves.Committed()) {
         auto safe = [&](TypeExpr *replaced, CountProof proof, GlobalSlots &views) {
             auto links = LiveElementLinks(s.owner, s.array, replaced, !s.viaclass, s.at,
                                           s.owner->isglobal && !s.viaclass ? &views : nullptr, &proof);
@@ -2784,7 +2806,7 @@ inline void TypeCheck::RecordLinkStore(const Roots &owners, TypeExpr *reached,
         auto write = state;
         if (!e.storefield.base) write.suffix.reset();
         if (d.bound || !owners.Exact() || d.root != owners.Root()) write.liveprefix = nullptr;
-        cur.links.Add(storeevents.back(), index, write);
+        cur.links.Add(*this, storeevents.back(), index, write);
     }
 }
 
@@ -3488,7 +3510,7 @@ inline void TypeCheck::NoteGlobalShrink(const LinkShrink &s, GlobalSlots slots) 
     // call. A bound may name another global, and a host can call an export
     // after any preceding export has edited the program's globals.
     auto spec = CurRealFrame().spec;
-    bool incoming = !s.effect.preserves.Committed() && (bound || (spec && spec->sf->isexport &&
+    bool incoming = !s.effect.keepslinks && !s.effect.preserves.Committed() && (bound || (spec && spec->sf->isexport &&
         !KilledFor(vd, vd, LoadType(vd->type), ResizableArrayIn(vd->type), since, true,
                    s.effect.replacesif.Committed() ? replaced : nullptr)));
     map<string, CountProof> fields;
@@ -4015,6 +4037,8 @@ inline void TypeCheck::NoteShrink(VarDef *root, TypeExpr *bound, ShrinkEffect ef
         if (!prior.arrayreceiver || !effect.arrayreceiver ||
             !TopConstEq(prior.arrayreceiver, effect.arrayreceiver)) prior.arrayreceiver = nullptr;
         // Only operations that can remove a slot constrain what they all replace.
+        prior.keepslinks = (prior.keepslinks || prior.preserves.Committed()) &&
+                           (effect.keepslinks || effect.preserves.Committed());
         if (effect.preserves.Committed()) return;
         if (prior.preserves.Committed()) {
             prior.preserves = effect.preserves;
@@ -4364,6 +4388,7 @@ inline void TypeCheck::ShrinkThrough(Node *at, const string &verb, const string 
             auto what = t.root == root ? string(t.root->name)
                                        : cat(t.root->name, " (which ", recv, " may point at)");
             GrowOnlyShrinkAt(at, verb, t.root, what, bound, arr, t.viaclass, effect);
+            if (!effect.preserves.Committed()) cur.links.ForgetSuffixes(*this, t.root, !bound);
         } else {
             auto what = t.root == root ? recv : cat(t.root->name, ", which ", recv,
                                                     " may point at");
@@ -5068,7 +5093,7 @@ inline void TypeCheck::ApplyCalleeShrinks(Node *at, FnSpec *spec, vector<Val> &a
                         state.suffix = { ast.Intern(mapped->path), suffix.guard };
                 }
             }
-            cur.links.Add(e, storesbase + i, state);
+            cur.links.Add(*this, e, storesbase + i, state);
         }
     };
     auto apply = [&](const Hit &h, ShrinkBalance judged) {
@@ -5278,7 +5303,13 @@ inline void TypeCheck::ApplyCalleeShrinks(Node *at, FnSpec *spec, vector<Val> &a
         }
         return judged;
     };
-    for (auto &h : hits) apply(h, judge(h));
+    for (auto &h : hits) {
+        apply(h, judge(h));
+        if (!h.effect.preserves.Committed()) {
+            entrylinks.ForgetSuffixes(*this, h.root, !h.bound);
+            cur.links.ForgetSuffixes(*this, h.root, !h.bound);
+        }
+    }
     ApplyCalleeLiveShrinks(at, spec, argvals, name);
     auto projectexit = [&](const FnRecord::ExitLinks &exit) {
         if (ordered) {

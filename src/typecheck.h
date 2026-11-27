@@ -316,6 +316,14 @@ struct TypeCheck {
             }
         };
         map<Part, Write, std::less<>> live;
+        // These trailing slots were appended after any forward link that
+        // could target them. Counts are lower bounds on every incoming path.
+        struct FreshSuffix {
+            VarDef *owner;
+            int64_t count;
+            bool operator==(const FreshSuffix &) const = default;
+        };
+        map<const LinkField *, FreshSuffix> fresh;
         // Integer bindings whose address may already have escaped on this path.
         set<VarDef *> borrowedindices;
         LimitedPrefixes prefixes;
@@ -385,8 +393,14 @@ struct TypeCheck {
             }
         };
         map<ArrayLit *, FillLinks> fills;
-        void Add(const StoreEvent &e, size_t index, FnRecord::LinkState state = {}) {
+        void ForgetSuffixes(TypeCheck &tc, VarDef *owner, bool exact) {
+            erase_if(fresh, [&](const auto &p) {
+                return tc.MayAliasRoots(p.second.owner, true, owner, exact) != AL_NO;
+            });
+        }
+        void Add(TypeCheck &tc, const StoreEvent &e, size_t index, FnRecord::LinkState state = {}) {
             if (state.cleared.Committed()) return;
+            if (e.elementlink.direction == EL_ANY) ForgetSuffixes(tc, e.container, !e.bound);
             Part part { e.container, e.elementlink, e.storefield, e.linkclass, e.linktarget, e.boundfield, e.indexed };
             Write write { state, index };
             auto [it, added] = live.try_emplace(std::move(part), write);
@@ -395,6 +409,7 @@ struct TypeCheck {
         // Once a binding expires, its outstanding writes still belong to
         // the enclosing field. A fresh iteration can bind a different slot.
         template<typename F> void ForgetBindings(F expired) {
+            erase_if(fresh, [&](const auto &p) { return expired(p.first->base) || expired(p.second.owner); });
             erase_if(borrowedindices, expired);
             erase_if(targets, [&](const auto &p) {
                 auto var = get_if<VarDef *>(&p.first);
@@ -416,7 +431,17 @@ struct TypeCheck {
                 if (!merged.inserted) merged.position->second.Include(merged.node.mapped());
             }
         }
-        void Join(const LinkFlow &other) {
+        void Join(const LinkFlow &other, bool backedge) {
+            for (auto it = fresh.begin(); it != fresh.end();) {
+                auto found = other.fresh.find(it->first);
+                // A decreasing bound can reach zero after enough iterations.
+                if (found == other.fresh.end() || found->second.owner != it->second.owner ||
+                    (backedge && found->second.count < it->second.count)) it = fresh.erase(it);
+                else {
+                    it->second.count = std::min(it->second.count, found->second.count);
+                    ++it;
+                }
+            }
             borrowedindices.insert(other.borrowedindices.begin(), other.borrowedindices.end());
             prefixes.Join(other.prefixes);
             for (auto it = targets.begin(); it != targets.end();) {
@@ -440,7 +465,8 @@ struct TypeCheck {
         }
         // Loop convergence depends on the possible writes, not event numbers.
         bool operator==(const LinkFlow &o) const {
-            return borrowedindices == o.borrowedindices && prefixes == o.prefixes && targets == o.targets && fills == o.fills &&
+            return fresh == o.fresh && borrowedindices == o.borrowedindices && prefixes == o.prefixes &&
+                   targets == o.targets && fills == o.fills &&
                    RelativeStore::SameSet(resultlinks, o.resultlinks) && live.size() == o.live.size() &&
                    equal(live.begin(), live.end(), o.live.begin(),
                          [](const auto &a, const auto &b) {
@@ -3029,7 +3055,7 @@ struct TypeCheck {
     const string *EmbedShader(Call *c, vector<Node *> &args);
     const string *EmbedFile(Call *c, vector<Node *> &args);
     void CheckGrowShrink(Node *at, const char *op, Node *recv, const Val &rv,
-                         SlotRemoval removal, CountProof condition);
+                         SlotRemoval removal, CountProof condition, bool keepslinks);
     bool RelyOnCountProof(CountProof proof, Node *at, const char *use);
     bool LiveConversionTargets(const ValueLinks &links, CountProof whole, Node *at);
     void GrowOnlyAssignKnown(Assign *a, const Roots &built, bool whole);
@@ -3139,13 +3165,14 @@ struct TypeCheck {
         cur.links.prefixes.Forget([&](VarDef *prefix) { return prefix == v; });
         cur.links.targets.erase(v);
         cur.links.targets.erase(SliceElements { v });
-        if (!cur.links.live.empty()) cur.links.ForgetBindings([&](VarDef *base) { return base == v; });
+        if (!cur.links.live.empty() || !cur.links.fresh.empty())
+            cur.links.ForgetBindings([&](VarDef *base) { return base == v; });
         if (!v->type || v->isvar || !IsAddressRef(v->type)) return;
         erase_if(cur.kills, [&](const Kill &k) { return k.relative && k.base == v; });
     }
     void ForgetLocal(VarDef *v) {
         if (cur.links.live.empty() && cur.links.targets.empty() && cur.links.prefixes.arrays.empty() &&
-            cur.links.fills.empty() && cur.links.borrowedindices.empty() && cur.kills.empty()) return;
+            cur.links.fills.empty() && cur.links.borrowedindices.empty() && cur.links.fresh.empty() && cur.kills.empty()) return;
         ForgetOwner(v);
         for (auto c : v->components) if (c) ForgetLocal(c);
     }

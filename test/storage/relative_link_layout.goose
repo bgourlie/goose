@@ -126,6 +126,39 @@ fn pushed_link_to_first() {
     assert(nodes.len == 1);
 }
 
+fn remove_new_slots(nodes: Node[>..]&, flag: bool) {
+    if flag { nodes.push(Node {}); }
+    else { nodes.push(Node {}); }
+    nodes.push(Node {});
+    nodes.pop();
+    nodes.pop_n(1);
+    nodes.append([Node {}, Node {}]);
+    nodes.pop_n(2);
+}
+
+fn keep_old_link(i: i64) {
+    var nodes: Node[>..] = [Node {}, Node {}];
+    nodes[0].next .= nodes[i];
+    nodes.push(Node {});
+    nodes.pop_n(1);
+    remove_new_slots(nodes, true);
+    remove_new_slots(nodes, false);
+    assert(nodes.len == 2 && nodes[0].next .== nodes[i]);
+}
+
+fn fixed_append_source() {
+    var list = NumberList { values: [11, 22] };
+    list.focus .= list.values[1];
+    let extra: i64[2] = [33, 44];
+    list.values.append(extra);
+    list.values.pop_n(2);
+    assert(list.values.len == 2 && list.focus .== list.values[1]);
+    var xs: i64[>..] = [];
+    xs.append([1; 32]);
+    while xs.len > 0 { xs.pop(); }
+    assert(xs.len == 0);
+}
+
 const TWO = 1 + 1;
 struct NumberList { focus: i64&<u32>?, values: i64[>..] }
 
@@ -220,6 +253,8 @@ fn main() {
     extend();
     appended_link(1);
     pushed_link_to_first();
+    keep_old_link(1);
+    fixed_append_source();
     backward_link();
     link_to_first(0);
     link_to_first(1);
