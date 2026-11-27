@@ -2886,8 +2886,7 @@ struct TypeCheck {
 
     Val CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> &args, Val *precv);
     enum class SlotRemoval { None, Possible, All, NamedZeroPop, NamedZeroResize };
-    SlotRemoval CountedRemoval(BuiltinKind op, const vector<Node *> &args, const Val &count,
-                               const Val &receiver, TypeExpr *array);
+    SlotRemoval CountedRemoval(BuiltinKind op, const vector<Node *> &args, const Val &count, TypeExpr *array);
     void CheckByteOut(Call *c, Node *out, const string &form);
     // Later passes walk only the arguments that can execute. Overload
     // resolution on a subsequent check still needs the call as written.
@@ -2952,8 +2951,8 @@ struct TypeCheck {
     std::optional<Kill> MapParamPart(FnSpec *spec, const vector<Node *> &args, const vector<Val> &vals,
                                      size_t param, const string &path, bool relative, size_t at);
     void NoteKill(Assign *assign, const LVal &loc, TypeExpr *target, const Val &v, size_t at);
-    bool MayViewLimitedSlot(const Kill &part, TypeExpr *array, Node *shrink = nullptr,
-                            set<TypeExpr *> *globalSlots = nullptr);
+    CountProof HiddenLimitedSlots(const Kill &part, TypeExpr *array, Node *shrink = nullptr,
+                                  set<TypeExpr *> *globalSlots = nullptr);
     bool CanExposeLimitedSlot(TypeExpr *array, TypeExpr *pointee);
     bool HasLimitedSlotView(VarDef *owner, const LinkField &part, TypeExpr *array, Node *shrink);
     bool MayKeepLimitedSlots(TypeExpr *t, const Kill &part, Node *value);
@@ -2961,7 +2960,9 @@ struct TypeCheck {
     void NoteOverwrite(Node *path, const Roots &loc, size_t at, TypeExpr *target,
                        const RefPlace *place = nullptr, Node *value = nullptr, CountProof guard = true);
     bool KilledFor(VarDef *c, VarDef *base, TypeExpr *t, TypeExpr *arr, size_t &since,
-                   bool relative = false, TypeExpr *replaced = nullptr, Node *shrink = nullptr);
+                   bool relative = false, TypeExpr *replaced = nullptr, Node *shrink = nullptr,
+                   CountProof *requirements = nullptr);
+    template<typename F> bool HasLiveHolderStores(VarDef *v, TypeExpr *array, Node *shrink, F sees);
     TypeExpr *FieldPathType(VarDef *base, string_view path);
     TypeExpr *KillPartType(const Kill &k) { return FieldPathType(k.base, k.path); }
     void ApplyLinkKill(const Kill &k);

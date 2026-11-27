@@ -1058,13 +1058,14 @@ struct ElementLink {
     TypeExpr *pointee = nullptr; // One representative per loaded type (LinkPointee).
     ElementLinks direction = EL_NONE;
     bool intail = false; // The receiving slot lies in its owner's resizable tail.
-    bool suffixonly = false; // In a limited-array value, this slot is outside its live length.
+    CountProof suffixonly; // This slot is outside the live length of a limited-array value.
     CountProof livetarget; // Its target is within this limited-array value's current length.
+    CountProof cleared;    // The containing value does not carry this link under this condition.
     explicit operator bool() const { return direction != EL_NONE; }
     auto operator<=>(const ElementLink &) const = default;
     bool SameSlotKind(ElementLink other) const {
         return pointee == other.pointee && intail == other.intail && suffixonly == other.suffixonly &&
-               livetarget == other.livetarget;
+               livetarget == other.livetarget && cleared == other.cleared;
     }
 };
 
@@ -3050,13 +3051,20 @@ struct FnRecord {
             out.writes.insert(right.writes.begin(), right.writes.end());
         });
     }
+    struct LimitedSuffix {
+        string_view path;
+        CountProof guard;
+        bool operator==(const LimitedSuffix &) const = default;
+    };
     struct LinkState {
-        std::optional<string_view> suffix; // The slot only survives outside this field's live length.
+        std::optional<LimitedSuffix> suffix; // The slot only survives outside this field's live length.
         LiveTarget liveprefix;             // The target is live in this array or array parameter.
         CountProof cleared;                // A named-zero resize can have removed this slot.
 
         void Include(const LinkState &other) {
-            if (suffix != other.suffix) suffix.reset();
+            if (suffix && other.suffix && suffix->path == other.suffix->path)
+                suffix->guard = suffix->guard.Both(other.suffix->guard);
+            else suffix.reset();
             liveprefix = liveprefix.Common(other.liveprefix);
             cleared = cleared.Both(other.cleared);
         }

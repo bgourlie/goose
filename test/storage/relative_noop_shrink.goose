@@ -1,6 +1,8 @@
 struct Node { next: Node&<u32>? }
 struct List { head: Node&<u32>?, nodes: Node[>..] }
 struct Cells { head: i64&<u32>?, data: i64[>..] }
+struct Point { coords: i64[2] = [0; 2] }
+struct Points { cursor: Point&<u32>?, values: Point[>..] }
 const ZERO = 0;
 const ALSO_ZERO = ZERO + 0;
 let zero_count = 0;
@@ -74,6 +76,12 @@ export fn keep_shared() { shared.resize(shared.len); }
 export fn pop_shared() { shared.pop_n(zero_count); }
 
 fn main() {
+    var points = Points { values: [Point { coords: [4, 2] }] };
+    points.cursor .= points.values[0];
+    points.values.resize(points.values.len, Point { coords: [7, 8] });
+    points.values.resize(points.values.len, Point {});
+    points.values.resize(points.values.len, default<Point>());
+    assert(points.cursor .== points.values[0]);
     var limited: Node[..] = [Node {}, Node {}];
     limited[0].next .= limited[1];
     limited.pop_n(unused_limited_count);

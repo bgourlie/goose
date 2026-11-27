@@ -24,12 +24,20 @@ inline bool ReadOnlyResizeFill(Node *n) {
     if (auto cond = Is<IfExpr>(n))
         return cond->elseb && ReadOnlyResizeFill(cond->cond) && ReadOnlyResizeFill(cond->thenb) &&
                ReadOnlyResizeFill(cond->elseb);
+    if (Is<StructLit>(n) || Is<ArrayLit>(n)) {
+        // CheckInits has already installed every field default that will run.
+        bool readonly = true;
+        n->Children([&](Node *child) { readonly = readonly && ReadOnlyResizeFill(child); });
+        return readonly;
+    }
+    if (auto c = Is<Call>(n); c && c->builtin == B_DEFAULT)
+        return !c->defaultinit || ReadOnlyResizeFill(c->defaultinit);
     return false;
 }
 
 // The count and, for resize, the fill have already been checked in evaluation order.
 inline TypeCheck::SlotRemoval TypeCheck::CountedRemoval(BuiltinKind op, const vector<Node *> &args,
-                                                        const Val &count, const Val &receiver, TypeExpr *array) {
+                                                        const Val &count, TypeExpr *array) {
     assert(op == B_POP_N || op == B_RESIZE);
     auto len = Is<Dot>(args[1]);
     if (len && len->member == B_LEN && SamePath(args[0], len->obj, PathInterval::ConsecutiveReads)) {
@@ -43,20 +51,14 @@ inline TypeCheck::SlotRemoval TypeCheck::CountedRemoval(BuiltinKind op, const ve
     auto binding = ConstantBindings(count);
     if (binding == ConstantBinding::Aliased) return SlotRemoval::Possible;
     if (binding == ConstantBinding::Immutable) return zero;
-    // A helper may not know whether its caller retains a link. Carry the
-    // count to the shrink check that needs to rely on its initializer.
+    // A helper may not know whether its caller retains a link. Keep the
+    // zero count conditional until a shrink or conversion needs it.
     if (op == B_POP_N && array->arr->akind != A_GROWSHRINK) return SlotRemoval::NamedZeroPop;
-    if (op == B_RESIZE && array->arr->akind == A_GROW && HasRelRefT(array->arr->sub))
+    auto ak = array->arr->akind;
+    auto elem = array->arr->sub;
+    if (op == B_RESIZE && ((ak == A_GROW && HasRelRefT(elem)) ||
+                           (ak == A_LIMITED && (HasRelRefT(elem) || HoldsPlainRef(elem)))))
         return SlotRemoval::NamedZeroResize;
-    if (op == B_RESIZE && reachable && array->arr->akind == A_LIMITED &&
-        HasRelRefT(array->arr->sub)) {
-        auto owner = receiver.Exact() ? receiver.Root() : nullptr;
-        if (cur.deferring || !owner || !owner->ownerspec || IsClassRoot(owner) ||
-            owner->ownerspec != CurRealFrame().spec || LiveElementLinks(owner)) {
-            RelyOnNamed(count, args[1]);
-            return zero;
-        }
-    }
     return SlotRemoval::Possible;
 }
 
@@ -542,7 +544,7 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
                                    "contains self-relative references, is not supported; push "
                                    "the elements, which constructs each in place"));
         }
-        removal = CountedRemoval(d.kind, args, length, rv, recvarr);
+        removal = CountedRemoval(d.kind, args, length, recvarr);
         if (removal == SlotRemoval::NamedZeroResize) zerocount = length.constfrom;
     }
     // index_of recovers the element index a reference stands for (§3.3).
@@ -655,7 +657,7 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
             case 'i': {
                 auto count = CheckIntAny(an);
                 if (d.kind == B_POP_N) {
-                    removal = CountedRemoval(d.kind, args, count, rv, recvarr);
+                    removal = CountedRemoval(d.kind, args, count, recvarr);
                     if (removal == SlotRemoval::NamedZeroPop) zerocount = count.constfrom;
                 }
                 break;
@@ -741,13 +743,14 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
     if (d.flags & BF_WRITE) {
         auto write = removal == SlotRemoval::None ? StorageWrite::Storage : StorageWrite::MayDropSlots;
         NoteStorageWrite(rv, recvarr, rv.refplace, reachable || writesduringargs, write,
-                         ak == A_LIMITED ? zerocount : nullptr);
+                         removal == SlotRemoval::NamedZeroPop && ak == A_LIMITED ? zerocount : nullptr);
     }
     // Emptying a limited array unpublishes its whole live prefix, just as
     // assigning [] does. Existing slot views keep their storage (§5.3).
-    if (removal == SlotRemoval::All && ak == A_LIMITED) {
-        if (HasRelRefT(elem)) NoteOverwrite(args[0], rv, storeevents.size(), recvarr, &rv.refplace);
-        if (HoldsPlainRef(elem)) NoteOverwrite(args[0], rv, storeevents.size(), recvarr, nullptr);
+    if (ak == A_LIMITED && (removal == SlotRemoval::All || removal == SlotRemoval::NamedZeroResize)) {
+        auto empty = zerocount ? CountProof::IfZero(ast.zeroconditions, zerocount) : CountProof(true);
+        if (HasRelRefT(elem)) NoteOverwrite(args[0], rv, storeevents.size(), recvarr, &rv.refplace, nullptr, empty);
+        if (HoldsPlainRef(elem)) NoteOverwrite(args[0], rv, storeevents.size(), recvarr, nullptr, nullptr, empty);
     }
     // A grow-only array shrinks only where nothing can still be rooted in
     // it (§5.1); pop, pop_n and resize also need an element the shrink can
@@ -1489,25 +1492,29 @@ inline ValueLinks TypeCheck::LiveElementLinks(VarDef *owner, TypeExpr *target, T
     auto limited = !target && t && IsArrayKind(t, A_LIMITED);
     ValueLinks links;
     auto retain = [&](ElementLink link, const LinkField &field, const LinkField &to,
-                      std::optional<string_view> suffix = {}, CountProof livetarget = false, CountProof absent = false) {
+                      std::optional<FnRecord::LimitedSuffix> suffix = {}, CountProof livetarget = false,
+                      CountProof absent = false) {
         if (!link || (emptiestail && link.intail) || !LinkMayReachElements(arr, link.pointee)) return;
         if (target && target->kind == TY_ARRAY && InRetainedField(owner, link.pointee, to.base, to.path)) return;
         if (absent.Committed()) return;
         if (shrink && suffix) {
-            Kill part { owner, field.base, string(*suffix), 0, true };
+            Kill part { owner, field.base, string(suffix->path), 0, true };
             auto array = KillPartType(part);
             if (array) {
                 set<TypeExpr *> slots;
-                auto visible = MayViewLimitedSlot(part, array, shrink, globalSlots && link.direction == EL_ANY
-                                                                       ? &slots : nullptr);
+                auto hidden = HiddenLimitedSlots(part, array, shrink, globalSlots && link.direction == EL_ANY
+                                                                        ? &slots : nullptr);
                 for (auto type : slots) {
                     auto [it, added] = globalSlots->try_emplace(type, absent);
                     if (!added) it->second = it->second.Both(absent);
                 }
-                if (!visible) return;
+                absent = absent.Prefer(suffix->guard.Both(hidden));
+                if (absent.Committed()) return;
             }
         }
-        link.suffixonly = limited && field.base == owner && suffix && suffix->empty();
+        link.suffixonly = limited && field.base == owner && suffix && suffix->path.empty()
+                              ? suffix->guard : CountProof();
+        link.cleared = absent;
         link.livetarget = limited ? livetarget : CountProof();
         if (requirements && link.direction == EL_ANY && absent.Available()) {
             *requirements = requirements->Both(absent);
@@ -1814,39 +1821,46 @@ inline void TypeCheck::NoteOverwrite(Node *lval, const Roots &loc, size_t at, Ty
 // A limited array keeps its capacity slots across assignment (§5.3). Once
 // the live count changes, the old suffix can only be observed through an
 // existing view of an element or one of its parts.
-inline bool TypeCheck::MayViewLimitedSlot(const Kill &part, TypeExpr *array, Node *shrink,
-                                          set<TypeExpr *> *globalSlots) {
+inline CountProof TypeCheck::HiddenLimitedSlots(const Kill &part, TypeExpr *array, Node *shrink,
+                                                set<TypeExpr *> *globalSlots) {
     auto owner = part.container;
-    if (cur.deferring || !owner || !owner->type) return true;
+    if (cur.deferring || !owner || !owner->type) return false;
     // Keep an external prefix overwrite conditional. At the shrink each
     // caller replays it against its own views. Global bindings are checked
     // after every function's stores are known.
     if (owner->isglobal || owner->ownerspec != CurRealFrame().spec) {
-        if (!part.relative || !shrink || (owner->isglobal && !globalSlots)) return true;
+        if (!part.relative || !shrink || (owner->isglobal && !globalSlots)) return false;
     }
     // Follow incoming links back to a live prefix or a held view. A cycle
     // of links entirely within discarded suffixes has no such entry point.
     LinkField start { part.base, part.path };
     set<LinkField> seen { start };
     vector<pair<LinkField, TypeExpr *>> pending { { start, array } };
+    CountProof hidden = true;
     while (!pending.empty()) {
         auto [field, type] = std::move(pending.back());
         pending.pop_back();
-        if (HasLimitedSlotView(owner, field, type, shrink)) return true;
+        if (HasLimitedSlotView(owner, field, type, shrink)) return false;
         if (owner->isglobal) globalSlots->insert(type);
         for (auto &[slot, write] : cur.links.live) {
             if (slot.owner != owner || slot.target.ApartFrom(field.base, field.path) ||
                 !CanExposeLimitedSlot(type, slot.link.pointee)) continue;
             if (write.at < part.at && slot.field.Within(part.base, part.path)) continue;
-            if (!write.suffix) return true;
-            LinkField source { slot.field.base, string(*write.suffix) };
+            if (write.cleared.Committed()) continue;
+            if (!write.suffix) {
+                hidden = hidden.Both(write.cleared);
+                if (!hidden.Available()) return false;
+                continue;
+            }
+            hidden = hidden.Both(write.suffix->guard);
+            LinkField source { slot.field.base, string(write.suffix->path) };
             if (!seen.insert(source).second) continue;
             auto container = FieldPathType(source.base, source.path);
-            if (!container || !IsArrayKind(container, A_LIMITED)) return true;
+            if (!container || !IsArrayKind(container, A_LIMITED)) return false;
             pending.emplace_back(std::move(source), container);
         }
     }
-    return false;
+    return hidden;
 }
 
 inline bool TypeCheck::CanExposeLimitedSlot(TypeExpr *array, TypeExpr *pointee) {
@@ -1940,7 +1954,7 @@ inline bool TypeCheck::MayKeepLimitedSlots(TypeExpr *t, const Kill &part, Node *
                 if (!lit->fillval) count = (int64_t)lit->elems.size();
                 else ConstInt(lit->fillcount, count);
             }
-            if ((!t->arr->sizeexpr || count != ArraySize(t->arr)) && MayViewLimitedSlot(part, t))
+            if ((!t->arr->sizeexpr || count != ArraySize(t->arr)) && !HiddenLimitedSlots(part, t).Committed())
                 return true;
         }
         auto elem = part;
@@ -1992,23 +2006,16 @@ inline void TypeCheck::NoteOverwrite(Kill kill, TypeExpr *target, Node *value) {
 // value or effects after construction can install links that survive.
 inline void TypeCheck::ApplyLinkKill(const Kill &k) {
     if (cur.links.live.empty()) return;
-    if (!k.guard.Committed()) {
-        // Only a named-zero resize produces a conditional overwrite. Its
-        // receiver is the unique resizable tail of this exact owner.
-        for (auto &[part, write] : cur.links.live)
-            if (part.owner == k.container && write.at < k.at &&
-                (part.link.intail || part.field.Within(k.base, k.path) ||
-                 (part.boundfield && part.boundfield->Within(k.base, k.path))))
-                write.cleared = write.cleared.Prefer(k.guard);
-        return;
-    }
     if (k.prefixonly) {
         // Record the condition on each incoming write in this execution
         // context, including caller and unwind state replaying this effect.
         auto suffix = ast.Intern(k.path);
-        for (auto &[part, write] : cur.links.live)
-            if (part.owner == k.container && write.at < k.at && part.field.Within(k.base, k.path))
-                write.suffix = suffix;
+        for (auto &[part, write] : cur.links.live) {
+            if (part.owner != k.container || write.at >= k.at || !part.field.Within(k.base, k.path)) continue;
+            auto guard = k.guard;
+            if (write.suffix && write.suffix->path == suffix) guard = write.suffix->guard.Prefer(guard);
+            write.suffix = { suffix, guard };
+        }
         return;
     }
     auto owner = k.container;
@@ -2019,21 +2026,24 @@ inline void TypeCheck::ApplyLinkKill(const Kill &k) {
     auto storage = OwnerType(owner);
     auto t = LoadType(storage ? storage : k.base->type->ref->sub);
     size_t since;
-    bool all = (storage || ClassOf(t) == SC_RESIZABLE) &&
+    bool all = k.guard.Committed() && (storage || ClassOf(t) == SC_RESIZABLE) &&
                KilledFor(owner, owner, t, nullptr, since, true);
     auto part = KillPartType(k);
     bool tail = part && ResizableArrayIn(part);
-    erase_if(cur.links.live, [&](const auto &entry) {
-        auto &[place, write] = entry;
-        auto at = write.at;
-        if (place.owner != owner) return false;
-        if (at < k.at && place.field.Within(k.base, k.path)) return true;
-        if (at < k.at && place.boundfield && place.boundfield->Within(k.base, k.path)) return true;
-        if (tail && place.link.intail && at < k.at) return true;
-        if (!all || at >= since) return false;
-        auto reached = storeevents[at].reached;
-        return storage || (reached && TopConstEq(t, LoadType(reached)));
-    });
+    for (auto it = cur.links.live.begin(); it != cur.links.live.end();) {
+        auto &[place, write] = *it;
+        if (place.owner == owner) {
+            if (write.at < k.at && (place.field.Within(k.base, k.path) || (tail && place.link.intail) ||
+                                    (place.boundfield && place.boundfield->Within(k.base, k.path))))
+                write.cleared = write.cleared.Prefer(k.guard);
+            if (all && write.at < since) {
+                auto reached = storeevents[write.at].reached;
+                if (storage || (reached && TopConstEq(t, LoadType(reached)))) write.cleared = true;
+            }
+        }
+        if (write.cleared.Committed()) it = cur.links.live.erase(it);
+        else ++it;
+    }
 }
 
 // Whether the kills in force empty every slot of a `t` lying at `base` in
@@ -2044,7 +2054,8 @@ inline void TypeCheck::ApplyLinkKill(const Kill &k) {
 // storage, which no kill of this one empties. `since` gets the earliest kill
 // relied on; with none relied on, nothing is said.
 inline bool TypeCheck::KilledFor(VarDef *c, VarDef *base, TypeExpr *t, TypeExpr *arr,
-                                 size_t &since, bool relative, TypeExpr *replaced, Node *shrink) {
+                                 size_t &since, bool relative, TypeExpr *replaced, Node *shrink,
+                                 CountProof *requirements) {
     since = SIZE_MAX;
     if (cur.kills.empty()) return false;
     // A reference into c whose pointee is of c's own type points at the
@@ -2060,19 +2071,29 @@ inline bool TypeCheck::KilledFor(VarDef *c, VarDef *base, TypeExpr *t, TypeExpr 
     function<bool(TypeExpr *, const string &)> emptied = [&](TypeExpr *ft, const string &path) {
         if (relative && !RetainsRelativeSlot(ft, arr, replaced)) return true;
         std::optional<size_t> latest;
+        CountProof proof;
         for (auto &k : cur.kills) {
-            if (k.container != c || k.relative != relative || !k.guard.Committed()) continue;
+            if (k.container != c || k.relative != relative) continue;
+            auto guard = k.guard;
+            if (requirements ? !guard.Available() : !guard.Committed()) continue;
             auto kb = whole(k.base);
             if (kb != c || !k.path.empty()) {
                 if (kb != base) continue;
                 if (k.path != path && !(relative && FieldPathWithin(path, k.path))) continue;
             }
-            if (k.prefixonly && (!shrink || !IsArrayKind(ft, A_LIMITED) ||
-                                 MayViewLimitedSlot(k, ft, shrink))) continue;
-            latest = latest ? std::max(*latest, k.at) : k.at;
+            if (k.prefixonly) {
+                if (!shrink || !IsArrayKind(ft, A_LIMITED)) continue;
+                guard = guard.Both(HiddenLimitedSlots(k, ft, shrink));
+                if (requirements ? !guard.Available() : !guard.Committed()) continue;
+            }
+            if (!latest || k.at > *latest) {
+                latest = k.at;
+                proof = guard;
+            } else if (k.at == *latest) proof = proof.Prefer(guard);
         }
         if (latest && (!relative || ft->kind != TY_STRUCT)) {
             since = std::min(since, *latest);
+            if (requirements) *requirements = requirements->Both(proof);
             return true;
         }
         if (!relative && !CanHoldViewInto(ft, arr)) return true;
@@ -2086,6 +2107,25 @@ inline bool TypeCheck::KilledFor(VarDef *c, VarDef *base, TypeExpr *t, TypeExpr 
         return true;
     };
     return emptied(t, "") && since != SIZE_MAX;
+}
+
+// Only rely on a named count if discarding the old stores actually removes
+// every relevant view. A new store after the resize can still be live.
+template<typename F>
+inline bool TypeCheck::HasLiveHolderStores(VarDef *v, TypeExpr *array, Node *shrink, F sees) {
+    auto from = LiveEventBase(v);
+    auto t = LoadType(v->type);
+    size_t since;
+    if (!pathslive && KilledFor(v, v, t, array, since, false, nullptr, shrink))
+        from = std::max(from, since);
+    if (!sees(from) || !UsedAfter(v)) return false;
+    CountProof proof = true;
+    if (!pathslive && KilledFor(v, v, t, array, since, false, nullptr, shrink, &proof) &&
+        since > from && !sees(since)) {
+        RelyOnCountProof(proof, shrink, "array shrink");
+        return false;
+    }
+    return true;
 }
 
 // The type of an inline field path, null where it names no such field.
@@ -2253,13 +2293,11 @@ inline void TypeCheck::GrowOnlyShrinkAt(Node *c, const string &op, VarDef *vd,
             VarDef *incoming = nullptr;
             // What a part a kill emptied held before it is gone, and so are
             // the views a path the holder keeps may have been followed to.
-            auto from = LiveEventBase(v);
-            size_t since;
-            if (!pathslive && KilledFor(v, v, LoadType(t), arrtype, since, false, nullptr, c))
-                from = std::max(from, since);
-            if (!HolderMayPointInto(v, vd, arrtype, from, &where, &hit, &via, &incoming) ||
-                !UsedAfter(v))
-                return;
+            if (!HasLiveHolderStores(v, arrtype, c, [&](size_t from) {
+                via = nullptr;
+                incoming = nullptr;
+                return HolderMayPointInto(v, vd, arrtype, from, &where, &hit, &via, &incoming);
+            })) return;
             // The views that say so were passed by the call, not stored by
             // the body, and only the parameter's class bounds them
             // (StoreEvent::incoming).
@@ -2301,7 +2339,7 @@ inline void TypeCheck::GrowOnlyShrinkAt(Node *c, const string &op, VarDef *vd,
 inline bool TypeCheck::LiveConversionTargets(const ValueLinks &links, CountProof whole, Node *at) {
     CountProof targets = true;
     for (auto &slot : links.slots)
-        if (slot.link.direction == EL_ANY) targets = targets.Both(slot.link.livetarget);
+        if (slot.link.direction == EL_ANY) targets = targets.Both(slot.link.livetarget.Prefer(slot.link.cleared));
     return RelyOnCountProof(whole.Prefer(targets), at, "limited-array conversion");
 }
 
@@ -2547,9 +2585,9 @@ inline void TypeCheck::StoreElementLink(const Dest &dest, TypeExpr *type, Elemen
                                        LiveTarget liveprefix) {
     if (!reachable || dest.discarded || dest.roots.None()) return;
     auto reached = dest.reached ? dest.reached : type;
-    std::optional<string_view> suffix;
-    if (link.suffixonly && IsArrayKind(type, A_LIMITED) && dest.fieldsteps && dest.field.base)
-        suffix = ast.Intern(dest.field.path);
+    std::optional<FnRecord::LimitedSuffix> suffix;
+    if (link.suffixonly.condition && IsArrayKind(type, A_LIMITED) && dest.fieldsteps && dest.field.base)
+        suffix = { ast.Intern(dest.field.path), link.suffixonly };
     link.suffixonly = false; // Stored links name their containing array by path.
     if (dest.repeated) {
         // Element slots share the field containing the array. Nested
@@ -2562,8 +2600,10 @@ inline void TypeCheck::StoreElementLink(const Dest &dest, TypeExpr *type, Elemen
     }
     auto field = dest.field;
     if (field.base && dest.fieldsteps) field.path += path;
-    RecordLinkStore(dest.roots, reached, link, at, dest.place, field, target,
-                    dest.boundsteps ? ast.places.Project(dest.boundfield, path) : dest.boundfield, { suffix, liveprefix });
+    auto cleared = link.cleared;
+    link.cleared = false;
+    auto bound = dest.boundsteps ? ast.places.Project(dest.boundfield, path) : dest.boundfield;
+    RecordLinkStore(dest.roots, reached, link, at, dest.place, field, target, bound, { suffix, liveprefix, cleared });
 }
 
 inline void TypeCheck::FinishFill(ArrayLit *fill, const Dest &dest) {
@@ -4236,18 +4276,18 @@ inline void TypeCheck::NoteLiveViews(Node *at, const string &prefix, VarDef *roo
         if (IsRefOrSlice(t) && !v->componentowner) {
             if (!v->refrootknown) return;
             vs = views(v->ref, t, false, v->isvar, false, v);
+            if (!judged(vs) || !UsedAfter(v)) return;
         } else if (growonly && HoldsPlainRef(t)) {
             // A grow-only array's views may be stored (§5.1): the holder's
             // store record says where its references lead, since the kills
             // that emptied it.
-            set<VarDef *> seen;
-            auto from = LiveEventBase(v);
-            size_t since;
-            if (!pathslive && KilledFor(v, v, LoadType(t), arrtype, since, false, nullptr, at))
-                from = std::max(from, since);
-            RecordedViews(v, from, t, vs, seen);
-        }
-        if (!judged(vs) || !UsedAfter(v)) return;
+            if (!HasLiveHolderStores(v, arrtype, at, [&](size_t from) {
+                set<VarDef *> seen;
+                vs.clear();
+                RecordedViews(v, from, t, vs, seen);
+                return judged(vs);
+            })) return;
+        } else return;
         for (auto &w : vs) note(w, string(v->name));
     });
 }
@@ -4776,7 +4816,8 @@ inline void TypeCheck::ApplyCalleeShrinks(Node *at, FnSpec *spec, vector<Val> &a
                 if (it->second.suffix && e.storefield.base) {
                     auto &from = spec->record.classevents[origins[i]];
                     auto base = from.storefield.base;
-                    FnRecord::CallerKill guard { -1, string(*it->second.suffix), true, from.container, base };
+                    const auto &suffix = *it->second.suffix;
+                    FnRecord::CallerKill guard { -1, string(suffix.path), true, from.container, base };
                     auto p = find(spec->params.begin(), spec->params.end(), base);
                     if (p != spec->params.end()) {
                         guard.param = (int)(p - spec->params.begin());
@@ -4784,7 +4825,7 @@ inline void TypeCheck::ApplyCalleeShrinks(Node *at, FnSpec *spec, vector<Val> &a
                     }
                     auto mapped = mapkill(guard);
                     if (mapped && mapped->container == e.container && e.storefield.Within(mapped->base, mapped->path))
-                        state.suffix = ast.Intern(mapped->path);
+                        state.suffix = { ast.Intern(mapped->path), suffix.guard };
                 }
             }
             cur.links.Add(e, storesbase + i, state);

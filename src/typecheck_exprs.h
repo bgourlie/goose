@@ -1488,23 +1488,27 @@ inline bool TypeCheck::FitsAt(Val &v, TypeExpr *dt, bool delivered, Node *conver
             if (!TypeEq(selem, dt->arr->sub)) return false;
             // An array conversion copies the live run. Suffix slots remain observable
             // through references into the source but are absent from the destination.
+            CountProof layout = true, shrinkable = true;
             ValueLinks links;
             for (auto [link, path, target] : v.elementlinks.slots) {
-                if (link.suffixonly) continue;
+                link.cleared = link.cleared.Prefer(link.suffixonly);
+                link.suffixonly = false;
+                if (link.cleared.Committed()) continue;
+                if (TopConstEq(link.pointee, t)) layout = layout.Both(link.cleared);
+                shrinkable = shrinkable.Both(link.cleared);
                 link.intail = IsArrayKind(dt, A_GROW);
                 links.Include(link, path, target);
             }
             // Changing the outer layout moves or removes its header. Offsets
             // within the element run survive, but an offset to the array
             // itself would no longer address an array of its declared type.
-            if (t->kind == TY_ARRAY &&
-                links.Any([&](auto link) { return TopConstEq(link.pointee, t); })) {
+            if (t->kind == TY_ARRAY && !RelyOnCountProof(layout, conversion, "array conversion")) {
                 fitfail = cat("cannot construct ", TypeStr(dt), " from ", TypeStr(t),
                               ": a self-relative link may name the source array itself, "
                               "whose layout the conversion changes (§3.9)");
                 return false;
             }
-            if (dt->arr->akind == A_GROWSHRINK && links) {
+            if (dt->arr->akind == A_GROWSHRINK && !RelyOnCountProof(shrinkable, conversion, "array conversion")) {
                 fitfail = cat("cannot construct ", TypeStr(dt), " from ", TypeStr(t),
                               ": a shrink could remove an element that a self-relative "
                               "reference still names (§5.2)");
@@ -1516,6 +1520,7 @@ inline bool TypeCheck::FitsAt(Val &v, TypeExpr *dt, bool delivered, Node *conver
                               "that the conversion would discard (§5.3)");
                 return false;
             }
+            erase_if(links.slots, [](const auto &slot) { return slot.link.cleared.Committed(); });
             v.elementlinks = std::move(links);
             v.intactprefix = IsArrayKind(dt, A_LIMITED);
             v.extent = ConstructedExtent(dt, IsArrayKind(t, A_FIXED) ? ArraySize(t->arr) : v.extent.length);
