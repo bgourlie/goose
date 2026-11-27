@@ -4075,10 +4075,16 @@ inline vector<FnRecord::CallerKill> TypeCheck::CallerKills(FnSpec *spec, bool re
             out.back().guard = k.guard;
             continue;
         }
-        if (!base->type || (!base->isglobal && base->ownerspec == spec)) continue;
-        if (base != k.container && (base->isvar || !IsAddressRef(base->type) ||
-                                    !base->ref.Exact() || RefRootOf(base) != k.container))
-            continue;
+        if (base->subscript) {
+            // This element is named by the pair of bindings. It remains
+            // the same caller location only if both survive the call.
+            if (base->subscript->ownerspec == spec || base->elementarray->base->ownerspec == spec) continue;
+        } else {
+            if (!base->type || (!base->isglobal && base->ownerspec == spec)) continue;
+            if (base != k.container && (base->isvar || !IsAddressRef(base->type) ||
+                                        !base->ref.Exact() || RefRootOf(base) != k.container))
+                continue;
+        }
         out.push_back({ -1, k.path, true, k.container, base, k.prefixonly });
         out.back().guard = k.guard;
     }
