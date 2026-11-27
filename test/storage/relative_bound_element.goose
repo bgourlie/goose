@@ -5,6 +5,21 @@ fn connect(n: Node&, target: Node&) { n.links.next .= target; }
 fn clear_links(links: Links&) { links.next .= null; }
 fn as_node(n: Node&) -> Node& { n }
 
+fn relay(n: Node&, target: Node&) { connect(n, target); }
+fn connect_link(link: Links&, target: Node&) { link.next .= target; }
+fn connect_extra(n: Node&, target: Node&, j: i64) { connect_link(n.extra[j], target); }
+
+fn clear_indexed(index: i64, j: i64) {
+    var nodes: Node[>..] = [Node {}, Node {}, Node {}];
+    relay(nodes[index], nodes[2]);
+    assert(nodes[index].links.next .== nodes[2]);
+    nodes[index].links.next .= null;
+    connect_extra(nodes[index], nodes[2], j);
+    nodes[index].extra = [Links {}, Links {}];
+    nodes.pop_n(1);
+    assert(nodes.len == 2 && nodes[index].links.next == null);
+}
+
 fn clear_pair(index: i64, direct: bool) {
     var nodes: Node[>..] = [Node {}, Node {}, Node {}];
     {
@@ -41,6 +56,7 @@ fn clear_each() {
 }
 
 fn main() {
+    clear_indexed(1, 0);
     clear_pair(0, true);
     clear_pair(0, false);
     clear_each();

@@ -2571,11 +2571,13 @@ inline void TypeCheck::AddStoreEvent(const StoreEvent &e) {
     // every store of it is.
     auto boundfield = e.boundfield;
     if (boundfield && boundfield->base->ownerspec == spec) boundfield = nullptr;
+    auto indexed = e.indexed;
+    if (indexed.DependsOn([&](VarDef *v) { return v->ownerspec == spec; })) indexed = {};
     auto &evs = spec->record.classevents;
     for (size_t m = 0; m < evs.size(); m++) {
         auto &o = evs[m];
         if (o.container == e.container && o.elementlink == e.elementlink && o.linkparam == e.linkparam &&
-            o.storefield == e.storefield && o.boundfield == boundfield &&
+            o.storefield == e.storefield && o.boundfield == boundfield && o.indexed == indexed &&
             o.linktarget == e.linktarget && o.wholecopy == e.wholecopy &&
             o.root == e.root && o.src == e.src &&
             o.exact == e.exact && o.byteview == e.byteview && o.bound == e.bound &&
@@ -2589,6 +2591,7 @@ inline void TypeCheck::AddStoreEvent(const StoreEvent &e) {
     }
     evs.push_back(e);
     evs.back().boundfield = boundfield;
+    evs.back().indexed = indexed;
     origin(evs.size() - 1);
 }
 
@@ -2665,7 +2668,8 @@ inline RefPlace TypeCheck::ArgumentPlace(FnSpec *spec, VarDef *param, span<const
 }
 
 inline LinkField TypeCheck::MapStoreField(FnSpec *spec, const vector<Val> &args, VarDef *owner,
-                                           const Roots &mapped, LinkField field, const LinkField **bound) {
+                                           const Roots &mapped, LinkField field, const LinkField **bound,
+                                           IndexedSlot *indexed) {
     if (!field.base) return {};
     if (field.base == owner && owner->componentbase) {
         field.base = ExactComponent(mapped);
@@ -2673,6 +2677,12 @@ inline LinkField TypeCheck::MapStoreField(FnSpec *spec, const vector<Val> &args,
     } else if (field.base->ownerspec == spec) {
         auto part = ArgumentPlace(spec, field.base, args);
         if (bound && !*bound) *bound = part.boundenclosing ? part.bound : ast.places.Project(part.bound, field.path);
+        // For an enclosing field this path ends at the containing part:
+        // replacing it clears the write, replacing a child alone cannot.
+        if (indexed && !indexed->array) {
+            *indexed = part.indexed;
+            indexed->element = ast.places.Project(indexed->element, field.path);
+        }
         // When the argument names only an enclosing array, the callee's
         // remaining path cannot identify an element within it.
         if (!part.Base()) return {};
@@ -2757,7 +2767,10 @@ inline void TypeCheck::RecordLinkStore(const Roots &owners, TypeExpr *reached,
         e.container = d.root;
         e.elementlink = link;
         e.storefield = StoredField(field, owners, d.root, d.bound);
-        if (!d.bound && owners.Exact() && d.root == owners.Root()) e.boundfield = boundfield;
+        if (!d.bound && owners.Exact() && d.root == owners.Root()) {
+            e.boundfield = boundfield;
+            e.indexed = indexed;
+        }
         e.linktarget = StoredField(target, owners, d.root, d.bound);
         if (place.param && !link.intail && !d.bound && owners.Exact() &&
             d.root == owners.Root() && d.root == place.param->ref.Root())
@@ -2771,8 +2784,7 @@ inline void TypeCheck::RecordLinkStore(const Roots &owners, TypeExpr *reached,
         auto write = state;
         if (!e.storefield.base) write.suffix.reset();
         if (d.bound || !owners.Exact() || d.root != owners.Root()) write.liveprefix = nullptr;
-        cur.links.Add(storeevents.back(), index, write,
-                      owners.Exact() && !d.bound && owners.Root() == d.root ? indexed : IndexedSlot {});
+        cur.links.Add(storeevents.back(), index, write);
     }
 }
 
@@ -3367,9 +3379,10 @@ inline void TypeCheck::ApplyCalleeStores(FnSpec *spec, vector<Val> &argvals, Nod
             }
             auto owners = mapped(e.container, !e.bound);
             auto boundfield = e.boundfield;
-            auto field = MapStoreField(spec, argvals, e.container, owners, e.storefield, &boundfield);
+            auto indexed = e.indexed;
+            auto field = MapStoreField(spec, argvals, e.container, owners, e.storefield, &boundfield, &indexed);
             RecordLinkStore(owners, e.reached, e.elementlink, at, place, field,
-                            MapStoreField(spec, argvals, e.container, owners, e.linktarget), boundfield);
+                            MapStoreField(spec, argvals, e.container, owners, e.linktarget), boundfield, {}, indexed);
         } else {
             applystore(e, mapped(e.root, e.exact), true);
         }

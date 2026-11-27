@@ -2555,7 +2555,8 @@ inline void TypeCheck::ApplyLinkEffects(const LinkEffects &effects) {
     for (auto &[part, write] : effects.writes.live) {
         storeevents.push_back(storeevents[write.at]);
         storeevents.back().boundfield = part.boundfield;
-        cur.links.Add(storeevents.back(), storeevents.size() - 1, write, part.indexed);
+        storeevents.back().indexed = part.indexed;
+        cur.links.Add(storeevents.back(), storeevents.size() - 1, write);
     }
     cur.links.borrowedindices.insert(effects.writes.borrowedindices.begin(), effects.writes.borrowedindices.end());
     for (auto &[v, fact] : effects.writes.prefixes.arrays) cur.links.prefixes.Establish(v, fact);

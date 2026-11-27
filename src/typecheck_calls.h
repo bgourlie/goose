@@ -3241,7 +3241,7 @@ inline bool TypeCheck::SameRecord(const FnRecord &a, const FnRecord &b, const Fn
     }
     auto sameevents = [&](const StoreEvent &p, const StoreEvent &q) {
         return p.container == q.container && p.elementlink == q.elementlink && p.linkparam == q.linkparam &&
-               p.storefield == q.storefield && p.boundfield == q.boundfield &&
+               p.storefield == q.storefield && p.boundfield == q.boundfield && p.indexed == q.indexed &&
                p.linktarget == q.linktarget && p.wholecopy == q.wholecopy &&
                p.root == q.root && p.src == q.src &&
                p.exact == q.exact && p.byteview == q.byteview && p.bound == q.bound &&

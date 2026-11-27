@@ -385,9 +385,9 @@ struct TypeCheck {
             }
         };
         map<ArrayLit *, FillLinks> fills;
-        void Add(const StoreEvent &e, size_t index, FnRecord::LinkState state = {}, IndexedSlot indexed = {}) {
+        void Add(const StoreEvent &e, size_t index, FnRecord::LinkState state = {}) {
             if (state.cleared.Committed()) return;
-            Part part { e.container, e.elementlink, e.storefield, e.linkclass, e.linktarget, e.boundfield, indexed };
+            Part part { e.container, e.elementlink, e.storefield, e.linkclass, e.linktarget, e.boundfield, e.indexed };
             Write write { state, index };
             auto [it, added] = live.try_emplace(std::move(part), write);
             if (!added) it->second.Include(write);
@@ -3165,7 +3165,8 @@ struct TypeCheck {
     RefPlace BindingPlace(VarDef *vd, RefPlace place);
     RefPlace ArgumentPlace(FnSpec *spec, VarDef *param, span<const Val> args);
     LinkField MapStoreField(FnSpec *spec, const vector<Val> &args, VarDef *owner,
-                            const Roots &mapped, LinkField field, const LinkField **bound = nullptr);
+                            const Roots &mapped, LinkField field, const LinkField **bound = nullptr,
+                            IndexedSlot *indexed = nullptr);
     void RecordElementLinks(const Dest &dest, TypeExpr *type, const ValueLinks &links, Node *at);
     void StoreElementLink(const Dest &dest, TypeExpr *type, ElementLink link, Node *at,
                           const Roots &borrowed, string_view path = {}, const LinkField &target = {},

@@ -2874,6 +2874,7 @@ struct StoreEvent {
     ElementLink elementlink;
     LinkField storefield;  // The part containing the written slot, when known.
     const LinkField *boundfield = nullptr; // Relative store within a bound element of that part.
+    IndexedSlot indexed;  // Relative store reached through an array and an index binding.
     LinkField linktarget;  // The part a self-relative link points into, when known.
     bool wholecopy = false; // An entire holder copied to this exact field.
     VarDef *linkparam = nullptr; // Direct destination parameter, even when parameters share a class.
