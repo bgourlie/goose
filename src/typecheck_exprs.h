@@ -261,10 +261,7 @@ inline TypeCheck::LVal TypeCheck::CheckLValue(Node *n, PathUse use) {
         lv.reusable = vd->reusable;
         n->exprtype = vd->type;
         if (IsRefOrSlice(lv.type)) {
-            Val v;
-            v.type = LoadType(lv.type);
-            v.SetProv(RefProvOf(vd));
-            RecordVal(n, v);
+            RecordVal(n, ReadRefBinding(vd, lv.type));
         } else {
             record(lv);
         }
@@ -305,8 +302,8 @@ inline TypeCheck::LVal TypeCheck::CheckLValue(Node *n, PathUse use) {
         // The index checks the captured length. A shrink during evaluation of
         // the subscript invalidates this evidence just like a later shrink.
         NoteSequenceElement(n, ix->obj, lv, lv.place, lv.type);
-        lv.place = lv.place.Inside(ast.places, IsArrayKind(lv.type, A_GROW));
-        if (use != PathUse::Reread) CheckIntAny(ix->idx);
+        if (use != PathUse::Reread) ix->constantindex = KnownIndex(ix->idx, CheckIntAny(ix->idx));
+        lv.place = IndexedPlace(lv.place, lv.type, ix);
         if (lv.type->cq) lv.writable = false;   // An element of a const value.
         lv.letbound = false;
         lv.type = elem;
@@ -929,6 +926,16 @@ inline void TypeCheck::CheckAccessorOwner(Node *at, TypeExpr *owner, TypeExpr *t
         Error(at, cat("const for accessor belongs to ", TypeStr(owner), ", not ", TypeStr(t)));
 }
 
+// A slice can start anywhere in its backing array. Its subscript alone
+// cannot identify the absolute slot, even when the subscript is constant.
+inline RefPlace TypeCheck::IndexedPlace(RefPlace place, TypeExpr *sequence, const Index *ix) {
+    auto intail = IsArrayKind(sequence, A_GROW);
+    if (sequence->kind != TY_ARRAY || ix->constantindex < 0) return place.Inside(ast.places, intail);
+    place.Project(ast.places, cat("[", ix->constantindex, "]"));
+    place.location.intail |= intail;
+    return place;
+}
+
 // Project an inline field before deciding whether to load its contents.
 // Root fields own their storage. A variant field stays within its payload.
 inline void TypeCheck::ProjectField(Prov &storage, RefPlace &place, TypeExpr *owner,
@@ -941,9 +948,7 @@ inline void TypeCheck::ProjectField(Prov &storage, RefPlace &place, TypeExpr *ow
     } else {
         if (!place.regions.All().empty() && GetStructInst(owner)->frameobj && ClassOf((*fields.ftypes)[i]) == SC_FIXED)
             place.regions = place.regions.FixedField(ast.places.regions);
-        auto name = (*fields.fields)[i].name;
-        if (!place.boundenclosing) place.bound = ast.places.Project(place.bound, name, ".");
-        place.fields = place.fields.Project(ast.places, name, false, ".");
+        place.Project(ast.places, (*fields.fields)[i].name);
     }
 }
 

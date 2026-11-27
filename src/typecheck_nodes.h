@@ -94,11 +94,9 @@ inline Val Ident::Check(TypeCheck &tc, TypeExpr *) {
         auto t = vd->narrowed ? vd->narrowed : vd->type;
         v.type = tc.LoadType(t);
         if (IsRefOrSlice(t)) {
-            v.SetProv(tc.RefProvOf(vd));
-            if (t->kind == TY_REF) v.refplace = vd->PointeePlace(tc.ast.places);
+            v = tc.ReadRefBinding(vd, t);
             v.lvalue = t->kind == TY_SLICE;   // A slice variable is storage; a reference is the pointee's path.
             if (v.lvalue) {
-                v.sliceplace = vd->SlicePlace();
                 v.slot.Set(vd, true);
                 // As writable as `&` of the variable is (CheckLValue, CheckRefOf).
                 v.slot.writable = v.writable && !vd->copybind && !(vd->type && vd->type->cq);

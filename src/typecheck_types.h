@@ -811,6 +811,17 @@ inline Val TypeCheck::CheckIntAny(Node *n) {
     return v;
 }
 
+// A fixed-type literal or a read of a typed constant still identifies a
+// slot even though its value cannot adapt to another integer type.
+inline int64_t TypeCheck::KnownIndex(Node *n, const Val &v) {
+    int64_t lo, hi;
+    if (IntConsts(v, lo, hi) && lo == hi && lo >= 0 && ConstantBindings(v) == ConstantBinding::Immutable)
+        return lo;
+    if (auto literal = Is<IntLit>(n); literal && literal->val >= 0) return literal->val;
+    if (auto id = Is<Ident>(n); id && id->vdef) return id->vdef->constantindex;
+    return -1;
+}
+
 // Does this type embed self-relative references at the value level (not
 // behind plain references/slices)? Those are the offsets that depend on
 // where the value sits, so a copy would carry the wrong ones; an

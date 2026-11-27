@@ -775,7 +775,7 @@ struct WriteRegions {
 
 struct LinkField {
     VarDef *base = nullptr;
-    string path;  // Dot-separated fields of this variable or stable parameter's pointee.
+    string path;  // Dot-separated fields and [index] steps from this variable or stable parameter's pointee.
     bool enclosing = false; // The path names storage containing the target, e.g. viewed elements.
     bool Within(VarDef *owner, string_view enclosing) const {
         return base && base == owner && FieldPathWithin(path, enclosing);
@@ -951,6 +951,10 @@ struct RefPlace {
     bool Enclosing() const { return fields.Cover().enclosing; }
 
     void ForgetBound() { bound = nullptr; boundenclosing = false; }
+    void Project(PlacePool &pool, string_view step) {
+        fields = fields.Project(pool, step, false, ".");
+        if (!boundenclosing) bound = pool.Project(bound, step, ".");
+    }
     RefPlace WithoutPath() const {
         auto part = *this;
         part.fields = {};
@@ -1762,6 +1766,7 @@ NODE(Index)
     BCE_WALK
     BCE_MARK
     Node *obj, *idx;
+    int64_t constantindex = -1; // Known subscript, saved so rereading a path needn't evaluate it again.
     bool nobc = false;          // Bounds check proven redundant (bce.h); codegen omits it.
     Index(Line l, Node *_obj, Node *_idx) : Node(l, NKind), obj(_obj), idx(_idx) {}
 NODE_END
@@ -2353,8 +2358,8 @@ struct VarDef {
     RefPlace PointeePlace(PlacePool &pool) {
         auto place = refplace;
         if (!isvar && !istemp && !place.fields.Known() && !place.nullonly) place.fields = { this };
-        // Indexing names only the enclosing array. A let also names its
-        // particular pointee for as long as this binding is in scope.
+        // Even when an index names only the enclosing array, a let names
+        // its particular pointee for as long as this binding is in scope.
         if (place.Enclosing() && (!place.bound || place.boundenclosing) &&
             !isvar && !istemp && !isglobal && IsAddressRef(type) && ref.Exact()) {
             place.bound = pool.Bound(this);
@@ -2390,6 +2395,7 @@ struct VarDef {
     bool constlit = false;
     bool constuns = false;      // constval's bits are a u64 above i64.max (Val::uns).
     int64_t constval = 0;
+    int64_t constantindex = -1; // Known nonnegative value of an immutable integer binding, including typed constants.
     bool constnot = false;      // A constlit whose constval is `~c`, c >= 0 (Val::notconst).
     bool constflt = false;      // A float constant, of value constfval.
     double constfval = 0;

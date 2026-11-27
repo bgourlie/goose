@@ -481,7 +481,7 @@ struct TypeCheck {
         LinkLocation place;
         LinkField field;
         const LinkField *boundfield = nullptr;
-        bool fieldsteps = true;  // An element or variant can only name its enclosing field.
+        bool fieldsteps = true;  // False when only the enclosing storage is known.
         bool boundsteps = true;
         Roots roots;
         FnSpec *result = nullptr;
@@ -702,7 +702,10 @@ struct TypeCheck {
     // The checked value of every expression that points somewhere, by node.
     flat_map<Node *, Val> nodevals;
     void RecordVal(Node *n, const Val &v) {
-        if (!v.None() || v.holderset) nodevals[n] = v;
+        // A deferred read needs the binding from this evaluation even when
+        // it points nowhere. An earlier loop pass may have recorded a target.
+        if (!v.None() || v.holderset || (hasdefers && Is<Ident>(n) && v.type && IsRefOrSlice(v.type)))
+            nodevals[n] = v;
     }
     // How a parent consumes an operand after its later operands ran: as its
     // value (a reference or slice, a holder's references), as a view of an
@@ -1744,6 +1747,7 @@ struct TypeCheck {
     bool BoundAnywhere(VarDef *vd);
     Prov GlobalVarRead(VarDef *vd);
     Prov RefProvOf(VarDef *vd);
+    Val ReadRefBinding(VarDef *vd, TypeExpr *type);
     VarDef *ResetLocal(VarDef *previous);
     VarDef *RootComponent(VarDef *owner, TypeExpr *t, int field);
     TypeExpr *ComponentType(VarDef *root) {
@@ -2010,6 +2014,7 @@ struct TypeCheck {
     TypeExpr *DeclType(TypeExpr *t, TypeExpr *s);
     static bool ImplicitInt(IntStorage from, IntStorage to);
     Val CheckIntAny(Node *n);
+    static int64_t KnownIndex(Node *n, const Val &v);
     bool HasRelRefT(TypeExpr *t, bool inpool = false);
     bool BuiltWhereReceived(Node *n, size_t result);
     void NoRelRefCopy(Node *n, TypeExpr *t, size_t result = 0, const VarDecl *bind = nullptr,
@@ -2171,6 +2176,7 @@ struct TypeCheck {
     Val ContainerRead(LVal lv);
     void CheckAccessorOwner(Node *at, TypeExpr *owner, TypeExpr *t, StructLit *lit = nullptr);
     void ResolveMemberLValue(LVal &lv, Dot *d);
+    RefPlace IndexedPlace(RefPlace place, TypeExpr *sequence, const Index *ix);
     void ProjectField(Prov &storage, RefPlace &place, TypeExpr *owner, const FieldRun &fields, size_t i);
     // Where a holder value's references point: what was derived for it, else
     // for a reference or slice its own roots, and for a by-value holder what
@@ -2289,12 +2295,12 @@ struct TypeCheck {
         NodeScope ns(*this, n);
         auto cyclecalls = frames.back().cyclecalls;
         auto v = n->Check(*this, expected);
-        if (hasdefers && (Is<Ident>(n) || Is<Dot>(n))) NoteStorageRead(n);
         if (v.type == fntype && !Is<Ident>(n) && !Is<FunVal>(n))
             Error(n, "a function value must be a function name or block literal (§7.6); "
                      "evaluate runtime expressions separately");
         NoteTemp(n, v, cyclecalls);
         RecordVal(n, v);
+        if (hasdefers && (Is<Ident>(n) || Is<Dot>(n))) NoteStorageRead(n);
         // A value of a type naming nothing is a consequence of the error
         // reported where the name is written, and says nothing more.
         if (!ast.unknowntypes.empty() && v.type && MentionsUnknown(v.type)) throw Abandoned {};
@@ -3051,7 +3057,7 @@ struct TypeCheck {
                    bool relative = false, TypeExpr *replaced = nullptr, Node *shrink = nullptr,
                    CountProof *requirements = nullptr);
     template<typename F> bool HasLiveHolderStores(VarDef *v, TypeExpr *array, Node *shrink, F sees);
-    TypeExpr *FieldPathType(VarDef *base, string_view path);
+    TypeExpr *FieldPathType(VarDef *base, string_view path, bool retainedonly = false);
     TypeExpr *KillPartType(const Kill &k) { return FieldPathType(k.base, k.path); }
     void ApplyLinkKill(const Kill &k);
     bool KillNamesType(const Kill &k, TypeExpr *target) {
@@ -3378,7 +3384,7 @@ struct TypeCheck {
         Rebuild *rebuild = nullptr;
         // The node being checked and every node it is nested in (PathEntry).
         vector<PathEntry> nodepath;
-        Node *bindingread = nullptr; // Initializer evaluated as a reference or slice binding.
+        Node *bindingread = nullptr; // Expression evaluated as a reference or slice binding.
         // The argument print, str or format is rendering, and as which
         // builtin: its views stay live while its parts' format overloads run,
         // and so does where it lies (`renderwhere`) unless an overload takes

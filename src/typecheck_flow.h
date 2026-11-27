@@ -569,6 +569,17 @@ inline Prov TypeCheck::RefProvOf(VarDef *vd) {
     return p;
 }
 
+// Both value and lvalue reads capture the reference's binding when the
+// name is evaluated. Later operands can change which storage it names.
+inline Val TypeCheck::ReadRefBinding(VarDef *vd, TypeExpr *type) {
+    Val value;
+    value.type = LoadType(type);
+    value.SetProv(RefProvOf(vd));
+    if (type->kind == TY_SLICE) value.sliceplace = vd->SlicePlace();
+    else value.refplace = vd->PointeePlace(ast.places);
+    return value;
+}
+
 inline VarDef *TypeCheck::ResetLocal(VarDef *previous) {
     if (!previous) return ast.NewVarDef();
     ForgetOwner(previous);
@@ -2678,17 +2689,24 @@ inline void TypeCheck::NoteStorageRead(Node *n) {
     auto ref = IsRefOrSlice(v->type) && !descriptor;
     if (!cur.deferring && !ref && !v->isglobal && v->ownerspec == spec) return;
     auto holder = ref ? PointeeOf(v->type) : v->type;
-    auto place = ref ? (v->type->kind == TY_SLICE ? v->SlicePlace() : v->PointeePlace(ast.places))
-                     : RefPlace { {}, { v } };
-    if (place.nullonly) return;
+    RefPlace place { {}, { v } };
     Prov storage;
-    storage.TakeAlts(ref ? OwnersAtPlace(RefRootsOf(v), place) : RootsOf(v));
+    if (ref) {
+        // The subscript may have rebound the name after its array or slice
+        // was selected. Its stored value describes the binding we evaluated.
+        auto binding = nodevals.find(id);
+        if (!binding) return;
+        place = v->type->kind == TY_SLICE ? binding->sliceplace : binding->refplace;
+        if (place.nullonly) return;
+        storage.TakeAlts(OwnersAtPlace(*binding, place));
+        storage.byteview = binding->byteview;
+    } else storage.TakeAlts(RootsOf(v));
     auto add = [&](const Prov &where, TypeExpr *type, TypeExpr *field, const RefPlace &selected) {
         auto observed = field ? field : type;
         vector<TypeExpr *> targets;
         if (!slotonly && HasRelRefT(observed)) SelfRelPointees(observed, targets);
         for (auto &owner : where.alts) {
-            StorageRead read { v, type, field, selected, owner, ref && v->ref.byteview, n };
+            StorageRead read { v, type, field, selected, owner, storage.byteview, n };
             if (slotonly || IsSelfRelRef(observed)) read.use = StorageRead::Slot;
             RecordStorageRead(read);
             for (auto t : targets) {
@@ -2720,7 +2738,7 @@ inline void TypeCheck::NoteStorageRead(Node *n) {
             if (IsPlainRef(seq)) seq = seq->ref->sub;
             if (seq->kind != TY_ARRAY && seq->kind != TY_SLICE) break;
             field = seq->kind == TY_SLICE ? seq->sub : seq->arr->sub;
-            place = place.Inside(ast.places, IsArrayKind(seq, A_GROW));
+            place = IndexedPlace(place, seq, ix);
         } else {
             auto t = field ? field : holder;
             auto runs = FieldRuns(t);
@@ -3283,6 +3301,8 @@ inline void TypeCheck::CheckVarDecl(VarDecl *vd, bool global) {
         d->constfval = v.fval;
         d->constfrom = d->constlit ? v.constfrom : nullptr;
         Finish(d, ann ? ann : v.type, &v, vd->inits[i]);
+        if (!d->isvar && d->type->cq && IsIntT(d->type))
+            d->constantindex = KnownIndex(vd->inits[i], v);
         auto len = Is<Dot>(vd->inits[i]);
         if (!vd->isvar && !global && len && len->member == B_LEN &&
             d->type->kind == TY_INT && d->type->intstorage == IS_I64)
@@ -3597,6 +3617,7 @@ inline void TypeCheck::CheckRebind(Assign *a, LVal &lv) {
         // `r .= &x` is the documented spelling of a rebind (§3.8), so an
         // explicit & is not redundant here as it is at a binding destination.
         SlotScope ss(*this, true);
+        Saved binding(cur.bindingread, a->rhs);
         v = CheckV(a->rhs, target);
         if (BindsRef(v, target)) {
             a->rhs->exprtype = v.type;

@@ -1546,7 +1546,7 @@ inline bool TypeCheck::InRetainedField(VarDef *owner, TypeExpr *pointee, VarDef 
     if (base != owner && !(base->isparam && !base->isvar && IsAddressRef(base->type) &&
                            base->ref.Exact() && base->ref.Root() == owner &&
                            ClassOf(base->type->ref->sub) == SC_RESIZABLE)) return false;
-    auto field = FieldPathType(base, path);
+    auto field = FieldPathType(base, path, true);
     return field && !IsRefOrSlice(field) && ClassOf(field) != SC_RESIZABLE &&
            CanContainLinkTarget(field, pointee);
 }
@@ -1948,7 +1948,7 @@ inline bool TypeCheck::MayKeepLimitedSlots(TypeExpr *t, const Kill &part, Node *
                 return true;
         }
         auto elem = part;
-        elem.base = nullptr;  // Field paths do not distinguish array elements.
+        elem.base = nullptr;  // This check covers every element, including an implicit fill.
         if (lit && !lit->fillval && !lit->elems.empty())
             return any_of(lit->elems.begin(), lit->elems.end(), [&](Node *e) {
                 return MayKeepLimitedSlots(t->arr->sub, elem, e);
@@ -1965,8 +1965,8 @@ inline bool TypeCheck::MayKeepLimitedSlots(TypeExpr *t, const Kill &part, Node *
 
 inline void TypeCheck::NoteOverwrite(Kill kill, TypeExpr *target, Node *value) {
     if (MayKeepLimitedSlots(target, kill, value)) {
-        // Kills name fields, not individual indices. Publish the fully
-        // overwritten siblings and retain the array's previous link facts.
+        // A partial limited-array replacement can leave reserved slots
+        // intact. Record complete overwrites of its siblings separately.
         if (IsArrayKind(target, A_LIMITED)) {
             kill.prefixonly = true;
         } else if (target->kind == TY_STRUCT) {
@@ -2118,8 +2118,9 @@ inline bool TypeCheck::HasLiveHolderStores(VarDef *v, TypeExpr *array, Node *shr
     return true;
 }
 
-// The type of an inline field path, null where it names no such field.
-inline TypeExpr *TypeCheck::FieldPathType(VarDef *base, string_view path) {
+// Resolve inline fields and array slots. A retained path must also stay
+// outside any element run that a shrink can release.
+inline TypeExpr *TypeCheck::FieldPathType(VarDef *base, string_view path, bool retainedonly) {
     auto t = OwnerType(base);
     if (!t) return nullptr;
     if (t->kind == TY_REF) t = t->ref->sub;
@@ -2130,6 +2131,11 @@ inline TypeExpr *TypeCheck::FieldPathType(VarDef *base, string_view path) {
         if (end == string_view::npos) end = path.size();
         auto name = path.substr(at + 1, end - at - 1);
         at = end;
+        if (name.starts_with('[')) {
+            if (t->kind != TY_ARRAY || (retainedonly && ClassOf(t) == SC_RESIZABLE)) return nullptr;
+            t = LoadType(t->arr->sub);
+            continue;
+        }
         if (t->kind != TY_STRUCT) return nullptr;
         auto inst = GetStructInst(t);
         TypeExpr *ft = nullptr;
@@ -2390,8 +2396,8 @@ inline void TypeCheck::CheckLinkShrink(const LinkShrink &s) {
 inline void TypeCheck::NoteLitElem(LitDeep &deep, Node *at, const Val &v, TypeExpr *t, string_view field) {
     if (!t) return;
     auto isrs = IsRefOrSlice(t);
-    // A struct field has a stable path. An array element or variant payload
-    // can only identify the enclosing array or enum when the value is stored.
+    // Struct literals supply field names. Array and variant literals
+    // summarize their links within the enclosing array or enum.
     if (!isrs) {
         for (auto &[value, path, target] : v.elementlinks.slots) {
             auto link = value;
@@ -2544,8 +2550,8 @@ inline LinkField TypeCheck::MapStoreField(FnSpec *spec, const vector<Val> &args,
     } else if (field.base->ownerspec == spec) {
         auto part = ArgumentPlace(spec, field.base, args);
         if (bound && !*bound) *bound = part.boundenclosing ? part.bound : ast.places.Project(part.bound, field.path);
-        // An indexed argument identifies the enclosing array. The callee's
-        // remaining path is inside its element.
+        // When the argument names only an enclosing array, the callee's
+        // remaining path cannot identify an element within it.
         if (!part.Base()) return {};
         field = { part.Base(), part.Enclosing() ? string(part.Path()) : cat(part.Path(), field.path),
                   part.Enclosing() || field.enclosing };
