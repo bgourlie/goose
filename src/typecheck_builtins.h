@@ -4225,15 +4225,16 @@ inline bool TypeCheck::BackwardElementRebind(Node *slot, Node *value) {
     auto binding = targetref ? targetref->vdef : nullptr;
     if (binding && source && source->vdef == binding && !binding->isvar && IsAddressRef(binding->type))
         return true;
+    auto call = Is<Call>(field);
+    auto appended = call && call->builtin == B_PUSH ? call->appendedarray : nullptr;
+    auto origin = source && source->vdef ? source->vdef->elementorigin : nullptr;
+    if (origin && !InScope(origin, origin->elementdecl)) origin = nullptr;
     auto prior = binding ? binding->elementorigin : nullptr;
     if (prior && InScope(prior, prior->elementdecl)) {
-        if (auto call = Is<Call>(field); call && call->builtin == B_PUSH && call->appendedarray == prior->elementarray)
-            return true;
-        auto origin = source && source->vdef ? source->vdef->elementorigin : nullptr;
+        if (appended && appended == prior->elementarray) return true;
         if (origin == prior) return true;
         if (origin && origin->appended && prior->elementarray == origin->elementarray &&
-            prior->elementdecl < origin->elementdecl &&
-            InScope(origin, origin->elementdecl)) return true;
+            prior->elementdecl < origin->elementdecl) return true;
     }
     if (!u || u->op != T_BITAND) return false;
     auto target = AddressedPath(u);
@@ -4245,10 +4246,12 @@ inline bool TypeCheck::BackwardElementRebind(Node *slot, Node *value) {
         return Is<Index>(n);
     };
     auto a = element(slot), b = element(target);
-    if (!a || !b) return false;
-    if (SamePath(a, b, PathInterval::ConsecutiveReads)) return true;
-    if (!a->arrayheader || a->arrayheader != b->arrayheader) return false;
+    if (!b) return false;
+    if (a && SamePath(a, b, PathInterval::ConsecutiveReads)) return true;
+    auto array = a ? a->arrayheader : origin ? origin->elementarray : appended;
+    if (!array || array != b->arrayheader) return false;
     if (b->constantindex == 0) return true; // Every valid source index is at least zero.
+    if (!a) return false;
     if (a->constantindex >= 0 && b->constantindex >= 0) return b->constantindex <= a->constantindex;
     // The right-hand base runs between the two subscript evaluations. It
     // can return the same array while changing a variable the index reads.

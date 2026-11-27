@@ -112,6 +112,20 @@ fn appended_link(i: i64) {
     assert(nodes.len == 3 && nodes[2].next .== nodes[i]);
 }
 
+fn pushed_link_to_first() {
+    var nodes: Node[>..] = [Node {}];
+    nodes.push(Node {}).next .= nodes[0];
+    {
+        let added .= nodes.push(Node {});
+        let alias .= added;
+        alias.next .= nodes[0];
+    }
+    nodes.pop_n(1);
+    assert(nodes[1].next .== nodes[0]);
+    nodes.pop_n(1);
+    assert(nodes.len == 1);
+}
+
 const TWO = 1 + 1;
 struct NumberList { focus: i64&<u32>?, values: i64[>..] }
 
@@ -205,6 +219,7 @@ fn main() {
     resize_with_fill();
     extend();
     appended_link(1);
+    pushed_link_to_first();
     backward_link();
     link_to_first(0);
     link_to_first(1);
