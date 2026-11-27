@@ -562,7 +562,7 @@ inline Val TypeCheck::ResolveCall(Call *c, vector<SFunction *> &cands, FnSpec *e
     // Arguments the re-check rebound by reference replace the originals.
     c->SetArgNodes(argnodes);
     c->spec = spec;
-    CheckCalleeRelative(c, spec, argvals);
+    CheckCalleeRelative(c, spec, argvals, argnodes);
     CalleesReturn({ spec }, argsreach);
     WarnDeprecatedCall(*this, c, name, best.sf);
     return CallResult(c, spec, argvals);
@@ -1425,7 +1425,7 @@ inline Val TypeCheck::TryDispatch(Call *c, vector<SFunction *> &cands, FnSpec *e
         c->dispatch.push_back(spec);
         NoteCallConstruction(spec->rets, spec, true);
         ApplyCalleeStorage(c, spec, armvals, name, argnodes, true);
-        CheckCalleeRelative(c, spec, argvals);
+        CheckCalleeRelative(c, spec, argvals, argnodes);
         auto rec = RecordOf(spec);
         if (!rec || rec->mayreturn) exits = JoinFlow(exits, SaveFlow());
     }
@@ -2093,10 +2093,17 @@ inline void TypeCheck::NoteExit(int tf, Node *at, vector<RetRoot> results,
     // The reference was computed before the defers. Only promise a live
     // target if its proof survived their writes and all later result operands.
     if (tf == current && !expressions.empty()) for (size_t i = 0; i < results.size(); i++) {
-        if (!IsAddressRef(frames[tf].spec->rets[i]) || !results[i].alts.Exact()) continue;
+        if (!IsAddressRef(frames[tf].spec->rets[i])) continue;
+        if (results[i].place.nullonly) {
+            results[i].liveprefix = LiveTarget::Null();
+            continue;
+        }
         auto prefix = expressions.size() == 1 ? LivePrefixTarget(expressions[0], i)
                                               : LivePrefixTarget(expressions[i]);
-        if (prefix.array && PrefixOwner(prefix.array) == results[i].alts.Root()) results[i].liveprefix = prefix;
+        if (prefix.array) {
+            auto roots = NonNullRefRoots(results[i].alts, frames[tf].spec->rets[i], results[i].writable);
+            if (roots.Exact() && PrefixOwner(prefix.array) == roots.Root()) results[i].liveprefix = prefix;
+        }
     }
     auto merge = [&](vector<RetRoot> &to) {
         if (to.size() < results.size()) to.resize(results.size());
@@ -4029,7 +4036,14 @@ inline Val TypeCheck::CallResult(Call *c, FnSpec *spec, vector<Val> &argvals) {
         }
         v.elementlinks = ri.elementlinks;
         if (!spec->inprogress) v.intactprefix = ri.intactprefix.value_or(false);
-        auto prefix = !spec->inprogress && v.Exact() ? CallerPrefix(ri.liveprefix, spec, argvals, v.Root()) : nullptr;
+        LiveTarget prefix;
+        if (!spec->inprogress) {
+            if (ri.liveprefix.NullOnly()) prefix = ri.liveprefix;
+            else if (ri.liveprefix.array) {
+                auto roots = NonNullRefRoots(v, v.type, v.writable);
+                if (roots.Exact()) prefix = CallerPrefix(ri.liveprefix, spec, argvals, roots.Root());
+            }
+        }
         cur.links.SetTarget(ResultTarget(c, i), prefix);
         lastcallrets.push_back(v);
     }
@@ -4539,7 +4553,7 @@ inline bool TypeCheck::RelativeDestination(const Roots &source, Dest dest, TypeE
     return true;
 }
 
-inline void TypeCheck::CheckCalleeRelative(Call *call, FnSpec *spec, vector<Val> &args) {
+inline void TypeCheck::CheckCalleeRelative(Call *call, FnSpec *spec, vector<Val> &args, span<Node *const> argnodes) {
     if (cur.probingtypes) return;
     if (!reachable) return;
     auto rec = RecordOf(spec);
@@ -4549,13 +4563,27 @@ inline void TypeCheck::CheckCalleeRelative(Call *call, FnSpec *spec, vector<Val>
     for (auto &s : stores) {
         auto i = (size_t)s.result;
         auto survives = i < rec->retroots.size() && s.RecordedIn(rec->retroots[i].resultlinks);
-        ApplyRelativeStore(call, spec, args, s, survives);
+        ApplyRelativeStore(call, spec, args, argnodes, s, survives);
     }
+}
+
+// An inline field within a fixed pointee is live whenever that particular
+// argument still is. Other parameters may share its root but name another
+// element. Consult the caller's flow after later arguments and callee writes.
+inline LiveTarget TypeCheck::StoredArgumentTarget(FnSpec *spec, span<Node *const> args,
+                                                 VarDef *base, const Roots &source) {
+    if (!base || !base->isparam || base->isvar || !IsAddressRef(base->type) ||
+        spec->inprogress || !source.Exact() || ClassOf(base->type->ref->sub) != SC_FIXED) return {};
+    auto it = find(spec->params.begin(), spec->params.end(), base);
+    auto i = (size_t)(it - spec->params.begin());
+    if (it == spec->params.end() || i >= args.size()) return {};
+    auto target = LivePrefixTarget(args[i]);
+    return target.array && PrefixOwner(target.array) == source.Root() ? target : LiveTarget();
 }
 
 // Check the location of a relative store and project its link onto the
 // receiving slot when the store survives the exit being applied.
-inline void TypeCheck::ApplyRelativeStore(Node *call, FnSpec *spec, vector<Val> &args,
+inline void TypeCheck::ApplyRelativeStore(Node *call, FnSpec *spec, vector<Val> &args, span<Node *const> argnodes,
                                           const RelativeStore &s, bool survives) {
     auto mapped = [&](const Roots &roots) {
         Roots out;
@@ -4595,8 +4623,11 @@ inline void TypeCheck::ApplyRelativeStore(Node *call, FnSpec *spec, vector<Val> 
                         "(§3.9); call of ", spec->sf->name, " links a target rooted at ",
                         target, " to receiving storage ", receiver));
     }
-    if (s.result >= 0 && dest.reached && !dest.result && !dest.discarded && !source.None())
-        StoreElementLink(dest, dest.reached, { s.pointee, dest.appended ? EL_BACKWARD : EL_ANY }, call, source, {}, targetfield);
+    if (s.result >= 0 && dest.reached && !dest.result && !dest.discarded && !source.None()) {
+        auto prefix = StoredArgumentTarget(spec, argnodes, s.target.base, source);
+        StoreElementLink(dest, dest.reached, { s.pointee, dest.appended ? EL_BACKWARD : EL_ANY },
+                         call, source, {}, targetfield, prefix);
+    }
 }
 
 inline TypeExpr *TypeCheck::SubstEnv(TypeExpr *t, FnSpec *env) {

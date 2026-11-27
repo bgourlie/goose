@@ -314,7 +314,7 @@ struct TypeCheck {
         using Target = variant<Node *, VarDef *, pair<Node *, size_t>>;
         map<Target, LiveTarget> targets;
         void SetTarget(Target key, LiveTarget prefix) {
-            if (prefix.array) targets[key] = prefix;
+            if (prefix.Known()) targets[key] = prefix;
             else targets.erase(key);
         }
         template<typename F> void DropPrefixes(F matches, CountProof retained = false) {
@@ -323,10 +323,12 @@ struct TypeCheck {
             };
             for (auto it = targets.begin(); it != targets.end();) {
                 weaken(it->second);
-                if (!it->second.array) it = targets.erase(it);
+                if (!it->second.Known()) it = targets.erase(it);
                 else ++it;
             }
             for (auto &[part, write] : live) weaken(write.liveprefix);
+            for (auto &[fill, links] : fills)
+                for (auto &[slot, value] : links.slots) weaken(value.liveprefix);
         }
         vector<RelativeStore> resultlinks; // Writes into the result under construction on this path.
         // A repeated literal captures its operand before installing any
@@ -339,10 +341,22 @@ struct TypeCheck {
                 LinkField target;
                 auto operator<=>(const Slot &) const = default;
             };
-            map<Slot, Roots> slots;
+            struct Captured {
+                Roots roots;
+                LiveTarget liveprefix;
+                bool operator==(const Captured &) const = default;
+            };
+            map<Slot, Captured> slots;
             vector<RelativeStore> results;
+            void Include(const Slot &slot, const Captured &value) {
+                auto [it, added] = slots.try_emplace(slot, value);
+                if (!added) {
+                    it->second.roots.Add(value.roots);
+                    it->second.liveprefix = it->second.liveprefix.Common(value.liveprefix);
+                }
+            }
             void Join(const FillLinks &other) {
-                for (auto &[slot, roots] : other.slots) slots[slot].Add(roots);
+                for (auto &[slot, value] : other.slots) Include(slot, value);
                 for (auto &link : other.results) link.AddTo(results);
             }
             bool operator==(const FillLinks &other) const {
@@ -362,7 +376,7 @@ struct TypeCheck {
         template<typename F> void ForgetBindings(F expired) {
             erase_if(targets, [&](const auto &p) {
                 auto var = get_if<VarDef *>(&p.first);
-                return expired(p.second.array) || (var && expired(*var));
+                return var && expired(*var);
             });
             for (auto it = live.begin(); it != live.end();) {
                 auto field = it->first.boundfield;
@@ -379,8 +393,9 @@ struct TypeCheck {
         void Join(const LinkFlow &other) {
             for (auto it = targets.begin(); it != targets.end();) {
                 auto p = other.targets.find(it->first);
-                if (p == other.targets.end() || it->second.array != p->second.array) it = targets.erase(it);
-                else { it->second = it->second.Common(p->second); ++it; }
+                auto common = p == other.targets.end() ? LiveTarget() : it->second.Common(p->second);
+                if (!common.Known()) it = targets.erase(it);
+                else { it->second = common; ++it; }
             }
             for (auto &link : other.resultlinks) link.AddTo(resultlinks);
             for (auto &[fill, links] : other.fills) fills[fill].Join(links);
@@ -755,8 +770,8 @@ struct TypeCheck {
     }
     bool RelativeDestination(const Roots &source, Dest dest, TypeExpr *pointee, Node *at,
                              bool record, LinkField target = {}, bool forwarding = false);
-    void CheckCalleeRelative(Call *call, FnSpec *spec, vector<Val> &args);
-    void ApplyRelativeStore(Node *call, FnSpec *spec, vector<Val> &args,
+    void CheckCalleeRelative(Call *call, FnSpec *spec, vector<Val> &args, span<Node *const> argnodes);
+    void ApplyRelativeStore(Node *call, FnSpec *spec, vector<Val> &args, span<Node *const> argnodes,
                             const RelativeStore &store, bool survives);
     bool ResultLayoutFits(TypeExpr *from, TypeExpr *to);
     // A declaration's immediate initializer and its owner, for root construction
@@ -2069,8 +2084,11 @@ struct TypeCheck {
         return result ? LinkFlow::Target(std::pair { n, result }) : LinkFlow::Target(n);
     }
     LiveTarget LivePrefixTarget(Node *n, size_t result = 0);
-    void ForwardLiveTarget(Node *result, Node *source);
+    void ForwardLiveTarget(Node *result, Node *source, const Val *value = nullptr);
+    Roots NonNullRefRoots(const Roots &roots, TypeExpr *type, bool writable);
+    void BindLiveTarget(VarDef *binding, Node *source, const Val &value, size_t result = 0);
     void NoteLiveElement(LinkFlow::Target key, const Roots &roots, const RefPlace &place, TypeExpr *array);
+    LiveTarget StoredArgumentTarget(FnSpec *spec, span<Node *const> args, VarDef *base, const Roots &source);
     LiveTarget CallerPrefix(LiveTarget target, FnSpec *spec, span<const Val> args, VarDef *owner);
     static VarDef *PrefixOwner(VarDef *prefix) {
         return prefix->type && IsAddressRef(prefix->type) ? prefix->ref.Root() : prefix;
@@ -3018,7 +3036,7 @@ struct TypeCheck {
         erase_if(cur.kills, [&](const Kill &k) { return k.relative && k.base == v; });
     }
     void ForgetLocal(VarDef *v) {
-        if (cur.links.live.empty() && cur.links.targets.empty() && cur.kills.empty()) return;
+        if (cur.links.live.empty() && cur.links.targets.empty() && cur.links.fills.empty() && cur.kills.empty()) return;
         ForgetOwner(v);
         for (auto c : v->components) if (c) ForgetLocal(c);
     }
@@ -3166,6 +3184,7 @@ struct TypeCheck {
     bool ResizesToMark(Node *recv, Node *len);
     enum class PathInterval { ConsecutiveReads, AcrossStatements };
     bool SamePath(Node *a, Node *b, PathInterval interval);
+    bool SameIndexValue(Node *a, Node *b);
     // An array a shrink may free (§5.1, §5.2): the one in root's own storage,
     // or, where root cannot hold one, one its storage leads to through the
     // references it holds (`bound`: root only bounds that array's lifetime).

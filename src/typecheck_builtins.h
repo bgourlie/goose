@@ -2597,8 +2597,7 @@ inline void TypeCheck::StoreElementLink(const Dest &dest, TypeExpr *type, Elemen
         // arrays may also place a slot within a growable tail.
         assert(!dest.fieldsteps);
         link.intail |= dest.place.intail;
-        // The captured target can outlive its original length during the fill.
-        cur.links.fills[dest.repeated].slots[{ reached, link, target }].Add(borrowed);
+        cur.links.fills[dest.repeated].Include({ reached, link, target }, { borrowed, liveprefix });
         return;
     }
     auto field = dest.field;
@@ -2612,8 +2611,8 @@ inline void TypeCheck::StoreElementLink(const Dest &dest, TypeExpr *type, Elemen
 inline void TypeCheck::FinishFill(ArrayLit *fill, const Dest &dest) {
     auto pending = cur.links.fills.extract(fill);
     if (!pending || !reachable) return;
-    for (auto &[slot, roots] : pending.mapped().slots)
-        StoreElementLink(dest, slot.reached, slot.link, fill, roots, {}, slot.target);
+    for (auto &[slot, value] : pending.mapped().slots)
+        StoreElementLink(dest, slot.reached, slot.link, fill, value.roots, {}, slot.target, value.liveprefix);
     for (auto &link : pending.mapped().results)
         link.AddTo(dest.repeated ? cur.links.fills[dest.repeated].results : cur.links.resultlinks);
 }
@@ -4045,6 +4044,32 @@ inline bool TypeCheck::ResizesToMark(Node *recv, Node *len) {
     return true;
 }
 
+// Two completed evaluations of this integer expression give the same index
+// when nothing writes between them. Every operand must itself be a pure read.
+inline bool TypeCheck::SameIndexValue(Node *a, Node *b) {
+    if (!a->exprtype || !b->exprtype || !TopConstEq(a->exprtype, b->exprtype)) return false;
+    if (auto x = Is<IntLit>(a)) {
+        auto y = Is<IntLit>(b);
+        return y && x->val == y->val && x->uns == y->uns;
+    }
+    if (auto x = Is<Binary>(a)) {
+        auto y = Is<Binary>(b);
+        return y && IsIntT(a->exprtype) && x->op == y->op &&
+               SameIndexValue(x->left, y->left) && SameIndexValue(x->right, y->right);
+    }
+    if (auto x = Is<Unary>(a)) {
+        auto y = Is<Unary>(b);
+        return y && (x->op == T_MINUS || x->op == T_BITNOT) && x->op == y->op &&
+               SameIndexValue(x->child, y->child);
+    }
+    if (auto x = Is<AsCast>(a)) {
+        auto y = Is<AsCast>(b);
+        return y && x->totype && y->totype && IsIntT(x->totype) && x->unchecked == y->unchecked &&
+               TopConstEq(x->totype, y->totype) && SameIndexValue(x->child, y->child);
+    }
+    return SamePath(a, b, PathInterval::ConsecutiveReads);
+}
+
 // Consecutive reads can follow the same subscript when evaluating the path
 // and index changes neither. Across statements a saved length also has to
 // survive rebinding, including replacement of a reference in an array slot.
@@ -4052,11 +4077,7 @@ inline bool TypeCheck::SamePath(Node *a, Node *b, PathInterval interval) {
     if (interval == PathInterval::ConsecutiveReads) {
         if (auto ix = Is<Index>(a)) {
             auto iy = Is<Index>(b);
-            return iy && SamePath(ix->obj, iy->obj, interval) && SamePath(ix->idx, iy->idx, interval);
-        }
-        if (auto x = Is<IntLit>(a)) {
-            auto y = Is<IntLit>(b);
-            return y && x->val == y->val && x->uns == y->uns;
+            return iy && SamePath(ix->obj, iy->obj, interval) && SameIndexValue(ix->idx, iy->idx);
         }
     }
     auto da = Is<Dot>(a), db = Is<Dot>(b);
@@ -5070,7 +5091,7 @@ inline void TypeCheck::ApplyCalleeShrinks(Node *at, FnSpec *spec, vector<Val> &a
         auto flow = SaveFlow();
         projectexit(exit.links);
         for (auto &s : exit.partialresults) {
-            if (s.resultowner == spec) ApplyRelativeStore(at, spec, argvals, s, true);
+            if (s.resultowner == spec) ApplyRelativeStore(at, spec, argvals, argnodes, s, true);
             else s.AddTo(cur.links.resultlinks); // Already in the enclosing result owner's coordinates.
         }
         ReplayOuterExit(tf, spec, exit, flow, at, argvals);

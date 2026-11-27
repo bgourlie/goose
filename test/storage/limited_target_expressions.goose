@@ -20,7 +20,52 @@ fn field_element() -> Cell[..] {
     return cells;
 }
 
+fn optional_target(nodes: Node[..]&, present: bool) -> Node&? {
+    if present { return nodes[1]; }
+    return null;
+}
+
+fn nullable_binding(how: i64, present: bool) -> Node[..] {
+    var nodes: Node[..] = [Node {}; 3];
+    nodes.pop_n(1);
+    let target: Node&?;
+    if how == 0 {
+        target .= if present { nodes[1] } else { null };
+    } else if how == 1 {
+        if present { target .= nodes[1]; } else { target .= null; }
+    } else if how == 2 {
+        target .= if present { nodes[1] } else { default<Node&?>() };
+    } else {
+        target .= optional_target(nodes, present);
+    }
+    nodes[0].next .= target;
+    return nodes;
+}
+
+fn make(target: Node&) -> Node { Node { next: target } }
+fn forward(target: Node&) -> Node { make(target) }
+
+fn stored_targets() -> Node[..] {
+    var nodes: Node[..] = [Node {}; 4];
+    nodes.pop_n(2);
+    nodes[0] = forward(nodes[1]);
+    let first: Node&;
+    first .= nodes[0];
+    nodes.append([Node { next: first }; 2]);
+    return nodes;
+}
+
 fn main() {
+    for how in 4 {
+        for present in [false, true] {
+            let nodes: Node[] = nullable_binding(how, present);
+            if present { assert(nodes[0].next .== nodes[1]); }
+            else { assert(nodes[0].next == null); }
+        }
+    }
+    let filled: Node[] = stored_targets();
+    assert(filled.len == 4 && filled[0].next .== filled[1]);
+    assert(filled[2].next .== filled[0] && filled[3].next .== filled[0]);
     for form in 3 {
         for i in 2 {
             let nodes: Node[] = selected(form, i);

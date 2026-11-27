@@ -1048,7 +1048,14 @@ struct LiveTarget {
     CountProof proof;
     LiveTarget(VarDef *array = nullptr, CountProof proof = true)
         : array(proof.condition ? array : nullptr), proof(array ? proof : CountProof()) {}
+    // Null has no target to keep live. A missing proof may still denote a
+    // non-null target, so only a proven null is neutral at a branch join.
+    static LiveTarget Null() { LiveTarget t; t.proof = true; return t; }
+    bool Known() const { return proof.condition != nullptr; }
+    bool NullOnly() const { return !array && Known(); }
     LiveTarget Common(LiveTarget other) const {
+        if (NullOnly()) return other;
+        if (other.NullOnly()) return *this;
         return array == other.array ? LiveTarget(array, proof.Both(other.proof)) : LiveTarget();
     }
     bool operator==(const LiveTarget &) const = default;

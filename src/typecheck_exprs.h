@@ -32,8 +32,34 @@ inline LiveTarget TypeCheck::LivePrefixTarget(Node *n, size_t result) {
 
 // The result denotes the same storage as its source on this path. Record it
 // before later operands or exit defers run so their effects reach both.
-inline void TypeCheck::ForwardLiveTarget(Node *result, Node *source) {
-    if (!cur.links.targets.empty()) cur.links.SetTarget(result, LivePrefixTarget(source));
+inline void TypeCheck::ForwardLiveTarget(Node *result, Node *source, const Val *value) {
+    if (source && value && (value->isnull || value->refplace.nullonly))
+        cur.links.SetTarget(result, LiveTarget::Null());
+    else if (!cur.links.targets.empty())
+        cur.links.SetTarget(result, LivePrefixTarget(source));
+}
+
+// A static alternative of an optional reference is null when no literal
+// can supply its pointee, or when it is writable. A read-only byte reference
+// can point into a string literal and must retain that alternative.
+inline Roots TypeCheck::NonNullRefRoots(const Roots &roots, TypeExpr *type, bool writable) {
+    Roots links;
+    links.unknown = roots.unknown;
+    for (auto &a : roots.alts) {
+        if (!a.root && a.exact && IsOptional(type) && (writable || !StaticCanContain(type->ref->sub))) continue;
+        links.Add(a);
+    }
+    return links;
+}
+
+inline void TypeCheck::BindLiveTarget(VarDef *binding, Node *source, const Val &value, size_t result) {
+    if (binding->isglobal || binding->isvar || !IsAddressRef(binding->type)) return;
+    auto prefix = value.isnull || value.refplace.nullonly ? LiveTarget::Null() : LivePrefixTarget(source, result);
+    if (prefix.array) {
+        auto roots = NonNullRefRoots(value, binding->type, value.writable);
+        if (!roots.Exact() || PrefixOwner(prefix.array) != roots.Root()) prefix = {};
+    }
+    cur.links.SetTarget(binding, prefix);
 }
 
 inline void TypeCheck::NoteLiveElement(LinkFlow::Target key, const Roots &roots, const RefPlace &place,
@@ -669,7 +695,7 @@ template<typename F> void TypeCheck::HeldOperands(F f) {
                     if (target.base) v.refplace = { {}, PlacePaths::Of({ target.base, ast.places.Path(target.path), true }, ast.places) };
                     f(Held { nullptr, std::move(v) });
                 };
-                for (auto &[slot, roots] : pending->second.slots) hold(slot.link.pointee, roots, slot.target);
+                for (auto &[slot, value] : pending->second.slots) hold(slot.link.pointee, value.roots, slot.target);
                 for (auto &link : pending->second.results) hold(link.pointee, link.source, link.target);
             }
         }
@@ -1551,28 +1577,12 @@ inline bool TypeCheck::FitsAt(Val &v, TypeExpr *dt, bool delivered, Node *conver
                 // the same root array; an `in pool` one needs the value in
                 // the pool, and takes the destination wherever it is.
                 if (t->ref->optional && !dt->ref->optional) return false;
-                // Null stores as the sentinel offset, which means the same
-                // in every location, so an optional relative slot takes a
-                // null wherever the slot is: a linked structure's sentinel
-                // end does not force plain links. A null has no roots
-                // (NullLit, RefProvOf), or static data exactly
-                // (default<T>(), a parameter given one), where nothing else
-                // a writable reference is given points (§9.5), nor one to a
-                // type no literal supplies; a read-only u8 one may point
-                // into a string literal. As one alternative of a merged
-                // value it names no array (§9.2): the others say where the
-                // value points.
-                auto nullalt = [&](const RootAlt &a) {
-                    return !a.root && a.exact && t->ref->optional &&
-                           (v.writable || !StaticCanContain(t->ref->sub));
-                };
-                Roots links;
-                if (!v.refplace.nullonly) {
-                    for (auto &a : v.alts) if (!nullalt(a)) links.Add(a);
-                    // A rebind uses this same proof to clear writes made by
-                    // its operand. An unresolved root is still provisional.
-                    if (links.None() && !v.None() && !v.unknown) v.refplace.nullonly = true;
-                }
+                // Null stores the same sentinel in every location. Only the
+                // non-null alternatives must belong to the destination's root.
+                auto links = v.refplace.nullonly ? Roots() : NonNullRefRoots(v, t, v.writable);
+                // A rebind uses this same proof to clear writes made by its
+                // operand. An unresolved root is still provisional.
+                if (links.None() && !v.None() && !v.unknown) v.refplace.nullonly = true;
                 // A reference that points nowhere yet (RefProvOf), or a
                 // location reached through one, is read again once it does.
                 if (!delivered || links.None() || (!dt->ref->pool && curdst.unknown)) {

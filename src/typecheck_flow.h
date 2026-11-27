@@ -1025,6 +1025,7 @@ inline TypeCheck::FlowState TypeCheck::JoinFlow(const FlowState &a, const FlowSt
     if (a.reachable && b.reachable) joined.links.Join(b.links);
     auto expired = [&](VarDef *v) { return Depth(v) > CurDepth(); };
     erase_if(joined.links.live, [&](const auto &entry) { return expired(entry.first.owner); });
+    joined.links.DropPrefixes(expired);
     joined.links.ForgetBindings(expired);
     erase_if(joined.kills, [&](const Kill &k) {
         return expired(k.container) || (k.relative && expired(k.base));
@@ -1536,7 +1537,7 @@ inline Val TypeCheck::CheckBlockVal(Block *b, TypeExpr *expected, bool wantvalue
     }
     // The block's result survives its local bindings. Its target proof also
     // survives, unless an exit defer shortens the array before delivery.
-    ForwardLiveTarget(b, wantvalue ? b->tail : nullptr);
+    ForwardLiveTarget(b, wantvalue ? b->tail : nullptr, &v);
     PopScope();
     if (reachable) CheckBranchRoot(v, CurDepth(), b->tail, "block");
     b->exprtype = v.type ? v.type : ast.voidtype;
@@ -1596,7 +1597,7 @@ inline Val TypeCheck::CheckMatch(MatchExpr *m, TypeExpr *expected, bool wantvalu
         } else {
             CheckStmtExpr(arm.body);
         }
-        ForwardLiveTarget(m, wantvalue ? arm.body : nullptr);
+        ForwardLiveTarget(m, wantvalue ? arm.body : nullptr, &av);
         PopScope();
         auto aflow = SaveFlow();
         if (reachable) CheckBranchRoot(av, CurDepth(), arm.body, "match arm");
@@ -1874,7 +1875,7 @@ inline Val TypeCheck::CheckEarlyBlock(EarlyBlock *x, TypeExpr *expected, bool wa
             CheckStmtExpr(x->body->tail);
         }
     }
-    ForwardLiveTarget(x, wantvalue ? x->body->tail : nullptr);
+    ForwardLiveTarget(x, wantvalue ? x->body->tail : nullptr, &v);
     auto sc = scopes.back();
     PopScope();
     auto tailreach = reachable;
@@ -2319,7 +2320,7 @@ inline void TypeCheck::CheckBreak(Break *b) {
         // Nothing after the break can complete a [] that took no element type
         // here: the construct's value does not carry the literal form.
         if (v.emptyarr) Error(b->val, "cannot infer array element type");
-        ForwardLiveTarget(scopes[si].node, b->val);
+        ForwardLiveTarget(scopes[si].node, b->val, &v);
     }
     CheckExitScopes(si, b);
     auto &sc = scopes[si];
@@ -3070,9 +3071,7 @@ inline void TypeCheck::CheckVarDecl(VarDecl *vd, bool global) {
         d->type = t;
         d->intactprefix = !global && IsArrayKind(t, A_LIMITED) && v ? v->intactprefix : CountProof();
         if (IsArrayKind(t, A_LIMITED) && v) d->limitedcapacity = v->extent.capacity;
-        if (v && !global && !d->isvar && IsAddressRef(t) && v->Exact())
-            if (auto prefix = LivePrefixTarget(init, result); prefix.array && PrefixOwner(prefix.array) == v->Root())
-                cur.links.targets[d] = prefix;
+        if (v && !global) BindLiveTarget(d, init, *v, result);
         if (global) CheckVarExtent(d, vd);
         if (v && IsRefOrSlice(t)) {
             BindRefProvenance(d, *v);
@@ -3567,6 +3566,7 @@ inline void TypeCheck::CheckRebind(Assign *a, LVal &lv) {
     a->rhs->exprtype = v.type;
     if (lv.var) {
         NoLetReassign(a, lv.var, "rebind", "bound");
+        BindLiveTarget(lv.var, a->rhs, v);
         if (!lv.var->refrootknown || lv.var->ref.Unknown()) BindRefProvenance(lv.var, v);
         else if (!v.isnull) CheckRefRebindRoot(a, lv.var, v);
         NoteRefPlace(lv.var, v);
