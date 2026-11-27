@@ -3629,7 +3629,7 @@ inline void TypeCheck::CheckRebind(Assign *a, LVal &lv) {
             a->rhs = AutoRef(a->rhs, v, !target->cq);
         }
         wasplain = IsPlainRef(v.type);
-        if (IsSelfRelRef(target)) curdst.sameelement = SameElementRebind(a->lval, a->rhs);
+        if (IsSelfRelRef(target)) curdst.backwardlink = BackwardElementRebind(a->lval, a->rhs);
         MustFit(v, a->rhs, target);
     }
     a->rhs->exprtype = v.type;

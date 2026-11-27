@@ -74,7 +74,18 @@ fn same_constant_element() {
     assert(calls == 1 && nodes[0].owner .== nodes[0]);
 }
 
+fn backward_link() {
+    var nodes: Node[>..] = [Node {}, Node {}, Node {}];
+    let alias .= nodes;
+    nodes[1].next .= alias[0];
+    nodes.pop_n(1);
+    assert(nodes[1].next .== nodes[0]);
+    nodes.pop_n(1);
+    assert(nodes.len == 1);
+}
+
 fn main() {
+    backward_link();
     same_element(0);
     same_element(1);
     same_constant_element();

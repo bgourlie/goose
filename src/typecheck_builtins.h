@@ -4104,10 +4104,9 @@ inline bool TypeCheck::SameIndexValue(Node *a, Node *b) {
     return SamePath(a, b, PathInterval::ConsecutiveReads);
 }
 
-// Both ends of a rebind lie in one element when their inline field paths
-// start at the same sequence and index. Loading a stored reference can
-// lead outside that element.
-inline bool TypeCheck::SameElementRebind(Node *slot, Node *value) {
+// A suffix removal preserves the target of a retained link to the same or
+// an earlier element. Only inline fields stay within the indexed element.
+inline bool TypeCheck::BackwardElementRebind(Node *slot, Node *value) {
     auto u = Is<Unary>(value);
     if (!u || u->op != T_BITAND) return false;
     auto target = AddressedPath(u);
@@ -4122,7 +4121,7 @@ inline bool TypeCheck::SameElementRebind(Node *slot, Node *value) {
     if (!a || !b) return false;
     if (SamePath(a, b, PathInterval::ConsecutiveReads)) return true;
     if (!a->arrayheader || a->arrayheader != b->arrayheader) return false;
-    if (a->constantindex >= 0 && a->constantindex == b->constantindex) return true;
+    if (a->constantindex >= 0 && b->constantindex >= 0) return b->constantindex <= a->constantindex;
     // The right-hand base runs between the two subscript evaluations. It
     // can return the same array while changing a variable the index reads.
     return SameIndexValue(a->idx, b->idx) && ReadOnlyExpr(b->obj, EvalRequirement::ReadOnly);

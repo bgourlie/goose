@@ -504,7 +504,7 @@ struct TypeCheck {
         // A resize's fill value: built once and copied into each slot the
         // resize adds, so no position in the array is its own (§3.9).
         bool fill = false;
-        bool sameelement = false;    // A rebind between inline locations in the same array element.
+        bool backwardlink = false;    // The link targets its own element or an earlier one in the same array.
         bool appended = false;       // New elements at the end of a grow-only array.
         Construction *construction = nullptr;
         ArrayCountDest countdest = ArrayCountDest::Storage;
@@ -3274,7 +3274,7 @@ struct TypeCheck {
     enum class PathInterval { ConsecutiveReads, AcrossStatements };
     bool SamePath(Node *a, Node *b, PathInterval interval);
     bool SameIndexValue(Node *a, Node *b);
-    bool SameElementRebind(Node *slot, Node *value);
+    bool BackwardElementRebind(Node *slot, Node *value);
     // An array a shrink may free (§5.1, §5.2): the one in root's own storage,
     // or, where root cannot hold one, one its storage leads to through the
     // references it holds (`bound`: root only bounds that array's lifetime).

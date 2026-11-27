@@ -1777,7 +1777,7 @@ inline bool TypeCheck::FitsAt(Val &v, TypeExpr *dt, bool delivered, Node *conver
                     return false;
                 }
                 if (recordingrelative && !dt->ref->pool && !curdst.result) {
-                    ElementLink link { pointee, curdst.appended || curdst.sameelement ? EL_BACKWARD : EL_ANY };
+                    ElementLink link { pointee, curdst.appended || curdst.backwardlink ? EL_BACKWARD : EL_ANY };
                     auto prefix = LivePrefixTarget(fitnode);
                     if (prefix.array && (PrefixOwner(prefix.array) != have || have != want)) prefix = {};
                     StoreElementLink(curdst, dt, link, fitnode, links, {}, target, prefix);
