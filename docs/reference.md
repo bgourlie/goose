@@ -2831,11 +2831,13 @@ not do, each a compile error:
   `return … from`, propagates one, or catches one, since the body may run
   while such a return is in flight ([section 20](#20-long-distance-return-and-errors));
   the error names the chain of calls that brings the machinery in.
-* **Name the function's named result.** A local that the function returns
-  by name is built where the caller receives it ([section 17](#results)),
-  and is complete when the body runs. The body may read through an alias
-  to the local. Writing into the local through an alias, directly or in a
-  function the body calls, is an error.
+* **Name the function's named result.** When every return of a non-fixed
+  result names the same local, the body may not name that local
+  ([section 17](#results)). The result is complete before the body runs.
+  The body may read through an alias to the local. A write through an
+  alias, directly or in a function the body calls, is an error if it can
+  change storage shared with the delivered result. The body may write to
+  source fields already copied into the result.
 
 A `defer` belongs in a function: a global initializer has no scope exit.
 Nothing runs a defer where no exit happens: `abort`, a failed `assert` or
