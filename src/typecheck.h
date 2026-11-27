@@ -2866,12 +2866,12 @@ struct TypeCheck {
         ValueLinks elementlinks;
     };
     bool InitOrderStoreSafe(Node *n, TypeExpr *dest);
-    enum class EvalRequirement { ReadOnly, Reorderable };
-    bool ReadOnlyExpr(Node *n, EvalRequirement requirement) {
+    enum class EvalRequirement { ReadOnly, LoggedGrowth, Reorderable };
+    bool EvalMeets(Node *n, EvalRequirement requirement) {
         map<FnSpec *, bool> bodies;
-        return ReadOnlyExpr(n, requirement, bodies, nullptr);
+        return EvalMeets(n, requirement, bodies, nullptr);
     }
-    bool ReadOnlyExpr(Node *n, EvalRequirement requirement, map<FnSpec *, bool> &bodies, FnSpec *callee);
+    bool EvalMeets(Node *n, EvalRequirement requirement, map<FnSpec *, bool> &bodies, FnSpec *callee);
     LitDeep CheckInits(StructLit *sl, vector<Field> &fields, vector<TypeExpr *> &ftypes,
                        string_view what, TypeExpr *selft);
     void CheckSelfInit(Node *n, TypeExpr *ft, TypeExpr *selft);
@@ -2985,7 +2985,7 @@ struct TypeCheck {
         return value.lvalue || IsPlainRef(value.type) ? ArrayHeader(value.refplace, array) : nullptr;
     }
     SlotRemoval CountedRemoval(BuiltinKind op, const vector<Node *> &args, const Val &count,
-                               TypeExpr *array, const Val &receiver, CountProof &condition);
+                               TypeExpr *array, const Val &receiver, CountProof &condition, CountProof fillpreserves = true);
     void CheckByteOut(Call *c, Node *out, const string &form);
     // Later passes walk only the arguments that can execute. Overload
     // resolution on a subsequent check still needs the call as written.
@@ -3501,9 +3501,11 @@ struct TypeCheck {
         }
     };
     // Each takes the type of the storage grown, shrunk or built in.
+    void RecordGrowth(Node *at, const Roots &roots, const string &what, TypeExpr *array);
     void NoteGrow(Node *at, const Roots &roots, const string &what, TypeExpr *t);
     void NoteShrinkEvent(Node *at, VarDef *root, TypeExpr *bound, const string &what,
                          TypeExpr *t);
+    template<typename F> void AliasingGrowsSince(size_t base, const Roots &roots, TypeExpr *array, F visit);
     void CheckGrowsSince(size_t base, const Roots &built, const string &what, TypeExpr *t);
     // The type of the one resizable array a value of type t holds (§1.3,
     // §3.4), where every value of t holds one of the same type: null where

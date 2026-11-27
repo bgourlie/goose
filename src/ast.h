@@ -1011,10 +1011,16 @@ struct RefPlace {
 
 // A count proof can depend on named integers retaining their initial values. Keep
 // conditions canonical across flow joins and recursive summary rounds.
+struct DistinctArrays {
+    FnSpec *spec;
+    VarDef *first, *second;
+    auto operator<=>(const DistinctArrays &) const = default;
+};
 struct CountCondition {
     set<VarDef *> names;
+    set<DistinctArrays> distinct; // Parameter classes whose arrays must differ at the call sites.
     set<CountCondition> *pool = nullptr;
-    bool operator<(const CountCondition &other) const { return names < other.names; }
+    bool operator<(const CountCondition &other) const { return std::tie(names, distinct) < std::tie(other.names, other.distinct); }
 };
 
 struct CountProof {
@@ -1024,25 +1030,30 @@ struct CountProof {
         if (known) condition = &always;
     }
     explicit CountProof(const CountCondition *c) : condition(c) {}
-    bool Unconditional() const { return condition && condition->names.empty(); }
+    bool Unconditional() const { return condition && condition->names.empty() && condition->distinct.empty(); }
     bool Available() const;
     bool Committed() const;
     CountProof Prefer(CountProof other) const {
         if (Committed()) return *this;
         if (other.Committed()) return other;
         if (!Available()) return other;
-        if (other.Available() && other.condition->names.size() < condition->names.size()) return other;
+        if (other.Available() && other.condition->names.size() + other.condition->distinct.size() <
+                                 condition->names.size() + condition->distinct.size()) return other;
         return *this;
     }
     static CountProof IfUnchanged(set<CountCondition> &pool, VarDef *name) {
-        return CountProof(&*pool.insert({ { name }, &pool }).first);
+        return CountProof(&*pool.insert({ { name }, {}, &pool }).first);
+    }
+    static CountProof IfDistinct(set<CountCondition> &pool, DistinctArrays arrays) {
+        return CountProof(&*pool.insert({ {}, { arrays }, &pool }).first);
     }
     CountProof Both(CountProof other) const {
         if (!condition || !other.condition) return false;
-        if (condition == other.condition || other.condition->names.empty()) return *this;
-        if (condition->names.empty()) return other;
+        if (condition == other.condition || other.Unconditional()) return *this;
+        if (Unconditional()) return other;
         auto joined = *condition;
         joined.names.insert(other.condition->names.begin(), other.condition->names.end());
+        joined.distinct.insert(other.condition->distinct.begin(), other.condition->distinct.end());
         return CountProof(&*condition->pool->insert(std::move(joined)).first);
     }
     auto operator<=>(const CountProof &) const = default;
@@ -2770,7 +2781,7 @@ inline bool CountProof::Available() const {
 }
 
 inline bool CountProof::Committed() const {
-    if (!condition) return false;
+    if (!condition || !condition->distinct.empty()) return false;
     for (auto name : condition->names)
         for (auto d = name; d; d = d->constfrom)
             if (!d->type->cq && !d->constuse) return false;

@@ -120,7 +120,42 @@ fn extend() {
     assert(list.values.len == 24 && list.values[2] == 33 && list.focus .== list.values[1]);
 }
 
+fn fill_count(calls: i64&) -> i64 { calls += 1; return calls; }
+
+fn extend_with_other(list: NumberList&, other: i64[>..]&) {
+    fn fill() -> i64 { other.push(17); return 33; }
+    list.values.resize(list.values.len + 1, fill());
+}
+
+fn limited_with_fill() -> Node[..] {
+    var nodes: Node[..] = [Node {}, Node {}];
+    nodes[0].next .= nodes[1];
+    var other: i64[>..] = [];
+    var limited: i64[..2] = [1];
+    fn fill() -> Node {
+        other.push(17);
+        other.clear();
+        limited = [18, 19];
+        return Node {};
+    }
+    nodes.resize(nodes.len, fill());
+    return nodes;
+}
+
+fn resize_with_fill() {
+    var list = NumberList { values: [11, 22] };
+    list.focus .= list.values[1];
+    var calls = 0;
+    list.values.resize(list.values.len, fill_count(calls));
+    var other: i64[>..] = [];
+    extend_with_other(list, other);
+    let limited: Node[] = limited_with_fill();
+    assert(limited[0].next .== limited[1]);
+    assert(calls == 1 && other.len == 1 && list.values[2] == 33 && list.focus .== list.values[1]);
+}
+
 fn main() {
+    resize_with_fill();
     extend();
     appended_link(1);
     backward_link();

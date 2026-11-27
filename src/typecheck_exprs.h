@@ -3375,15 +3375,20 @@ inline bool TypeCheck::InitOrderStoreSafe(Node *n, TypeExpr *dest) {
     return from && TypeEq(from, dest);
 }
 
-// A resize fill must leave storage unchanged on paths reaching the resize.
+// A resize fill may write scalars while preserving all array lengths.
 // Reordering initializers also requires that no runtime check can abort.
-inline bool TypeCheck::ReadOnlyExpr(Node *n, EvalRequirement requirement, map<FnSpec *, bool> &bodies, FnSpec *callee) {
+inline bool TypeCheck::EvalMeets(Node *n, EvalRequirement requirement, map<FnSpec *, bool> &bodies, FnSpec *callee) {
     if (!n) return true;
     auto reorder = requirement == EvalRequirement::Reorderable;
-    auto safe = [&](Node *child) { return ReadOnlyExpr(child, requirement, bodies, callee); };
+    auto safe = [&](Node *child) { return EvalMeets(child, requirement, bodies, callee); };
     auto store = [&](Node *value, TypeExpr *dest) { return !reorder || InitOrderStoreSafe(value, dest); };
     if (Is<IntLit>(n) || Is<FltLit>(n) || Is<BoolLit>(n) || Is<StrLit>(n) ||
         Is<NullLit>(n) || Is<SelfRef>(n) || Is<Ident>(n)) return true;
+    if (requirement == EvalRequirement::LoggedGrowth) {
+        if (auto x = Is<IncDec>(n)) return safe(x->lval);
+        // Aggregate assignments record each limited header they can replace.
+        if (auto a = Is<Assign>(n)) return safe(a->lval) && safe(a->rhs);
+    }
     if (auto d = Is<Dot>(n)) return d->variantconst || safe(d->obj);
     if (auto u = Is<Unary>(n)) {
         // Implicit reference conversions have a typed unary node but need not
@@ -3424,6 +3429,14 @@ inline bool TypeCheck::ReadOnlyExpr(Node *n, EvalRequirement requirement, map<Fn
     }
     if (auto c = Is<Call>(n)) {
         if (c->builtin == B_DEFAULT) return (c->defaultinit || !reorder) && safe(c->defaultinit);
+        // These builtins record their growth on the receiver. The resize
+        // checks those events separately, including any in their operands.
+        if (requirement == EvalRequirement::LoggedGrowth &&
+            (c->builtin == B_PUSH || c->builtin == B_APPEND || c->builtin == B_RESIZE ||
+             c->builtin == B_CLEAR || c->builtin == B_POP || c->builtin == B_POP_N)) {
+            for (auto arg : c->ArgNodes()) if (!safe(arg)) return false;
+            return true;
+        }
         if (c->builtin >= 0) return false;
         auto sp = c->spec;
         if (!sp || !sp->body || sp->inprogress || sp->rets.size() > 1) return false;
@@ -3436,7 +3449,7 @@ inline bool TypeCheck::ReadOnlyExpr(Node *n, EvalRequirement requirement, map<Fn
         auto [body, first] = bodies.try_emplace(sp, false);
         if (first)
             body->second = (sp->rets.empty() || store(sp->body, sp->rets[0])) &&
-                           ReadOnlyExpr(sp->body, requirement, bodies, sp);
+                           EvalMeets(sp->body, requirement, bodies, sp);
         return body->second;
     }
     if (auto r = Is<Return>(n)) {
@@ -3585,7 +3598,7 @@ inline TypeCheck::LitDeep TypeCheck::CheckInits(StructLit *sl, vector<Field> &fi
             if (reorderable[idx] < 0) {
                 auto init = sl->InitFor(idx);
                 reorderable[idx] = InitOrderStoreSafe(init, ftypes[idx]) &&
-                                   ReadOnlyExpr(init, EvalRequirement::Reorderable);
+                                   EvalMeets(init, EvalRequirement::Reorderable);
             }
             return reorderable[idx] != 0;
         };

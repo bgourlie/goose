@@ -3404,6 +3404,21 @@ inline Val TypeCheck::CheckAssignedValue(Assign *a, TypeExpr *target, TypeExpr *
     // result starts writing early only if it needs its destination's address.
     // A runtime-capacity limited array copies the completed source (§4.4).
     Construction construction { true };
+    if (reachable && !cur.probingtypes && IsAggregate(target)) {
+        // An aggregate type can recur in many variant fields. Each limited
+        // header type contributes the same effect at this assignment.
+        set<TypeExpr *> visited;
+        auto headers = [&](auto &&walk, TypeExpr *t) -> void {
+            if (!IsAggregate(t) || !visited.insert(t).second) return;
+            if (t->kind == TY_ARRAY) {
+                if (IsArrayKind(t, A_LIMITED)) RecordGrowth(a, built, "replace limited array", t);
+                walk(walk, t->arr->sub);
+            } else {
+                EachField(t, [&](TypeExpr *field) { walk(walk, field); });
+            }
+        };
+        headers(headers, target);
+    }
     if (IsArrayKind(target, A_LIMITED) && FixedPlacedResult(target))
         NoteStorageWrite(built, target, built.place, reachable, StorageWrite::PrefixOnly);
     if (hasdefers && IsAggregate(target)) {

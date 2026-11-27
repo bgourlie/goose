@@ -25,18 +25,21 @@ inline const LinkField *TypeCheck::ArrayHeader(const RefPlace &place, TypeExpr *
 // The count and, for resize, the fill have already been checked in evaluation order.
 inline TypeCheck::SlotRemoval TypeCheck::CountedRemoval(BuiltinKind op, const vector<Node *> &args,
                                                         const Val &count, TypeExpr *array, const Val &receiver,
-                                                        CountProof &condition) {
+                                                        CountProof &condition, CountProof fillpreserves) {
     assert(op == B_POP_N || op == B_RESIZE);
     auto matches = [&](Dot *d) {
         return SamePath(args[0], d->obj, PathInterval::ConsecutiveReads) ||
                (d->measuredarray && d->measuredarray == ArrayHeader(receiver, array));
     };
-    auto unmodified = [&] { return args.size() == 2 || ReadOnlyExpr(args[2], EvalRequirement::ReadOnly); };
+    auto preserves = [&](CountProof proof) {
+        condition = proof;
+        return proof.Unconditional() ? SlotRemoval::None : SlotRemoval::PreservesIfUnchanged;
+    };
     if (auto d = Is<Dot>(args[1]); d && matches(d)) {
         if (d->member == B_CAP && op == B_RESIZE && IsArrayKind(array, A_LIMITED)) return SlotRemoval::ToCapacity;
         if (d->member == B_LEN) {
             if (op == B_POP_N) return SlotRemoval::All;
-            if (unmodified()) return SlotRemoval::None;
+            if (fillpreserves.Available()) return preserves(fillpreserves);
         }
     }
     // On successful resize, adding a nonnegative i64 to .len cannot shrink:
@@ -48,7 +51,7 @@ inline TypeCheck::SlotRemoval TypeCheck::CountedRemoval(BuiltinKind op, const ve
             if (!d || d->member != B_LEN || !matches(d)) return false;
             if (auto k = Is<IntLit>(offset)) return !k->uns && k->val >= 0;
             if (auto k = Is<Dot>(offset); k && (k->member == B_LEN || k->member == B_CAP))
-                return ReadOnlyExpr(k->obj, EvalRequirement::ReadOnly);
+                return EvalMeets(k->obj, EvalRequirement::ReadOnly);
             if (auto id = Is<Ident>(offset); id && id->vdef) {
                 auto v = id->vdef;
                 if (v->constantindex >= 0 || (IsIntT(v->type) && IsUnsigned(v->type->intstorage) &&
@@ -63,11 +66,8 @@ inline TypeCheck::SlotRemoval TypeCheck::CountedRemoval(BuiltinKind op, const ve
             return false;
         };
         auto proof = growth(sum->left, sum->right).Prefer(growth(sum->right, sum->left));
-        if (proof.Available() && unmodified()) {
-            if (proof.Unconditional()) return SlotRemoval::None;
-            condition = proof;
-            return SlotRemoval::PreservesIfUnchanged;
-        }
+        proof = proof.Both(fillpreserves);
+        if (proof.Available()) return preserves(proof);
     }
     int64_t lo, hi;
     if (!IntConsts(count, lo, hi) || lo != hi || lo < 0) return SlotRemoval::Possible;
@@ -565,8 +565,25 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
     if (d.flags & BF_SHRINKS) removal = d.kind == B_CLEAR ? SlotRemoval::All : SlotRemoval::Possible;
     if (d.kind == B_RESIZE) {
         auto length = CheckIntAny(args[1]);
+        CountProof fillpreserves = true;
         if (args.size() == 3) {
+            auto beforefill = cur.growlog.size();
             ElemArg(args[2], elem, elementdest());
+            // Count and receiver have already been evaluated. Only a change
+            // to this header can make its measured length stale. Resizable
+            // writes are logged through calls; a fixed-capacity limited array
+            // can also be replaced by an ordinary assignment.
+            if (rv.unknown || rv.None() || !ShrinkRootsKnown(rv)) {
+                fillpreserves = EvalMeets(args[2], EvalRequirement::ReadOnly);
+            } else if (ak == A_LIMITED && !EvalMeets(args[2], EvalRequirement::LoggedGrowth)) {
+                fillpreserves = false;
+            } else {
+                AliasingGrowsSince(beforefill, rv, recvarr, [&](const GrowEvent &e, VarDef *root, Alias alias) {
+                    if (alias == AL_YES) fillpreserves = false;
+                    else fillpreserves = fillpreserves.Both(CountProof::IfDistinct(
+                        ast.countconditions, { CurRealFrame().spec, e.root, root }));
+                });
+            }
             // The fill value is built once and copied into every slot the
             // resize adds, so not even a literal is built in place (§3.9).
             if (HasRelRefT(elem) && (Is<StructLit>(args[2]) || Is<ArrayLit>(args[2])))
@@ -575,7 +592,7 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
                                    "contains self-relative references, is not supported; push "
                                    "the elements, which constructs each in place"));
         }
-        removal = CountedRemoval(d.kind, args, length, recvarr, rv, countcondition);
+        removal = CountedRemoval(d.kind, args, length, recvarr, rv, countcondition, fillpreserves);
     }
     // index_of recovers the element index a reference stands for (§3.3).
     // The reference must be an element of this very array, which is what
@@ -2395,6 +2412,9 @@ inline bool TypeCheck::RelyOnCountProof(CountProof proof, Node *at, const char *
     if (!proof.Available()) return false;
     // Overload matching checks whether the conversion fits without committing to it.
     if (!at || unifytrial || cur.probingtypes || proof.Committed()) return true;
+    for (const auto &pair : proof.condition->distinct)
+        growconflicts.push_back({ at, pair.spec, pair.first, pair.second,
+            cat("the ", reason, " relies on the resize fill leaving the measured array's length unchanged") });
     for (auto count : proof.condition->names) {
         ConstUse use { at, reason, count };
         for (auto d = count; d; d = d->constfrom) RelyOnConstant(use, d);
@@ -4177,7 +4197,7 @@ inline bool TypeCheck::BackwardElementRebind(Node *slot, Node *value) {
     if (a->constantindex >= 0 && b->constantindex >= 0) return b->constantindex <= a->constantindex;
     // The right-hand base runs between the two subscript evaluations. It
     // can return the same array while changing a variable the index reads.
-    return SameIndexValue(a->idx, b->idx) && ReadOnlyExpr(b->obj, EvalRequirement::ReadOnly);
+    return SameIndexValue(a->idx, b->idx) && EvalMeets(b->obj, EvalRequirement::ReadOnly);
 }
 
 // Consecutive reads can follow the same subscript when evaluating the path
@@ -5307,8 +5327,11 @@ inline TypeExpr *TypeCheck::SoleResizableIn(TypeExpr *t) {
 }
 
 inline void TypeCheck::NoteGrow(Node *at, const Roots &roots, const string &what, TypeExpr *t) {
+    RecordGrowth(at, roots, what, SoleResizableIn(t));
+}
+
+inline void TypeCheck::RecordGrowth(Node *at, const Roots &roots, const string &what, TypeExpr *arr) {
     if (cur.probingtypes) return;
-    auto arr = SoleResizableIn(t);
     auto note = [&](vector<TypeExpr *> &types) {
         for (auto u : types)
             if (!u == !arr && (!u || TypeEq(u, arr))) return;
@@ -5332,6 +5355,21 @@ inline void TypeCheck::NoteShrinkEvent(Node *at, VarDef *root, TypeExpr *bound,
     cur.growlog.push_back({ at, root, !bound, what, true, SoleResizableIn(t) });
 }
 
+template<typename F> inline void TypeCheck::AliasingGrowsSince(size_t base, const Roots &roots,
+                                                              TypeExpr *array, F visit) {
+    for (auto i = base; i < cur.growlog.size(); i++) {
+        const auto &e = cur.growlog[i];
+        // Replacing a limited header changes length without allocating or
+        // releasing stack storage. Only a measured limited length observes it.
+        if (e.arr && IsArrayKind(e.arr, A_LIMITED) && (!array || !IsArrayKind(array, A_LIMITED))) continue;
+        if (array && e.arr && !TopConstEq(array, e.arr)) continue;
+        for (auto &b : roots.alts) {
+            auto may = MayAliasRoots(e.root, e.exact, b.root, b.exact);
+            if (may != AL_NO) visit(e, b.root, may);
+        }
+    }
+}
+
 // The value built at the top or in a slot of the array `built` may be, by
 // the expression checked since cur.growlog was `base` long: none of the growths
 // logged meanwhile may have been of that array, or it would have landed
@@ -5341,20 +5379,13 @@ inline void TypeCheck::NoteShrinkEvent(Node *at, VarDef *root, TypeExpr *bound,
 // other growable array may lie inside it.
 inline void TypeCheck::CheckGrowsSince(size_t base, const Roots &built, const string &what,
                                        TypeExpr *t) {
-    auto arr = SoleResizableIn(t);
-    for (auto i = base; i < cur.growlog.size(); i++) {
-        auto e = cur.growlog[i];
-        if (arr && e.arr && !TopConstEq(arr, e.arr)) continue;
-        for (auto &b : built.alts) {
-            auto may = MayAliasRoots(e.root, e.exact, b.root, b.exact);
-            if (may == AL_NO) continue;
-            auto msg = cat("cannot ", e.what, ": ", what, " is still under construction, and "
-                           "the ", e.shrink ? "shrink would free the storage it is built in"
-                                            : "growth would land inside it", " (§1.3)");
-            if (may == AL_YES) Error(e.at, msg);
-            growconflicts.push_back({ e.at, CurRealFrame().spec, e.root, b.root, msg });
-        }
-    }
+    AliasingGrowsSince(base, built, SoleResizableIn(t), [&](const GrowEvent &e, VarDef *root, Alias may) {
+        auto msg = cat("cannot ", e.what, ": ", what, " is still under construction, and "
+                       "the ", e.shrink ? "shrink would free the storage it is built in"
+                                        : "growth would land inside it", " (§1.3)");
+        if (may == AL_YES) Error(e.at, msg);
+        growconflicts.push_back({ e.at, CurRealFrame().spec, e.root, root, msg });
+    });
 }
 
 // The callee's growths are the caller's (§1.3(4)): an argument it grows
@@ -5374,13 +5405,13 @@ inline void TypeCheck::ApplyCalleeGrows(Node *at, FnSpec *spec, vector<Val> &arg
                           : ClassArgRoots(spec->argtypes[i], argvals[i]);
         auto root = roots.Root();
         if (!root || IsTemp(root)) return;
-        NoteGrow(at, roots, cat("call ", name, ", which ", how, " ", root->name), arr);
+        RecordGrowth(at, roots, cat("call ", name, ", which ", how, " ", root->name), arr);
     };
     if (spec->sf->isextern) {
         for (size_t i = 0; i < spec->argtypes.size(); i++) {
             auto pt = spec->argtypes[i];
             if (IsPlainRef(pt) && ClassOf(pt->ref->sub) == SC_RESIZABLE)
-                grows(i, "may grow", pt->ref->sub);
+                grows(i, "may grow", SoleResizableIn(pt->ref->sub));
         }
         return;
     }
@@ -5392,7 +5423,7 @@ inline void TypeCheck::ApplyCalleeGrows(Node *at, FnSpec *spec, vector<Val> &arg
         for (auto arr : arrs) grows((size_t)pi, "grows", arr);
     for (auto &[vd, arrs] : rec->growexternals)
         for (auto arr : arrs)
-            NoteGrow(at, MapClass(spec, vd, argvals), cat("call ", name, ", which grows ", vd->name), arr);
+            RecordGrowth(at, MapClass(spec, vd, argvals), cat("call ", name, ", which grows ", vd->name), arr);
 }
 
 // Whether storage of type y can be, or hold, the location `lval` assigned,
