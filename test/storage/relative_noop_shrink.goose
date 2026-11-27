@@ -41,6 +41,8 @@ fn indexed_receiver(i: i64) -> Node[..] {
     views[0].resize(views[0].len);
     views[i].resize(views[i].len);
     views[i + 1].resize(views[i + 1].len);
+    let offsets: i64[..] = [0, 1];
+    views[offsets.cap - 1].resize(views[offsets.cap - 1].len);
     return nodes;
 }
 
@@ -68,6 +70,8 @@ fn empty(nodes: Node[>..]&) {
 fn through_mutable_ref() {
     var nodes: Node[>..] = [Node {}, Node {}];
     nodes[0].next .= nodes[1];
+    let views: (Node[>..]&)[2] = [nodes, nodes];
+    views[views.len - 1].resize(views[views.len - 1].len);
     var alias .= nodes;
     alias.resize(alias.len);
     assert(nodes.len == 2 && nodes[0].next .== nodes[1]);

@@ -757,17 +757,25 @@ template<typename F> void TypeCheck::HeldOperands(F f) {
 // operands each node on the path has not evaluated yet, the one being
 // checked excluded, and where the point is in the head of a construct, the
 // parts the head decides between. Each comes with the frame it is checked in.
-template<typename F> void TypeCheck::LaterOperands(F f) {
-    for (size_t k = 0; k < cur.nodepath.size(); k++) {
-        auto &e = cur.nodepath[k];
-        auto last = k + 1 == cur.nodepath.size();
+inline bool TypeCheck::LaterUse::RemainingOperands(int varframe) {
+    const auto &path = tc.cur.nodepath;
+    for (size_t k = 0; k < path.size(); k++) {
+        auto &e = path[k];
+        if (!tc.NamesFrame(e.frame, varframe)) continue;
+        auto scope = At(e.frame, e.varcount);
+        auto last = k + 1 == path.size();
+        auto hit = false;
         auto i = 0;
-        ForOperands(e.node, [&](Node *ch, HoldKind) {
+        tc.ForOperands(e.node, [&](Node *ch, HoldKind) {
             auto at = i++;
-            if (at > e.pos || (last && at == e.pos)) f(ch, e.frame, e.varcount);
+            if (at > e.pos || (last && at == e.pos))
+                hit = hit || Reads(ch, scope, Is<Call>(e.node));
+            if (auto vd = Is<VarDecl>(e.node); vd && at < (int)vd->names.size())
+                Bind(scope, vd, at);
         });
-        if (!last) AfterHead(e.node, cur.nodepath[k + 1].node, [&](Node *p) { f(p, e.frame, e.varcount); });
+        if (hit || (!last && AfterHead(e.node, path[k + 1].node, scope))) return true;
     }
+    return false;
 }
 
 // What construct n runs after its head -- an if's condition, a match's
@@ -775,21 +783,20 @@ template<typename F> void TypeCheck::LaterOperands(F f) {
 // node being checked inside it: while that is the head, every part the head
 // leads to; while it is one of those parts, nothing more of n, since the
 // other branches do not run.
-template<typename F> void TypeCheck::AfterHead(Node *n, Node *next, F f) {
+inline bool TypeCheck::LaterUse::AfterHead(Node *n, Node *next, const Bindings &scope) {
     if (auto fi = Is<IfExpr>(n)) {
-        if (next != fi->cond) return;
-        f(fi->thenb);
-        if (fi->elseb) f(fi->elseb);
+        return next == fi->cond && (Reads(fi->thenb, scope) || Reads(fi->elseb, scope));
     } else if (auto m = Is<MatchExpr>(n)) {
-        if (next != m->scrutinee) return;
-        for (auto &arm : m->arms) f(arm.body);
+        if (next == m->scrutinee)
+            for (auto &arm : m->arms) if (ArmBody(arm, scope)) return true;
     } else if (auto fl = Is<ForLoop>(n)) {
         auto r = Is<RangeExpr>(fl->iter);
-        if (r && next == r->lo) f(r->hi);
-        if (next == fl->iter || (r && (next == r->lo || next == r->hi))) f(fl->body);
+        if (r && next == r->lo && Reads(r->hi, scope)) return true;
+        if (next == fl->iter || (r && (next == r->lo || next == r->hi))) return LoopBody(fl, scope);
     } else if (auto w = Is<While>(n)) {
-        if (next == w->cond) f(w->body);
+        return next == w->cond && Reads(w->body, scope);
     }
+    return false;
 }
 
 // The root bounding the references inside a holder value: what was
@@ -3390,7 +3397,7 @@ inline TypeCheck::LitDeep TypeCheck::CheckInits(StructLit *sl, vector<Field> &fi
     }
     // Every initializer is in place before any is checked: each is an
     // operand of the literal, the ones before it held and the ones after it
-    // still to run (HeldOperands, LaterOperands).
+    // still to run (HeldOperands, LaterUse::RemainingOperands).
     auto construction = curdst.construction;
     if (construction && reachable) {
         // A tag, an omitted optional, or leading padding emitted on the
@@ -3530,44 +3537,118 @@ inline void TypeCheck::CheckStmts(Block *b) {
     blockpos.back().idx = b->stmts.size();
 }
 
-// Whether the code under n names `name`, including through a nested
-// function called directly or passed as a static function value (§7.6).
-// Unresolved local declarations conservatively count as mentions.
-inline bool TypeCheck::MentionsName(Node *n, string_view name, set<SFunction *> &seen, span<VarDef *> locals,
-                                    span<const string_view> callbackparams) {
-    if (!n) return false;
-    auto nested = [&](string_view used) {
-        for (auto &[si, sf] : localfns)
-            if (sf->name == used && sf->body && seen.insert(sf).second &&
-                MentionsName(sf->body, name, seen)) return true;
-        return false;
-    };
-    if (auto id = Is<Ident>(n)) {
-        if (find(callbackparams.begin(), callbackparams.end(), id->name) != callbackparams.end()) return false;
-        if (id->name == name) return true;
-        if (id->vdef || localfns.empty()) return false;
-        // A bare name can pass a nested function as a static argument.
-        // A variable in the use's lexical scope hides that function (§11.1).
-        if (any_of(locals.begin(), locals.end(), [&](VarDef *v) { return v->name == id->name; })) return false;
-        return nested(id->name);
+inline TypeCheck::LaterUse::Bindings TypeCheck::LaterUse::At(int frame, size_t varcount) const {
+    auto first = (size_t)tc.frames[frame].varbase;
+    Bindings scope;
+    if (varcount > first) scope.locals = span(tc.vars).subspan(first, varcount - first);
+    // Checked locals are in declaration order. The last matching one wins.
+    for (auto v : scope.locals) if (v->name == var->name) scope.hidesvar = v != var;
+    return scope;
+}
+
+inline void TypeCheck::LaterUse::Bind(Bindings &scope, string_view name, VarDef *definition) const {
+    if (name == var->name) scope.hidesvar = definition != var;
+    else if (!name.empty() && !tc.localfns.empty()) scope.introduced.push_back(name);
+}
+
+inline void TypeCheck::LaterUse::Bind(Bindings &scope, VarDecl *decl, size_t i) const {
+    Bind(scope, decl->names[i], i < decl->defs.size() ? decl->defs[i] : nullptr);
+}
+
+// Follow a nested function in the environment of its declaration. A local
+// that hides a name at the call cannot hide a capture in the function body.
+inline bool TypeCheck::LaterUse::Nested(string_view name) {
+    for (auto &[si, sf] : tc.localfns) {
+        if (sf->name != name || !sf->body || !seen.insert(sf).second) continue;
+        Bindings scope;
+        auto env = tc.frames[tc.FrameOfScope(si)].lexspec;
+        auto site = tc.declsiteof.find({ env, sf });
+        if (site != tc.declsiteof.end()) {
+            scope.locals = site->second->vars; // Captures are innermost first.
+            for (auto v : scope.locals) if (v->name == var->name) {
+                scope.hidesvar = v != var;
+                break;
+            }
+        }
+        if (Function(sf, scope)) return true;
     }
-    if (auto fd = Is<FnDecl>(n)) {
-        if (fd->sf->body && seen.insert(fd->sf).second &&
-            MentionsName(fd->sf->body, name, seen))
-            return true;
+    return false;
+}
+
+inline bool TypeCheck::LaterUse::Function(SFunction *sf, Bindings scope) {
+    for (const auto &p : sf->params) Bind(scope, p.name);
+    for (const auto &g : sf->generics) Bind(scope, g.name);
+    Saved countAnyRead(exposed, false);
+    return Reads(sf->body, scope);
+}
+
+inline bool TypeCheck::LaterUse::LoopBody(ForLoop *loop, Bindings scope) {
+    Bind(scope, loop->var, loop->vdef);
+    Bind(scope, loop->idxvar, loop->idxdef);
+    return Reads(loop->body, scope);
+}
+
+inline bool TypeCheck::LaterUse::ArmBody(const MatchArm &arm, Bindings scope) {
+    Bind(scope, arm.pat.binder, arm.binder);
+    return Reads(arm.body, scope);
+}
+
+inline bool TypeCheck::LaterUse::Statements(span<Node *const> stmts, Node *tail, Bindings scope) {
+    for (auto st : stmts) {
+        if (auto vd = Is<VarDecl>(st)) {
+            // A name enters scope after its initializer. A single call on
+            // the right of a multi-result declaration precedes all its names.
+            for (size_t i = 0; i < vd->names.size(); i++) {
+                if (i < vd->inits.size() && Reads(vd->inits[i], scope)) return true;
+                Bind(scope, vd, i);
+            }
+        } else if (Reads(st, scope)) return true;
+    }
+    return Reads(tail, scope);
+}
+
+inline bool TypeCheck::LaterUse::Reads(Node *n, const Bindings &scope, bool callable) {
+    if (!n) return false;
+    if (auto id = Is<Ident>(n)) {
+        if (id->name == var->name) return !scope.hidesvar;
+        if (!callable || id->vdef || tc.localfns.empty()) return false;
+        if (find(scope.introduced.begin(), scope.introduced.end(), id->name) != scope.introduced.end()) return false;
+        if (any_of(scope.locals.begin(), scope.locals.end(), [&](VarDef *v) { return v->name == id->name; }))
+            return false;
+        return Nested(id->name);
     }
     if (auto c = Is<Call>(n)) {
-        if (auto d = Is<Dot>(c->callee); d && nested(d->name)) return true;
+        // Only a callee or a direct argument can denote a static function
+        // (§7.6). Reading an implicit it in arithmetic cannot call an outer
+        // function named it; passing it to another call can.
+        if (auto d = Is<Dot>(c->callee)) {
+            if (Nested(d->name) || Reads(d->obj, scope, true)) return true;
+        } else if (Reads(c->callee, scope, true)) return true;
+        for (auto arg : c->args) if (Reads(arg, scope, true)) return true;
+        return Reads(c->trailing, scope);
     }
-    if (auto fv = Is<FunVal>(n); fv && !fv->params.empty()) {
-        // A block captures its lexical variables. Its own parameters shadow
-        // them only inside this body. An implicit it depends on call arity.
-        vector<string_view> params(callbackparams.begin(), callbackparams.end());
-        for (const auto &p : fv->params) params.push_back(p.name);
-        return MentionsName(fv->body, name, seen, locals, params);
+    if (auto b = Is<Block>(n)) return Statements(b->stmts, b->tail, scope);
+    if (auto fl = Is<ForLoop>(n)) return Reads(fl->iter, scope) || LoopBody(fl, scope);
+    if (auto m = Is<MatchExpr>(n)) {
+        if (Reads(m->scrutinee, scope)) return true;
+        for (auto &arm : m->arms) {
+            if (Reads(arm.expansion, scope)) return true;
+            for (auto &p : arm.pat.items) if (Reads(p.lo, scope) || Reads(p.hi, scope)) return true;
+            if (ArmBody(arm, scope)) return true;
+        }
+        return false;
+    }
+    if (auto fd = Is<FnDecl>(n)) return Function(fd->sf, scope);
+    if (auto fv = Is<FunVal>(n)) {
+        auto body = scope;
+        for (const auto &p : fv->params) Bind(body, p.name);
+        return Reads(fv->body, body);
+    }
+    if (exposed && Is<Dot>(n)) {
+        if (auto ft = FieldType(n); ft && !tc.HoldsPlainRef(ft)) return false;
     }
     auto hit = false;
-    n->Children([&](Node *ch) { hit = hit || MentionsName(ch, name, seen, locals, callbackparams); });
+    n->Children([&](Node *ch) { hit = hit || Reads(ch, scope); });
     return hit;
 }
 
@@ -3586,54 +3667,34 @@ inline bool TypeCheck::EscapingContinue(Node *n) {
     return hit;
 }
 
-// Whether the rest of the statement being checked (LaterOperands) may take a
+// Whether the rest of the statement being checked (LaterUse::RemainingOperands) may take a
 // reference or slice out of v: it names v other than to read a field path
 // whose value holds none, itself or in a nested function it calls. Syntactic,
 // as UsedAfter is: a field path is resolved by name against v's type.
 inline bool TypeCheck::ExposedLater(VarDef *v) {
-    auto vframe = FrameOfScope(Depth(v) - 1);
-    // The type of the field path `n` reads starting at v, or null.
-    auto fieldtype = [&](Node *n) -> TypeExpr * {
-        vector<string_view> names;
-        while (auto d = Is<Dot>(n)) {
-            names.push_back(d->name);
-            n = d->obj;
-        }
-        auto id = Is<Ident>(n);
-        if (!id || id->name != v->name || names.empty() || !v->type) return nullptr;
-        auto t = v->type;
-        for (auto i = names.size(); i-- > 0;) {
-            if (t->kind == TY_REF) t = t->ref->sub;
-            if (t->kind != TY_STRUCT) return nullptr;
-            auto inst = GetStructInst(t);
-            TypeExpr *ft = nullptr;
-            for (size_t k = 0; k < inst->st->fields.size() && k < inst->ftypes.size(); k++)
-                if (inst->st->fields[k].name == names[i]) ft = inst->ftypes[k];
-            if (!ft) return nullptr;
-            t = ft;
-        }
-        return t;
-    };
-    function<bool(Node *)> exposes = [&](Node *n) -> bool {
-        set<SFunction *> seen;
-        if (!n || !MentionsName(n, v->name, seen)) return false;
-        if (auto ft = fieldtype(n)) return HoldsPlainRef(ft);
-        if (Is<Ident>(n)) return true;
-        // A mention by a nested function the node calls, not by its operands.
-        auto inchild = false, any = false;
-        n->Children([&](Node *ch) {
-            set<SFunction *> s;
-            if (!MentionsName(ch, v->name, s)) return;
-            inchild = true;
-            any = any || exposes(ch);
-        });
-        return any || !inchild;
-    };
-    auto exposed = false;
-    LaterOperands([&](Node *n, int fi, size_t) {
-        exposed = exposed || (NamesFrame(fi, vframe) && exposes(n));
-    });
-    return exposed;
+    return LaterUse { *this, v, true }.RemainingOperands(FrameOfScope(Depth(v) - 1));
+}
+
+inline TypeExpr *TypeCheck::LaterUse::FieldType(Node *n) const {
+    vector<string_view> names;
+    while (auto d = Is<Dot>(n)) {
+        names.push_back(d->name);
+        n = d->obj;
+    }
+    auto id = Is<Ident>(n);
+    if (!id || id->name != var->name || names.empty() || !var->type) return nullptr;
+    auto t = var->type;
+    for (auto i = names.size(); i-- > 0;) {
+        if (t->kind == TY_REF) t = t->ref->sub;
+        if (t->kind != TY_STRUCT) return nullptr;
+        auto inst = tc.GetStructInst(t);
+        TypeExpr *ft = nullptr;
+        for (size_t k = 0; k < inst->st->fields.size() && k < inst->ftypes.size(); k++)
+            if (inst->st->fields[k].name == names[i]) ft = inst->ftypes[k];
+        if (!ft) return nullptr;
+        t = ft;
+    }
+    return t;
 }
 
 // Whether variable v can be read again after the shrink being checked
@@ -3655,17 +3716,9 @@ inline bool TypeCheck::UsedAfter(VarDef *v) {
     // Components have no source identifier of their own. A later use of
     // their owner conservatively keeps the component's stored views live.
     if (v->componentowner && v->type) v = v->componentowner;
-    set<SFunction *> seen;
+    LaterUse scan { *this, v };
     auto vframe = FrameOfScope(Depth(v) - 1);
-    auto mentions = [&](Node *n, int fi, size_t varcount = 0) {
-        if (!NamesFrame(fi, vframe)) return false;
-        auto first = (size_t)frames[fi].varbase;
-        auto locals = varcount > first ? span(vars).subspan(first, varcount - first) : span<VarDef *> {};
-        return MentionsName(n, v->name, seen, locals);
-    };
-    auto later = false;
-    LaterOperands([&](Node *n, int fi, size_t varcount) { later = later || mentions(n, fi, varcount); });
-    if (later) return true;
+    if (scan.RemainingOperands(vframe)) return true;
     // The scopes the exit leaves, from `cut` on, and the statement it is in
     // the innermost block (its stmts.size() for the tail).
     auto cut = (int)scopes.size();
@@ -3694,16 +3747,17 @@ inline bool TypeCheck::UsedAfter(VarDef *v) {
         // A `for` binding is rebound by the loop itself at every iteration.
         if (auto fl = Is<ForLoop>(scopes[i].node); fl && (fl->vdef == v || fl->idxdef == v))
             return true;
-        if (Depth(v) <= i && scopes[i].node && mentions(scopes[i].node, FrameOfScope(i)))
+        if (Depth(v) <= i && NamesFrame(FrameOfScope(i), vframe) && scan.Reads(scopes[i].node, {}))
             return true;
     }
     for (auto &bp : blockpos) {
         if (bp.scopeidx < Depth(v) - 1) continue;
         auto fi = FrameOfScope(bp.scopeidx);
+        if (!NamesFrame(fi, vframe)) continue;
         auto &fr = frames[fi];
         // A function value's body, whole.
         if (fr.isfunval && !fr.isdefault && bp.scopeidx == fr.scopebase &&
-            Depth(v) - 1 < bp.scopeidx && mentions(bp.block, fi))
+            Depth(v) - 1 < bp.scopeidx && scan.Reads(bp.block, {}))
             return true;
         auto &stmts = bp.block->stmts;
         auto exits = &bp == &blockpos.back() && exitat != SIZE_MAX;
@@ -3711,11 +3765,13 @@ inline bool TypeCheck::UsedAfter(VarDef *v) {
         auto end = exits ? min(exitat + 1, stmts.size()) : stmts.size();
         auto nextscope = (size_t)bp.scopeidx + 1;
         auto varcount = nextscope < scopes.size() ? (size_t)scopes[nextscope].varbase : vars.size();
-        for (auto i = bp.idx + 1; i < end; i++)
-            if (mentions(stmts[i], fi, varcount)) return true;
-        if ((!exits || exitat == stmts.size()) && bp.idx < stmts.size() && bp.block->tail &&
-            mentions(bp.block->tail, fi, varcount))
-            return true;
+        if (bp.idx >= stmts.size()) continue;
+        auto scope = scan.At(fi, varcount);
+        if (auto vd = Is<VarDecl>(stmts[bp.idx]))
+            for (size_t i = 0; i < vd->names.size(); i++) scan.Bind(scope, vd, i);
+        auto rest = span(stmts).subspan(bp.idx + 1, end - (bp.idx + 1));
+        auto tail = !exits || exitat == stmts.size() ? bp.block->tail : nullptr;
+        if (scan.Statements(rest, tail, scope)) return true;
     }
     return false;
 }

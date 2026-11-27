@@ -591,8 +591,31 @@ struct TypeCheck {
     void ExpandInitializers(vector<FieldInit> &inits);
     void ExpandArms(vector<MatchArm> &arms);
     bool IsValuelessTail(const Node *n);
-    bool MentionsName(Node *n, string_view name, set<SFunction *> &seen, span<VarDef *> locals = {},
-                      span<const string_view> callbackparams = {});
+    // Lexical scan of code that may still read a variable (§5.1). A whole
+    // block and the unexecuted suffix of an open block use the same walk.
+    struct LaterUse {
+        TypeCheck &tc;
+        VarDef *var;
+        bool exposed = false; // Only reads that can expose a reference from the variable.
+        set<SFunction *> seen;
+        struct Bindings {
+            span<VarDef *const> locals; // Already visible at this point in the checked frame.
+            small_vector<string_view, 4> introduced; // Variables that can hide nested functions.
+            bool hidesvar = false;
+        };
+        Bindings At(int frame, size_t varcount) const;
+        void Bind(Bindings &scope, string_view name, VarDef *definition = nullptr) const;
+        void Bind(Bindings &scope, VarDecl *decl, size_t i) const;
+        bool Reads(Node *n, const Bindings &scope, bool callable = false);
+        bool Statements(span<Node *const> stmts, Node *tail, Bindings scope);
+        bool Function(SFunction *sf, Bindings scope);
+        bool Nested(string_view name);
+        bool LoopBody(ForLoop *loop, Bindings scope);
+        bool ArmBody(const MatchArm &arm, Bindings scope);
+        bool AfterHead(Node *n, Node *next, const Bindings &scope);
+        bool RemainingOperands(int varframe);
+        TypeExpr *FieldType(Node *n) const;
+    };
     bool EscapingContinue(Node *n);
     bool UsedAfter(VarDef *v);
 
@@ -605,7 +628,7 @@ struct TypeCheck {
     // (`nodevals`): the values evaluated before that point and still live --
     // the earlier operands of every node on the path, which their parents
     // consume after the point (HeldOperands, §5.1, §5.2) -- and the parts
-    // that run after it (LaterOperands, UsedAfter). Nothing is recorded
+    // that run after it (LaterUse::RemainingOperands, UsedAfter). Nothing is recorded
     // along the way, so no construct can be left out.
     struct PathEntry {
         Node *node;
@@ -691,8 +714,6 @@ struct TypeCheck {
     static Node *AddressedPath(Node *n);
     static Node *PathObject(Node *n);
     template<typename F> void HeldOperands(F f);
-    template<typename F> void LaterOperands(F f);
-    template<typename F> void AfterHead(Node *n, Node *next, F f);
     vector<VarDef *> vars;                            // All in-scope variables, all frames.
     vector<pair<int, SFunction *>> localfns;          // Nested fns, with their scope index.
     // The overload sets of nested functions bound as function values

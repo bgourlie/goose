@@ -1898,8 +1898,7 @@ inline bool TypeCheck::HasLimitedSlotView(VarDef *owner, const LinkField &part, 
         if (!shrink || UsedAfter(v)) return true;
         // The operation itself may pass the view to a callee. A registered
         // defer can also read it after its last use in the enclosing block.
-        set<SFunction *> seen;
-        if (MentionsName(shrink, v->name, seen)) return true;
+        if (LaterUse { *this, v }.Reads(shrink, {})) return true;
         for (auto &scope : scopes) for (auto &d : scope.defers)
             if (d.env && any_of(d.env->bindings.begin(), d.env->bindings.end(),
                                 [&](const EnvRead &r) { return r.var == v; })) return true;
@@ -4082,6 +4081,9 @@ inline bool TypeCheck::SamePath(Node *a, Node *b, PathInterval interval) {
     }
     auto da = Is<Dot>(a), db = Is<Dot>(b);
     if (da || db) {
+        if (interval == PathInterval::ConsecutiveReads && da && db &&
+            (da->member == B_LEN || da->member == B_CAP) && da->member == db->member)
+            return SamePath(da->obj, db->obj, interval);
         auto field = [&](Dot *d) {
             return d && d->fieldidx >= 0 && d->exprtype &&
                    (interval == PathInterval::ConsecutiveReads || !IsRefOrSlice(d->exprtype));
