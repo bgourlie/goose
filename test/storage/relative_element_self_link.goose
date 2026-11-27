@@ -15,8 +15,22 @@ fn trim(i: i64) {
     else { assert(nodes[0].links.next == null); }
 }
 
+fn mark(n: Node&) { n.links.next .= n; }
+
+fn mark_each(helper: bool) {
+    var nodes: Node[>..] = [Node {}, Node {}, Node {}];
+    for &n in nodes {
+        if helper { mark(n); }
+        else { n.links.next .= n; }
+    }
+    nodes.pop_n(1);
+    assert(nodes.len == 2 && nodes[0].links.next .== nodes[0] && nodes[1].links.next .== nodes[1]);
+}
+
 fn main() {
     trim(0);
     trim(1);
+    mark_each(false);
+    mark_each(true);
     print("ok");
 }

@@ -4222,7 +4222,10 @@ inline bool TypeCheck::BackwardElementRebind(Node *slot, Node *value) {
         if (!field->exprtype || IsRefOrSlice(field->exprtype)) break;
     }
     auto source = Is<Ident>(field), targetref = Is<Ident>(u && u->op == T_BITAND ? u->child : value);
-    auto prior = targetref && targetref->vdef ? targetref->vdef->elementorigin : nullptr;
+    auto binding = targetref ? targetref->vdef : nullptr;
+    if (binding && source && source->vdef == binding && !binding->isvar && IsAddressRef(binding->type))
+        return true;
+    auto prior = binding ? binding->elementorigin : nullptr;
     if (prior && InScope(prior, prior->elementdecl)) {
         if (auto call = Is<Call>(field); call && call->builtin == B_PUSH && call->appendedarray == prior->elementarray)
             return true;
