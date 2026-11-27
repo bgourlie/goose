@@ -25,7 +25,7 @@ inline const LinkField *TypeCheck::ArrayHeader(const RefPlace &place, TypeExpr *
 // The count and, for resize, the fill have already been checked in evaluation order.
 inline TypeCheck::SlotRemoval TypeCheck::CountedRemoval(BuiltinKind op, const vector<Node *> &args,
                                                         const Val &count, TypeExpr *array, const Val &receiver,
-                                                        CountProof &condition, CountProof fillpreserves) {
+                                                        CountProof &condition, CountProof fillpreserves, CountProof savedlength) {
     assert(op == B_POP_N || op == B_RESIZE);
     auto matches = [&](Dot *d) {
         return SamePath(args[0], d->obj, PathInterval::ConsecutiveReads) ||
@@ -35,6 +35,7 @@ inline TypeCheck::SlotRemoval TypeCheck::CountedRemoval(BuiltinKind op, const ve
         condition = proof;
         return proof.Unconditional() ? SlotRemoval::None : SlotRemoval::PreservesIfUnchanged;
     };
+    if (auto proof = savedlength.Both(fillpreserves); proof.Available()) return preserves(proof);
     if (auto d = Is<Dot>(args[1]); d && matches(d)) {
         if (d->member == B_CAP && op == B_RESIZE && IsArrayKind(array, A_LIMITED)) return SlotRemoval::ToCapacity;
         if (d->member == B_LEN) {
@@ -503,10 +504,22 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
         }
         elem = rt->arr->sub;
     }
+    // Save the measurement before logging this resize's own potential growth.
+    VarDef *sizebinding = nullptr;
+    LinkFlow::Measurement measured;
+    if (d.kind == B_RESIZE && ak == A_GROW && !cur.links.lengths.empty()) {
+        if (auto id = Is<Ident>(args[1])) {
+            sizebinding = LookupVar(id->name, id->ns);
+            measured = cur.links.Measured(sizebinding);
+            if (measured.header != ArrayHeader(rv, recvarr) || !rv.Exact() || rv.Root() != measured.owner)
+                measured = {};
+        }
+    }
     // The receiver grows (§1.3(4)): logged ahead of the arguments, so that
     // a value built in place among them is checked against the growths
     // within it alone.
-    if (*d.grows && !(d.flags & BF_OUTARG))
+    bool shrinkonly = d.kind == B_RESIZE && ak == A_GROW && args.size() == 2;
+    if (*d.grows && !(d.flags & BF_OUTARG) && !shrinkonly)
         NoteGrow(c, rv, cat(d.grows, " ", ExprStr(args[0])), recvarr);
     // The serialization pair (docs/design/serialization.md §4). to_bytes
     // builds the image -- a varint byte count then the element region --
@@ -592,7 +605,12 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
                                    "contains self-relative references, is not supported; push "
                                    "the elements, which constructs each in place"));
         }
-        removal = CountedRemoval(d.kind, args, length, recvarr, rv, countcondition, fillpreserves);
+        CountProof savedlength;
+        if (measured.header)
+            savedlength = sizebinding->type->cq ? CountProof(true) : CountProof::IfUnchanged(ast.countconditions, sizebinding);
+        removal = CountedRemoval(d.kind, args, length, recvarr, rv, countcondition, fillpreserves, savedlength);
+        // A successful resize installs the evaluated count even when a fill ran.
+        if (measured.header && reachable) cur.links.lengths[sizebinding] = measured;
     }
     // index_of recovers the element index a reference stands for (§3.3).
     // The reference must be an element of this very array, which is what
@@ -5428,8 +5446,20 @@ inline void TypeCheck::NoteGrow(Node *at, const Roots &roots, const string &what
     RecordGrowth(at, roots, what, SoleResizableIn(t));
 }
 
+inline void TypeCheck::InvalidateLengths(VarDef *owner, bool exact, TypeExpr *array, const LinkFlow *exit) {
+    if (cur.deferring) cur.deferring->growths.emplace(owner, exact, array);
+    erase_if(cur.links.lengths, [&](const auto &p) {
+        const auto &m = p.second;
+        if (exit && exit->Measured(p.first) == m) return false;
+        if (owner && MayAliasRoots(m.owner, true, owner, exact) == AL_NO) return false;
+        return !array || TopConstEq(FieldPathType(m.header->base, m.header->path), array);
+    });
+}
+
 inline void TypeCheck::RecordGrowth(Node *at, const Roots &roots, const string &what, TypeExpr *arr) {
     if (cur.probingtypes) return;
+    bool changeslength = !arr || IsArrayKind(arr, A_GROW);
+    if (changeslength && roots.unknown) InvalidateLengths(nullptr, false, arr);
     auto note = [&](vector<TypeExpr *> &types) {
         for (auto u : types)
             if (!u == !arr && (!u || TypeEq(u, arr))) return;
@@ -5437,6 +5467,7 @@ inline void TypeCheck::RecordGrowth(Node *at, const Roots &roots, const string &
     };
     for (auto &a : roots.alts) {
         auto root = a.root;
+        if (changeslength && (root || !a.exact)) InvalidateLengths(root, a.exact, arr);
         if (!root || IsTemp(root)) continue;
         cur.growlog.push_back({ at, root, a.exact, what, false, arr });
         NoteRootEvent(root, [&](FnSpec *s, int i) { note(s->record.growparams[i]); },

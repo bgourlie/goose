@@ -27,6 +27,38 @@ fn keep(nodes: Node[>..]&) {
     defer { nodes.pop_n(ALSO_ZERO); }
 }
 
+fn keep_saved(nodes: Node[>..]&) {
+    const size = nodes.len;
+    let alias .= nodes;
+    nodes.resize(nodes.len);
+    alias.resize(size);
+    nodes.resize(size);
+    defer { nodes.resize(size); }
+}
+
+fn grow_scratch(nodes: Node[>..]&, scratch: i64[>..]&) {
+    const size = nodes.len;
+    scratch.push(7);
+    nodes.resize(size);
+}
+
+fn leave_with_growth(scratch: i64[>..]&) {
+    scratch.push(8);
+    return from keep_on_exit;
+}
+
+fn keep_on_exit(nodes: Node[>..]&, scratch: i64[>..]&) {
+    const size = nodes.len;
+    defer { nodes.resize(size); }
+    leave_with_growth(scratch);
+}
+
+fn restore_measurement(cells: Cells&) {
+    const size = cells.data.len;
+    { defer { cells.data.resize(size, 0); } }
+    cells.data.resize(size, 0);
+}
+
 fn keep_through_alias(nodes: Node[>..]&) {
     let other .= nodes;
     nodes.resize(other.len);
@@ -146,6 +178,7 @@ fn main() {
     assert(unlinked.len == 0);
     var cells = Cells { data: [1, 2] };
     cells.head .= cells.data[1];
+    restore_measurement(cells);
     let cell_alias .= cells;
     cells.data.resize(cell_alias.data.len, 0);
     cell_alias.data.resize(cells.data.len);
@@ -171,6 +204,11 @@ fn main() {
     var nodes: Node[>..] = [Node {}, Node {}, Node {}];
     trim_then_link(nodes);
     keep_named(nodes);
+    keep_saved(nodes);
+    var scratch: i64[>..] = [];
+    grow_scratch(nodes, scratch);
+    keep_on_exit(nodes, scratch);
+    assert(scratch.len == 2);
     nodes.pop_n(zero_count);
     nodes.pop_n(0);
     nodes.resize(nodes.len);

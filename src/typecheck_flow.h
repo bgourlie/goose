@@ -2439,7 +2439,7 @@ inline vector<TypeCheck::DeferBinding> TypeCheck::DeferBindings(Defer *d) {
         if (!v || v->isglobal || !seen.insert(v).second) return;
         if (v->type && (HoldsPlainRef(v->type) || (!v->isvar && IsIntT(v->type))))
             bindings.push_back({ EnvReadOf(v), cur.links.GetTarget(LinkFlow::BindingKey(v)),
-                                 cur.links.borrowedindices.count(v) != 0 });
+                                 cur.links.borrowedindices.count(v) != 0, cur.links.Measured(v) });
         // A captured element reference also depends on the integer that
         // selected its slot, even when the defer never names the index.
         if (v->refplace.indexed.array) {
@@ -2475,6 +2475,7 @@ inline TypeCheck::DeferEffects TypeCheck::CheckDeferredBody(Defer *d) {
         Saved<Rebuild *> active(cur.rebuild, nullptr); // Checked now, executed on scope exit.
         cur.links = {};
         cur.links.borrowedindices = saved.links.borrowedindices;
+        cur.links.lengths = saved.links.lengths;
         // A defer starts with its captured bindings. Its summary contains
         // only stores made by the body, even when earlier stores reach it.
         for (auto &e : saved.locals) cur.links.CopyBindingTarget(e.var, saved.links);
@@ -2504,7 +2505,8 @@ inline void TypeCheck::RefreshDeferredBody(DeferEffects &effects) {
             return r.ref != r.var->ref || r.contents != r.var->contents ||
                    r.slotref != r.var->slotref || r.refplace != r.var->refplace ||
                    binding.target != cur.links.GetTarget(LinkFlow::BindingKey(r.var)) ||
-                   binding.borrowedindex != (cur.links.borrowedindices.count(r.var) != 0);
+                   binding.borrowedindex != (cur.links.borrowedindices.count(r.var) != 0) ||
+                   binding.length != cur.links.Measured(r.var);
         })) return;
     auto exit = SaveFlow();
     {
@@ -2520,6 +2522,7 @@ inline void TypeCheck::RefreshDeferredBody(DeferEffects &effects) {
         scopes.back().defers.resize(env->ndefers);
         RestoreFlow(env->entry);
         cur.links.borrowedindices = exit.links.borrowedindices;
+        cur.links.lengths = exit.links.lengths;
         // The declarations and narrowing are those at registration. The
         // references those declarations hold are the ones on this exit.
         for (auto &e : exit.locals) {
@@ -2567,6 +2570,8 @@ inline void TypeCheck::RunExitDefers(int first, ScopeExit exit, span<const FnRec
     for (auto i = (int)scopes.size(); i-- > first;) {
         for (auto it = scopes[i].defers.rbegin(); it != scopes[i].defers.rend(); ++it) {
             RefreshDeferredBody(*it);
+            for (auto [owner, exact, array] : it->growths)
+                InvalidateLengths(owner, exact, array, &it->exit.writes);
             // A nonlocal return can unwind a frame using the same result stack.
             // On a local exit only channels reached by a return operand are in use.
             auto channels = exit == ScopeExit::Local ? cur.delivering : SIZE_MAX;
@@ -3348,8 +3353,16 @@ inline void TypeCheck::CheckVarDecl(VarDecl *vd, bool global) {
             d->constantindex = KnownIndex(vd->inits[i], v);
         auto len = Is<Dot>(vd->inits[i]);
         if (!vd->isvar && !global && len && len->member == B_LEN &&
-            d->type->kind == TY_INT && d->type->intstorage == IS_I64)
+            d->type->kind == TY_INT && d->type->intstorage == IS_I64) {
             d->markof = len->obj;
+            auto array = len->obj->exprtype;
+            if (IsPlainRef(array)) array = array->ref->sub;
+            if (len->measuredarray && IsArrayKind(array, A_GROW)) {
+                auto value = nodevals.find(len->obj);
+                if (value && value->Exact() && value->Root() && !IsTemp(value->Root()))
+                    cur.links.lengths[d] = { len->measuredarray, value->Root() };
+            }
+        }
     }
 }
 

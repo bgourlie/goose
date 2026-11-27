@@ -324,6 +324,17 @@ struct TypeCheck {
             bool operator==(const FreshSuffix &) const = default;
         };
         map<const LinkField *, FreshSuffix> fresh;
+        struct Measurement {
+            const LinkField *header = nullptr;
+            VarDef *owner = nullptr;
+            bool operator==(const Measurement &) const = default;
+        };
+        // A saved length bounds the current length until a possible growth.
+        map<VarDef *, Measurement> lengths;
+        Measurement Measured(VarDef *binding) const {
+            auto it = lengths.find(binding);
+            return it == lengths.end() ? Measurement {} : it->second;
+        }
         // Integer bindings whose address may already have escaped on this path.
         set<VarDef *> borrowedindices;
         LimitedPrefixes prefixes;
@@ -410,6 +421,9 @@ struct TypeCheck {
         // the enclosing field. A fresh iteration can bind a different slot.
         template<typename F> void ForgetBindings(F expired) {
             erase_if(fresh, [&](const auto &p) { return expired(p.first->base) || expired(p.second.owner); });
+            erase_if(lengths, [&](const auto &p) {
+                return expired(p.first) || expired(p.second.header->base) || expired(p.second.owner);
+            });
             erase_if(borrowedindices, expired);
             erase_if(targets, [&](const auto &p) {
                 auto var = get_if<VarDef *>(&p.first);
@@ -432,6 +446,7 @@ struct TypeCheck {
             }
         }
         void Join(const LinkFlow &other, bool backedge) {
+            erase_if(lengths, [&](const auto &p) { return other.Measured(p.first) != p.second; });
             for (auto it = fresh.begin(); it != fresh.end();) {
                 auto found = other.fresh.find(it->first);
                 // A decreasing bound can reach zero after enough iterations.
@@ -465,7 +480,7 @@ struct TypeCheck {
         }
         // Loop convergence depends on the possible writes, not event numbers.
         bool operator==(const LinkFlow &o) const {
-            return fresh == o.fresh && borrowedindices == o.borrowedindices && prefixes == o.prefixes &&
+            return fresh == o.fresh && lengths == o.lengths && borrowedindices == o.borrowedindices && prefixes == o.prefixes &&
                    targets == o.targets && fills == o.fills &&
                    RelativeStore::SameSet(resultlinks, o.resultlinks) && live.size() == o.live.size() &&
                    equal(live.begin(), live.end(), o.live.begin(),
@@ -579,6 +594,7 @@ struct TypeCheck {
     struct DeferEnv;
     struct DeferEffects {
         Defer *statement = nullptr;
+        set<tuple<VarDef *, bool, TypeExpr *>> growths; // Headers that can grow when this defer runs.
         vector<FnRecord::StorageRead> reads;
         vector<FnRecord::StorageWrite> writes;
         vector<pair<VarDef *, RefPlace>> bindings; // Captures rebound on normal completion.
@@ -709,6 +725,7 @@ struct TypeCheck {
         EnvRead read;
         LiveTarget target;
         bool borrowedindex;
+        LinkFlow::Measurement length;
     };
     // A defer sees its original declarations and the bindings at execution.
     struct DeferEnv {
@@ -3028,7 +3045,8 @@ struct TypeCheck {
         return value.lvalue || IsPlainRef(value.type) ? ArrayHeader(value.refplace, array) : nullptr;
     }
     SlotRemoval CountedRemoval(BuiltinKind op, const vector<Node *> &args, const Val &count,
-                               TypeExpr *array, const Val &receiver, CountProof &condition, CountProof fillpreserves = true);
+                               TypeExpr *array, const Val &receiver, CountProof &condition,
+                               CountProof fillpreserves = true, CountProof savedlength = false);
     void CheckByteOut(Call *c, Node *out, const string &form);
     // Later passes walk only the arguments that can execute. Overload
     // resolution on a subsequent check still needs the call as written.
@@ -3165,14 +3183,15 @@ struct TypeCheck {
         cur.links.prefixes.Forget([&](VarDef *prefix) { return prefix == v; });
         cur.links.targets.erase(v);
         cur.links.targets.erase(SliceElements { v });
-        if (!cur.links.live.empty() || !cur.links.fresh.empty())
+        if (!cur.links.live.empty() || !cur.links.fresh.empty() || !cur.links.lengths.empty())
             cur.links.ForgetBindings([&](VarDef *base) { return base == v; });
         if (!v->type || v->isvar || !IsAddressRef(v->type)) return;
         erase_if(cur.kills, [&](const Kill &k) { return k.relative && k.base == v; });
     }
     void ForgetLocal(VarDef *v) {
         if (cur.links.live.empty() && cur.links.targets.empty() && cur.links.prefixes.arrays.empty() &&
-            cur.links.fills.empty() && cur.links.borrowedindices.empty() && cur.links.fresh.empty() && cur.kills.empty()) return;
+            cur.links.fills.empty() && cur.links.borrowedindices.empty() && cur.links.fresh.empty() &&
+            cur.links.lengths.empty() && cur.kills.empty()) return;
         ForgetOwner(v);
         for (auto c : v->components) if (c) ForgetLocal(c);
     }
@@ -3553,6 +3572,7 @@ struct TypeCheck {
     };
     // Each takes the type of the storage grown, shrunk or built in.
     void RecordGrowth(Node *at, const Roots &roots, const string &what, TypeExpr *array);
+    void InvalidateLengths(VarDef *owner, bool exact, TypeExpr *array, const LinkFlow *exit = nullptr);
     void NoteGrow(Node *at, const Roots &roots, const string &what, TypeExpr *t);
     void NoteShrinkEvent(Node *at, VarDef *root, TypeExpr *bound, const string &what,
                          TypeExpr *t);
@@ -3567,8 +3587,9 @@ struct TypeCheck {
                             const vector<Node *> &argnodes, bool applyexits) {
         if (cur.probingtypes) return;
         if (hasdefers && reachable) ApplyCalleeReads(spec, args);
-        ApplyCalleeShrinks(at, spec, args, name, argnodes, applyexits);
+        // A nonlocal exit can unwind a caller's defer inside shrink replay.
         ApplyCalleeGrows(at, spec, args, name);
+        ApplyCalleeShrinks(at, spec, args, name, argnodes, applyexits);
     }
     // Whether an element pushed into, or allocated in, an array of `elem`
     // is built in place at its slot, as codegen builds it (ElemValue): a
