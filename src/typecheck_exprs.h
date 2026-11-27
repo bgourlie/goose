@@ -30,6 +30,12 @@ inline LiveTarget TypeCheck::LivePrefixTarget(Node *n, size_t result) {
     return it == cur.links.targets.end() ? nullptr : it->second;
 }
 
+// The result denotes the same storage as its source on this path. Record it
+// before later operands or exit defers run so their effects reach both.
+inline void TypeCheck::ForwardLiveTarget(Node *result, Node *source) {
+    if (!cur.links.targets.empty()) cur.links.SetTarget(result, LivePrefixTarget(source));
+}
+
 inline void TypeCheck::NoteLiveElement(LinkFlow::Target key, const Roots &roots, const RefPlace &place,
                                        TypeExpr *array) {
     VarDef *prefix = nullptr;
@@ -131,7 +137,10 @@ inline TypeCheck::LVal TypeCheck::CheckLValue(Node *n, PathUse use) {
         if (lv.intemp) NoRelRefTempRead(ix->obj, lv.type, elem);
         // The index checks the captured length. A shrink during evaluation of
         // the subscript invalidates this evidence just like a later shrink.
-        NoteLiveElement(n, lv, lv.place, lv.type);
+        if (IsArrayKind(lv.type, A_FIXED) && !IsRefOrSlice(elem))
+            ForwardLiveTarget(n, ix->obj);
+        else
+            NoteLiveElement(n, lv, lv.place, lv.type);
         lv.place = lv.place.Inside(ast.places, IsArrayKind(lv.type, A_GROW));
         if (use != PathUse::Reread) CheckIntAny(ix->idx);
         if (lv.type->cq) lv.writable = false;   // An element of a const value.
@@ -783,11 +792,7 @@ inline void TypeCheck::ResolveMemberLValue(LVal &lv, Dot *d) {
             lv.letbound = f.isconst;
             lv.letname = f.name;
             lv.type = (*run.ftypes)[i];
-            if (!cur.links.targets.empty()) {
-                cur.links.targets.erase(d);
-                if (auto owner = LivePrefixTarget(d->obj); owner.array && !IsRefOrSlice(lv.type))
-                    cur.links.targets[d] = owner;
-            }
+            ForwardLiveTarget(d, IsRefOrSlice(lv.type) ? nullptr : d->obj);
             ProjectField(lv, lv.place, t, run, i);
             lv.var = nullptr;
             lv.fromstorage = true;

@@ -24,6 +24,9 @@ inline bool ReadOnlyResizeFill(Node *n) {
     if (auto cond = Is<IfExpr>(n))
         return cond->elseb && ReadOnlyResizeFill(cond->cond) && ReadOnlyResizeFill(cond->thenb) &&
                ReadOnlyResizeFill(cond->elseb);
+    if (auto m = Is<MatchExpr>(n))
+        return ReadOnlyResizeFill(m->scrutinee) && all_of(m->arms.begin(), m->arms.end(),
+            [](const MatchArm &arm) { return ReadOnlyResizeFill(arm.body); });
     if (Is<StructLit>(n) || Is<ArrayLit>(n)) {
         // CheckInits has already installed every field default that will run.
         bool readonly = true;
@@ -4042,10 +4045,20 @@ inline bool TypeCheck::ResizesToMark(Node *recv, Node *len) {
     return true;
 }
 
-// Reading the same variable and fields twice without intervening effects
-// observes the same storage. Across statements the path must also survive
-// rebinding of the variable or of any reference-valued field along it.
+// Consecutive reads can follow the same subscript when evaluating the path
+// and index changes neither. Across statements a saved length also has to
+// survive rebinding, including replacement of a reference in an array slot.
 inline bool TypeCheck::SamePath(Node *a, Node *b, PathInterval interval) {
+    if (interval == PathInterval::ConsecutiveReads) {
+        if (auto ix = Is<Index>(a)) {
+            auto iy = Is<Index>(b);
+            return iy && SamePath(ix->obj, iy->obj, interval) && SamePath(ix->idx, iy->idx, interval);
+        }
+        if (auto x = Is<IntLit>(a)) {
+            auto y = Is<IntLit>(b);
+            return y && x->val == y->val && x->uns == y->uns;
+        }
+    }
     auto da = Is<Dot>(a), db = Is<Dot>(b);
     if (da || db) {
         auto field = [&](Dot *d) {

@@ -34,6 +34,15 @@ fn limited_pair() -> Node[..] {
 
 fn pop_limited(nodes: Node[..]&) { nodes.pop_n(other_zero); }
 
+fn indexed_receiver(i: i64) -> Node[..] {
+    var nodes: Node[..] = [Node {}, Node {}];
+    nodes[0].next .= nodes[1];
+    var views: (Node[..]&)[1] = [nodes];
+    views[0].resize(views[0].len);
+    views[i].resize(views[i].len);
+    return nodes;
+}
+
 fn shortened_pair() -> Node[..] {
     var nodes: Node[..] = [Node {}; 3];
     nodes.pop_n(1);
@@ -100,7 +109,10 @@ fn main() {
     let n: u64 = 3;
     cells.data.resize(cells.data.len, n as i64);
     cells.data.resize(cells.data.len, if n > 0 { 1 } else { 2 });
+    cells.data.resize(cells.data.len, match n { 0 => 17, _ => 34 });
     assert(cells.head .== cells.data[1]);
+    let indexed: Node[] = indexed_receiver(0);
+    assert(indexed.len == 2 && indexed[0].next .== indexed[1]);
     through_mutable_ref();
     let pair: Node[] = limited_pair();
     assert(pair.len == 2 && pair[0].next .== pair[1]);

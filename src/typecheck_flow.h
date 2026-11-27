@@ -1480,7 +1480,7 @@ inline Val TypeCheck::CheckIf(IfExpr *x, TypeExpr *expected, bool wantvalue) {
         JoinPathScope js(*this, onjoin ? x->thenb : nullptr);
         tv = CheckBlockVal(x->thenb, expected, wantvalue);
     }
-    cur.links.SetTarget(x, LivePrefixTarget(x->thenb));
+    ForwardLiveTarget(x, x->thenb);
     auto aflow = SaveFlow();
     RestoreFlow(entry);
     Val ev = VoidVal();
@@ -1500,7 +1500,7 @@ inline Val TypeCheck::CheckIf(IfExpr *x, TypeExpr *expected, bool wantvalue) {
     // A nested else-if is checked here rather than through its own Check,
     // so its type is settled here too, void where it never produces.
     if (x->elseb) x->elseb->exprtype = ev.type ? ev.type : ast.voidtype;
-    cur.links.SetTarget(x, LivePrefixTarget(x->elseb));
+    ForwardLiveTarget(x, x->elseb);
     auto bflow = SaveFlow();
     Node *last = nullptr;
     if (!blockpos.empty()) {
@@ -1536,7 +1536,7 @@ inline Val TypeCheck::CheckBlockVal(Block *b, TypeExpr *expected, bool wantvalue
     }
     // The block's result survives its local bindings. Its target proof also
     // survives, unless an exit defer shortens the array before delivery.
-    cur.links.SetTarget(b, wantvalue ? LivePrefixTarget(b->tail) : nullptr);
+    ForwardLiveTarget(b, wantvalue ? b->tail : nullptr);
     PopScope();
     if (reachable) CheckBranchRoot(v, CurDepth(), b->tail, "block");
     b->exprtype = v.type ? v.type : ast.voidtype;
@@ -1596,6 +1596,7 @@ inline Val TypeCheck::CheckMatch(MatchExpr *m, TypeExpr *expected, bool wantvalu
         } else {
             CheckStmtExpr(arm.body);
         }
+        ForwardLiveTarget(m, wantvalue ? arm.body : nullptr);
         PopScope();
         auto aflow = SaveFlow();
         if (reachable) CheckBranchRoot(av, CurDepth(), arm.body, "match arm");
@@ -1873,6 +1874,7 @@ inline Val TypeCheck::CheckEarlyBlock(EarlyBlock *x, TypeExpr *expected, bool wa
             CheckStmtExpr(x->body->tail);
         }
     }
+    ForwardLiveTarget(x, wantvalue ? x->body->tail : nullptr);
     auto sc = scopes.back();
     PopScope();
     auto tailreach = reachable;
@@ -2317,6 +2319,7 @@ inline void TypeCheck::CheckBreak(Break *b) {
         // Nothing after the break can complete a [] that took no element type
         // here: the construct's value does not carry the literal form.
         if (v.emptyarr) Error(b->val, "cannot infer array element type");
+        ForwardLiveTarget(scopes[si].node, b->val);
     }
     CheckExitScopes(si, b);
     auto &sc = scopes[si];

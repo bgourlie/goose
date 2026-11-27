@@ -2069,6 +2069,7 @@ struct TypeCheck {
         return result ? LinkFlow::Target(std::pair { n, result }) : LinkFlow::Target(n);
     }
     LiveTarget LivePrefixTarget(Node *n, size_t result = 0);
+    void ForwardLiveTarget(Node *result, Node *source);
     void NoteLiveElement(LinkFlow::Target key, const Roots &roots, const RefPlace &place, TypeExpr *array);
     LiveTarget CallerPrefix(LiveTarget target, FnSpec *spec, span<const Val> args, VarDef *owner);
     static VarDef *PrefixOwner(VarDef *prefix) {
