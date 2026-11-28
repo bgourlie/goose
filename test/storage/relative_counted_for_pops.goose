@@ -13,7 +13,33 @@ fn trim_until(stop: bool) {
         if stop { break; }
     }
 }
+fn conditional_counts(flag: bool) {
+    var rows: Node[>..] = [Node {}; 2];
+    rows[0].next .= rows[1];
+    rows.append([Node {}; 2]);
+    for i in if flag { 1 } else { 2 } { rows.pop(); }
+    assert(rows.len == (if flag { 3 } else { 2 }) && rows[0].next .== rows[1]);
+    const ONE: u8 = 1;
+    const TWO: u8 = 2;
+    rows.append([Node {}; 2]);
+    for i in if flag { TWO } else { ONE } { rows.pop(); }
+    assert(rows.len == 3);
+    rows.append([Node {}; 2]);
+    for i: i8 in (if flag { -1 } else { 0 })..(if flag { 1 } else { 0 }) { rows.pop(); }
+    assert(rows.len == (if flag { 3 } else { 5 }) && rows[0].next .== rows[1]);
+    rows.append([Node {}; 2]);
+    for i in if flag { return; } else { TWO } { rows.pop(); }
+    assert(rows.len == 5 && rows[0].next .== rows[1]);
+}
+fn assigned_in_wide_range(short: bool) -> i64 {
+    var value: i64;
+    for i in (if short { 0 } else { -9223372036854775808 })..2 { value = 42; }
+    return value;
+}
 fn main() {
+    assert(assigned_in_wide_range(true) == 42);
+    conditional_counts(true);
+    conditional_counts(false);
     nodes[0].next .= nodes[1];
     nodes.append([Node {}; 2]);
     for i in 2 { nodes.pop(); }

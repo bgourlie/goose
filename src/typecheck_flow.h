@@ -2077,6 +2077,7 @@ inline void TypeCheck::CheckFor(ForLoop *x) {
     TypeExpr *elemtype = nullptr;   // The array's element type, where it has one.
     Val sequence;    // A computed sequence is materialized once (§6.5).
     IterationBounds bounds { 0, -1 };
+    std::optional<IntegerBounds> start = IntegerBounds{ 0, 0 }, end;
     // A binder's written integer type (§6.5).
     auto written = [&](TypeExpr *te, const char *what) -> TypeExpr * {
         if (!te) return nullptr;
@@ -2113,12 +2114,15 @@ inline void TypeCheck::CheckFor(ForLoop *x) {
         if (vartype) {
             // The bounds are values of the binder's type, a constant adapting
             // as at any typed destination (§3.1), and the loop counts at it.
-            CheckValue(r->lo, vartype);
+            auto lo = CheckValue(r->lo, vartype);
+            start = KnownIntegerBounds(r->lo, lo);
             if (pastend(r->hi)) {
-                CheckIntAny(r->hi);
+                auto hi = CheckIntAny(r->hi);
+                end = KnownIntegerBounds(r->hi, hi);
                 r->exprtype = r->hi->exprtype = ast.inttypes[IS_I64];
             } else {
-                CheckValue(r->hi, vartype);
+                auto hi = CheckValue(r->hi, vartype);
+                end = KnownIntegerBounds(r->hi, hi);
                 r->exprtype = vartype;
             }
             bindtype = vartype;
@@ -2133,6 +2137,8 @@ inline void TypeCheck::CheckFor(ForLoop *x) {
                            ? lot->ix->arr : nullptr;
             auto ct = UnifyNumeric(r, T_DOTDOT, lo, hi, lo.type, hi.type);
             RetypeOperands(r->lo, r->hi, lo, hi, ct);
+            start = KnownIntegerBounds(r->lo, lo);
+            end = KnownIntegerBounds(r->hi, hi);
             r->exprtype = ct;
             bindtype = ct;
             if (arr && IsIntT(ct) && IsUnsigned(ct->intstorage))
@@ -2165,6 +2171,7 @@ inline void TypeCheck::CheckFor(ForLoop *x) {
                 }
                 bindtype = vartype;
             }
+            end = KnownIntegerBounds(x->iter, nv);
         } else if (t->kind == TY_ARRAY || t->kind == TY_SLICE) {
             bounds = ArrayIterations(t);
             if (vartype)
@@ -2214,18 +2221,18 @@ inline void TypeCheck::CheckFor(ForLoop *x) {
     if (idxtype && x->iterkind != IK_ARRAY && x->iterkind != IK_SLICE)
         Error(x, "the index of a range or count counts its iterations as an i64; a type on "
                  "the loop's binder gives the values their type");
-    if (x->iterkind == IK_COUNT || x->iterkind == IK_RANGE) {
-        auto r = Is<RangeExpr>(x->iter);
-        auto lo = r ? FixedCountOperand(r->lo) : std::optional<int64_t>(0);
-        auto hi = FixedCountOperand(r ? r->hi : x->iter);
-        if (lo && hi) {
-            // The bounds are evaluated once. Compare at the counter's
-            // signedness, then subtract without overflowing a signed integer.
-            auto uns = IsUnsigned(x->iter->exprtype->intstorage);
-            auto empty = uns ? (uint64_t)*hi <= (uint64_t)*lo : *hi <= *lo;
-            auto count = empty ? uint64_t(0) : (uint64_t)*hi - (uint64_t)*lo;
-            if (count <= INT64_MAX) bounds = { (int64_t)count, (int64_t)count };
-        }
+    if (start && end) {
+        // The smallest start and largest end bound every possible count.
+        // Compare at the counter's signedness and subtract without signed overflow.
+        auto uns = IsUnsigned(x->iter->exprtype->intstorage);
+        auto distance = [&](int64_t from, int64_t to) -> uint64_t {
+            auto empty = uns ? (uint64_t)to <= (uint64_t)from : to <= from;
+            return empty ? 0 : (uint64_t)to - (uint64_t)from;
+        };
+        auto mincount = distance(start->hi, end->lo);
+        auto maxcount = distance(start->lo, end->hi);
+        bounds.min = (int64_t)std::min<uint64_t>(mincount, INT64_MAX);
+        bounds.max = maxcount <= INT64_MAX ? (int64_t)maxcount : -1;
     }
     // A slice element bound by value, or a reference one however it is
     // bound, was read out of the array: it is as writable as its slot says
@@ -3421,11 +3428,9 @@ inline void TypeCheck::CheckVarDecl(VarDecl *vd, bool global) {
         d->constfrom = d->constlit ? v.constfrom : nullptr;
         Finish(d, ann ? ann : v.type, &v, vd->inits[i]);
         if (!d->isvar && d->type->cq && IsIntT(d->type)) {
-            int64_t lo, hi;
-            if (IntConsts(v, lo, hi) && lo == hi && ConstantBindings(v) == ConstantBinding::Immutable)
-                d->fixedint = WrapStorage(lo, d->type->intstorage);
-            else if (auto k = FixedCountOperand(vd->inits[i]))
-                d->fixedint = WrapStorage(*k, d->type->intstorage);
+            auto bounds = KnownIntegerBounds(vd->inits[i], v);
+            if (bounds && bounds->lo == bounds->hi)
+                d->fixedint = WrapStorage(bounds->lo, d->type->intstorage);
         }
         auto len = Is<Dot>(vd->inits[i]);
         if (!vd->isvar && !global && len && len->member == B_LEN &&

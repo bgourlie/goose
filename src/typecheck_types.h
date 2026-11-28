@@ -811,54 +811,90 @@ inline Val TypeCheck::CheckIntAny(Node *n) {
     return v;
 }
 
-// Indices and counts can be known even when their type is fixed and they
-// cannot adapt like literals. A negative value is never a valid index.
+// A checked integer can be one of several branch literals. Typed constants
+// and arithmetic can also have a fixed runtime value without being literals.
+inline std::optional<TypeCheck::IntegerBounds> TypeCheck::KnownIntegerBounds(Node *n, const Val &v) {
+    IntegerBounds bounds;
+    if (ConstantBindings(v) == ConstantBinding::Immutable && IntConsts(v, bounds.lo, bounds.hi))
+        return bounds;
+    return FoldIntegerBounds(n);
+}
+
 inline int64_t TypeCheck::KnownIndex(Node *n, const Val &v) {
-    int64_t lo, hi;
-    if (IntConsts(v, lo, hi) && lo == hi && lo >= 0 && ConstantBindings(v) == ConstantBinding::Immutable)
-        return lo;
-    return std::max<int64_t>(-1, FixedCountOperand(n).value_or(-1));
+    auto bounds = KnownIntegerBounds(n, v);
+    return bounds && bounds->lo == bounds->hi ? std::max<int64_t>(-1, bounds->lo) : -1;
 }
 
 // Runtime arithmetic can have a fixed value even when a typed constant
 // cannot adapt like a literal. Fold the checked operands at their actual
 // widths and use their resolved bindings (including shadowing locals).
-inline std::optional<int64_t> TypeCheck::FixedCountOperand(Node *n) {
+inline std::optional<TypeCheck::IntegerBounds> TypeCheck::FoldIntegerBounds(Node *n) {
     if (!n || !n->exprtype || !IsIntT(n->exprtype)) return {};
-    if (auto lit = Is<IntLit>(n)) return lit->val;
+    if (auto lit = Is<IntLit>(n)) return IntegerBounds::Exact(lit->val);
     if (auto id = Is<Ident>(n); id && id->vdef && id->vdef->fixedint)
-        return WrapStorage(*id->vdef->fixedint, n->exprtype->intstorage);
+        return IntegerBounds::Exact(WrapStorage(*id->vdef->fixedint, n->exprtype->intstorage));
     if (auto d = Is<Dot>(n); d && (d->member == B_LEN || d->member == B_CAP)) {
         auto t = d->obj->exprtype;
         if (IsPlainRef(t)) t = t->ref->sub;
-        if (IsArrayKind(t, A_FIXED) && d->member == B_LEN) return ArraySize(t->arr);
-        if (IsArrayKind(t, A_LIMITED) && d->member == B_CAP && t->arr->sizeexpr) return ArraySize(t->arr);
+        if ((IsArrayKind(t, A_FIXED) && d->member == B_LEN) ||
+            (IsArrayKind(t, A_LIMITED) && d->member == B_CAP && t->arr->sizeexpr))
+            return IntegerBounds::Exact(ArraySize(t->arr));
     }
-    if (auto b = Is<Block>(n)) return FixedCountOperand(b->tail);
-    if (auto b = Is<EarlyBlock>(n)) {
-        auto value = FixedCountOperand(b->body->tail);
-        if (b->body->tail && !value) return {};
-        for (auto br : b->breaks) {
-            auto k = FixedCountOperand(br->val);
-            if (!k || (value && k != value)) return {};
-            value = k;
+    if (auto b = Is<Block>(n)) return FoldIntegerBounds(b->tail);
+    std::optional<IntegerBounds> bounds;
+    auto include = [&](Node *arm) {
+        // An arm that exits its function supplies no value to the join.
+        if (arm && arm->exprtype && arm->exprtype->kind == TY_VOID) return true;
+        auto next = FoldIntegerBounds(arm);
+        if (!next) return false;
+        auto less = [&](int64_t x, int64_t y) {
+            return IsUnsigned(n->exprtype->intstorage) ? (uint64_t)x < (uint64_t)y : x < y;
+        };
+        if (!bounds) bounds = next;
+        else {
+            if (less(next->lo, bounds->lo)) bounds->lo = next->lo;
+            if (less(bounds->hi, next->hi)) bounds->hi = next->hi;
         }
-        return value;
+        return true;
+    };
+    if (auto x = Is<IfExpr>(n)) {
+        if (!include(x->thenb) || !include(x->elseb)) return {};
+        return bounds;
     }
+    if (auto x = Is<MatchExpr>(n)) {
+        for (auto &arm : x->arms) if (!include(arm.body)) return {};
+        return bounds;
+    }
+    if (auto b = Is<EarlyBlock>(n)) {
+        if (b->body->tail && !include(b->body->tail)) return {};
+        for (auto br : b->breaks) if (!include(br->val)) return {};
+        return bounds;
+    }
+    if (auto l = Is<LoopExpr>(n)) {
+        for (auto br : l->breaks) if (!include(br->val)) return {};
+        return bounds;
+    }
+    // Arithmetic can wrap at the operand width. Fold it only when each
+    // operand has one value, even if that value comes from several arms.
+    auto exact = [&](Node *operand) -> std::optional<int64_t> {
+        auto v = FoldIntegerBounds(operand);
+        if (v && v->lo == v->hi) return v->lo;
+        return {};
+    };
     int64_t result;
     if (auto b = Is<Binary>(n)) {
-        auto l = FixedCountOperand(b->left);
+        auto l = exact(b->left);
         if (!l) return {};
-        auto r = FixedCountOperand(b->right);
-        if (r && FoldIntOp(b->op, *l, *r, b->left->exprtype->intstorage, result)) return result;
+        auto r = exact(b->right);
+        if (r && FoldIntOp(b->op, *l, *r, b->left->exprtype->intstorage, result)) return IntegerBounds::Exact(result);
     } else if (auto u = Is<Unary>(n); u && (u->op == T_MINUS || u->op == T_BITNOT)) {
-        if (auto v = FixedCountOperand(u->child)) {
+        if (auto v = exact(u->child)) {
             auto s = u->child->exprtype->intstorage;
-            if (u->op == T_BITNOT) return WrapStorage(~*v, s);
-            if (FoldIntOp(T_MINUS, 0, *v, s, result)) return result;
+            if (u->op == T_BITNOT) return IntegerBounds::Exact(WrapStorage(~*v, s));
+            if (FoldIntOp(T_MINUS, 0, *v, s, result)) return IntegerBounds::Exact(result);
         }
     } else if (auto cast = Is<AsCast>(n)) {
-        if (auto v = FixedCountOperand(cast->child)) return WrapStorage(*v, cast->totype->intstorage);
+        if (auto v = exact(cast->child)) return IntegerBounds::Exact(WrapStorage(*v, cast->totype->intstorage));
     }
     return {};
 }

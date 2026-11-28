@@ -2127,8 +2127,13 @@ struct TypeCheck {
     TypeExpr *DeclType(TypeExpr *t, TypeExpr *s);
     static bool ImplicitInt(IntStorage from, IntStorage to);
     Val CheckIntAny(Node *n);
+    struct IntegerBounds {
+        int64_t lo, hi;
+        static IntegerBounds Exact(int64_t value) { return { value, value }; }
+    };
+    std::optional<IntegerBounds> KnownIntegerBounds(Node *n, const Val &v);
     int64_t KnownIndex(Node *n, const Val &v);
-    std::optional<int64_t> FixedCountOperand(Node *n);
+    std::optional<IntegerBounds> FoldIntegerBounds(Node *n);
     bool HasRelRefT(TypeExpr *t, bool inpool = false);
     bool BuiltWhereReceived(Node *n, size_t result);
     void NoRelRefCopy(Node *n, TypeExpr *t, size_t result = 0, const VarDecl *bind = nullptr,

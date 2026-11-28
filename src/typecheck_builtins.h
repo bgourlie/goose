@@ -840,11 +840,12 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
             // The pool claims its slots before constructing their defaults.
             writesduringargs = reachable;
             int64_t lo = 0, hi = -1;
-            if (ConstantBindings(length) == ConstantBinding::Immutable && IntConsts(length, lo, hi)) {
-                lo = std::max<int64_t>(0, lo);
-                hi = std::max<int64_t>(0, hi);
-            } else if (auto count = FixedCountOperand(args.back())) {
-                lo = hi = std::max<int64_t>(0, *count);
+            if (auto bounds = KnownIntegerBounds(args.back(), length)) {
+                lo = std::max<int64_t>(0, bounds->lo);
+                // A u64 range straddling i64.max still includes admissible
+                // positive pool lengths. Its large endpoint aborts at run time.
+                hi = IsUnsigned(length.type->intstorage) && bounds->hi < 0 && bounds->lo >= 0
+                     ? INT64_MAX : std::max<int64_t>(0, bounds->hi);
             }
             if (lo == hi) slicelength = lo;
             // Only the newly added slots run defaults. An unknown old slice
