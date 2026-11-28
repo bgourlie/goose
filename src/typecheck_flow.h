@@ -3372,8 +3372,10 @@ inline void TypeCheck::CheckVarDecl(VarDecl *vd, bool global) {
             if (IsPlainRef(array)) array = array->ref->sub;
             if (len->measuredarray && IsArrayKind(array, A_GROW)) {
                 auto value = nodevals.find(len->obj);
-                if (value && value->Exact() && value->Root() && !IsTemp(value->Root()))
-                    cur.links.lengths[{ d, len->measuredarray }] = { value->Root() };
+                if (value) {
+                    auto owners = LinkFlow::MeasuredOwners(*value);
+                    if (!owners.None()) cur.links.lengths[{ d, len->measuredarray }] = { std::move(owners) };
+                }
             }
         }
     }

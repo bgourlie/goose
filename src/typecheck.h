@@ -348,10 +348,19 @@ struct TypeCheck {
             auto operator<=>(VarDef *v) const { return std::compare_three_way {}(binding, v); }
         };
         struct Measurement {
-            VarDef *owner = nullptr;
+            Roots owners; // Exact storage alternatives for the one header selected at the read.
             CountProof valid = true; // Possible writers that must name a different array.
             bool operator==(const Measurement &) const = default;
         };
+        static Roots MeasuredOwners(const Roots &value) {
+            Roots owners;
+            if (value.unknown) return owners;
+            for (auto &a : value.alts) {
+                if (!a.exact || !a.root || IsTemp(a.root)) return {};
+                owners.alts.push_back({ a.root, true }); // The input already has one alternative per root.
+            }
+            return owners;
+        }
         // A saved length bounds the current length until a possible growth.
         map<LengthKey, Measurement, std::less<>> lengths;
         Measurement Measured(LengthKey key) const {
@@ -461,7 +470,7 @@ struct TypeCheck {
             });
             erase_if(fresh, [&](const auto &p) { return expired(p.first->base) || expired(p.second.owner); });
             erase_if(lengths, [&](const auto &p) {
-                return expired(p.first.binding) || expired(p.first.header->base) || expired(p.second.owner);
+                return expired(p.first.binding) || expired(p.first.header->base) || p.second.owners.Any([&](auto &a) { return expired(a.root); });
             });
             erase_if(borrowedindices, expired);
             erase_if(targets, [&](const auto &p) {
@@ -491,7 +500,7 @@ struct TypeCheck {
             for (auto it = lengths.begin(); it != lengths.end();) {
                 auto &m = it->second;
                 auto next = other.Measured(it->first);
-                if (next.owner != m.owner) it = lengths.erase(it);
+                if (next.owners != m.owners) it = lengths.erase(it);
                 else { m.valid = m.valid.Both(next.valid); ++it; }
             }
             for (auto it = fresh.begin(); it != fresh.end();) {
@@ -3095,6 +3104,12 @@ struct TypeCheck {
         SlotRemoval removal;
         CountProof condition;
         int64_t added = 0; // Guaranteed fresh slots on successful completion.
+        CountProof Empties() const {
+            return removal == SlotRemoval::NamedZeroResize ? condition : CountProof(removal == SlotRemoval::All);
+        }
+        CountProof Preserves() const {
+            return removal == SlotRemoval::PreservesIfUnchanged ? condition : CountProof(removal == SlotRemoval::None);
+        }
     };
     const LinkField *ArrayHeader(const RefPlace &place, TypeExpr *array);
     const LinkField *ArrayHeader(const Val &value, TypeExpr *array) {
@@ -3102,6 +3117,7 @@ struct TypeCheck {
     }
     bool MeasuresReceiver(Node *expr, Node *receiver, const Val &value, TypeExpr *array, BuiltinKind member,
                           bool consecutive = true);
+    pair<LinkFlow::LengthKey, CountProof> SavedLengthBound(Node *count, const Val &receiver, TypeExpr *array);
     CountProof PreservesMeasuredLength(size_t since, Node *operand, const Val &receiver, TypeExpr *array);
     SlotChange CountedSlots(BuiltinKind op, const vector<Node *> &args, const Val &count,
                             TypeExpr *array, const Val &receiver, CountProof fillpreserves = true);
@@ -3130,8 +3146,8 @@ struct TypeCheck {
     StrLit *ConstStrLit(Node *n);
     const string *EmbedShader(Call *c, vector<Node *> &args);
     const string *EmbedFile(Call *c, vector<Node *> &args);
-    void CheckGrowShrink(Node *at, const char *op, Node *recv, const Val &rv,
-                         SlotRemoval removal, CountProof condition, CountProof savedlength, const LinkField *popheader, int64_t popped);
+    void CheckGrowShrink(Node *at, const BuiltinDef &op, Node *recv, const Val &rv, const SlotChange &slots,
+                         CountProof savedlength, const LinkField *popheader, int64_t popped);
     bool RelyOnCountProof(CountProof proof, Node *at, const char *use);
     bool LiveConversionTargets(const ValueLinks &links, CountProof whole, Node *at);
     void GrowOnlyAssignKnown(Assign *a, const Roots &built, bool whole);

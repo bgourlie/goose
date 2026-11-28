@@ -133,6 +133,25 @@ inline bool TypeCheck::MeasuresReceiver(Node *expr, Node *receiver, const Val &v
                                        (d->measuredarray && d->measuredarray == ArrayHeader(value, array)));
 }
 
+// An immutable binding and an exact grow-only array header identify a
+// saved upper bound. A let's value also depends on no writable borrow.
+inline pair<TypeCheck::LinkFlow::LengthKey, CountProof> TypeCheck::SavedLengthBound(Node *count, const Val &receiver,
+                                                                                   TypeExpr *array) {
+    auto id = Is<Ident>(count);
+    if (!IsArrayKind(array, A_GROW) || !id || !id->vdef || id->vdef->isvar || !IsIntT(id->vdef->type)) return {};
+    LinkFlow::LengthKey key { id->vdef, ArrayHeader(receiver, array) };
+    if (!key.header) return {};
+    auto owners = LinkFlow::MeasuredOwners(receiver);
+    if (owners.None()) return {};
+    if (cur.deferring && key.binding->isglobal) NoteDeferMention(key.binding);
+    auto measured = cur.links.Measured(key);
+    if (measured.owners != owners) return { key, false };
+    auto valid = measured.valid;
+    if (!key.binding->type->cq)
+        valid = valid.Both(CountProof::IfBindingUnchanged(ast.countconditions, key.binding));
+    return { key, valid };
+}
+
 // Count operands and fill expressions may write to other storage. Only a
 // change to the measured header can make its length stale. A limited
 // header can also be replaced by an ordinary assignment.
@@ -705,18 +724,7 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
     if (d.flags & BF_SHRINKS) removal = d.kind == B_CLEAR ? SlotRemoval::All : SlotRemoval::Possible;
     if (d.kind == B_RESIZE) {
         auto length = CheckIntAny(args[1]);
-        LinkFlow::LengthKey key {};
-        LinkFlow::Measurement measured;
-        if (ak == A_GROW && rv.Exact() && rv.Root() && !IsTemp(rv.Root())) {
-            auto id = Is<Ident>(args[1]);
-            if (id && id->vdef && !id->vdef->isvar && IsIntT(id->vdef->type)) {
-                key = { id->vdef, ArrayHeader(rv, recvarr) };
-                if (key.header) {
-                    measured = cur.links.Measured(key);
-                    if (cur.deferring && key.binding->isglobal) NoteDeferMention(key.binding);
-                }
-            }
-        }
+        auto [key, bound] = SavedLengthBound(args[1], rv, recvarr);
         CountProof fillpreserves = true;
         if (args.size() == 3) {
             auto beforefill = cur.growlog.size();
@@ -730,16 +738,12 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
                                    "contains self-relative references, is not supported; push "
                                    "the elements, which constructs each in place"));
         }
-        if (measured.owner && measured.owner == rv.Root()) {
-            savedlength = measured.valid.Both(fillpreserves);
-            if (!key.binding->type->cq)
-                savedlength = savedlength.Both(CountProof::IfBindingUnchanged(ast.countconditions, key.binding));
-        }
+        savedlength = bound.Both(fillpreserves);
         slots = CountedSlots(d.kind, args, length, recvarr, rv, fillpreserves);
         if (countedgrowth && args.size() == 3 && reachable && KnownIndex(args[1], length) != 0 &&
             !(fillpreserves.Unconditional() && MeasuresReceiver(args[1], args[0], rv, recvarr, B_LEN))) grow();
         // A successful resize installs the evaluated count even when a fill ran.
-        if (key.header && reachable) cur.links.lengths[key] = { rv.Root() };
+        if (key.header && reachable) cur.links.lengths[key] = { LinkFlow::MeasuredOwners(rv) };
     }
     // index_of recovers the element index a reference stands for (§3.3).
     // The reference must be an element of this very array, which is what
@@ -854,6 +858,7 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
                 auto count = CheckIntAny(an);
                 if (d.kind == B_POP_N) {
                     popped = KnownIndex(an, count);
+                    savedlength = SavedLengthBound(an, rv, recvarr).second;
                     slots = CountedSlots(d.kind, args, count, recvarr, rv);
                 }
                 break;
@@ -951,8 +956,7 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
     if (removal == SlotRemoval::ToCapacity) RestoreLimitedPrefix(rv, rv.refplace, recvarr);
     // Emptying a limited array unpublishes its whole live prefix, just as
     // assigning [] does. Existing slot views keep their storage (§5.3).
-    if (ak == A_LIMITED && (removal == SlotRemoval::All || removal == SlotRemoval::NamedZeroResize)) {
-        auto empty = removal == SlotRemoval::NamedZeroResize ? countcondition : CountProof(true);
+    if (auto empty = slots.Empties(); ak == A_LIMITED && empty.Available()) {
         if (HasRelRefT(elem)) NoteOverwrite(args[0], rv, storeevents.size(), recvarr, &rv.refplace, nullptr, empty);
         if (HoldsPlainRef(elem)) NoteOverwrite(args[0], rv, storeevents.size(), recvarr, nullptr, nullptr, empty);
     }
@@ -967,7 +971,7 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
     SuffixEffects::Paths before;
     if (header && TracksSuffix(suffixowner, true)) before = cur.links.suffixeffects.PathsFor(*this, header, suffixowner);
     if (ak == A_GROW && shrink) {
-        CheckGrowShrink(c, d.name, args[0], rv, removal, countcondition, savedlength, header, popped);
+        CheckGrowShrink(c, d, args[0], rv, slots, savedlength, header, popped);
         if (popped > 0 && popped < fresh) cur.links.fresh[header] = { suffixowner, fresh - popped };
         if (!before.empty() && popped > 0)
             cur.links.suffixeffects.Shift(header, suffixowner, before, -popped);
@@ -1652,24 +1656,26 @@ inline const string *TypeCheck::EmbedShader(Call *c, vector<Node *> &args) {
 // reference variable or parameter, in which case the array behind the
 // reference is what shrinks, or it is a struct's tail field, which shrinks
 // the storage the struct lies in, as a reference to the field would.
-inline void TypeCheck::CheckGrowShrink(Node *at, const char *op, Node *recv, const Val &rv,
-                                       SlotRemoval removal, CountProof condition, CountProof savedlength,
+inline void TypeCheck::CheckGrowShrink(Node *at, const BuiltinDef &op, Node *recv, const Val &rv,
+                                       const SlotChange &slots, CountProof savedlength,
                                        const LinkField *popheader, int64_t popped) {
     auto at_type = IsPlainRef(rv.type) ? rv.type->ref->sub : rv.type;
     assert(at_type->kind == TY_ARRAY);
     auto roots = rv.AsRoots();
     if (!ShrinkRootsKnown(roots))
-        Error(at, cat(op, " through a reference whose array is not known (§5.1)"));
-    auto namedresize = removal == SlotRemoval::NamedZeroResize;
-    auto empties = removal == SlotRemoval::All || namedresize;
-    auto replacesif = namedresize ? condition : CountProof(true);
-    if (empties && HasRelRefT(at_type))
-        NoteOverwrite(recv, roots, storeevents.size(), at_type, &rv.refplace, nullptr, replacesif);
-    ShrinkEffect effect { SB_UNBALANCED, empties ? at_type : nullptr };
-    effect.preserves = removal == SlotRemoval::PreservesIfUnchanged ? condition : CountProof(removal == SlotRemoval::None);
-    effect.preserves = effect.preserves.Prefer(savedlength);
-    effect.replacesif = replacesif;
-    ShrinkThrough(at, op, ExprStr(recv), roots, at_type, effect, popheader, popped);
+        Error(at, cat(op.name, " through a reference whose array is not known (§5.1)"));
+    auto empties = slots.Empties();
+    auto preserves = slots.Preserves();
+    // A resize to an upper bound cannot remove a slot. A successful pop_n
+    // must have count <= length, so popping an upper bound removes every slot.
+    if (op.kind == B_RESIZE) preserves = preserves.Prefer(savedlength);
+    if (op.kind == B_POP_N) empties = empties.Prefer(savedlength);
+    if (empties.Available() && HasRelRefT(at_type))
+        NoteOverwrite(recv, roots, storeevents.size(), at_type, &rv.refplace, nullptr, empties);
+    ShrinkEffect effect { SB_UNBALANCED, empties.Available() ? at_type : nullptr };
+    effect.preserves = preserves;
+    if (effect.replaced) effect.replacesif = empties;
+    ShrinkThrough(at, op.name, ExprStr(recv), roots, at_type, effect, popheader, popped);
 }
 
 // A whole assignment of a grow-only array, or of a value holding one as its
@@ -5715,9 +5721,12 @@ inline void TypeCheck::InvalidateLengths(VarDef *owner, bool exact, TypeExpr *ar
             ++it;
             continue;
         }
-        auto alias = owner ? MayAliasRoots(m.owner, true, owner, exact) : AL_YES;
-        if (alias == AL_DEFER) m.valid = m.valid.Both(DistinctGrowth(owner, exact, m.owner));
-        if (alias == AL_YES || !m.valid.Available()) {
+        for (auto &a : m.owners.alts) {
+            auto alias = owner ? MayAliasRoots(a.root, true, owner, exact) : AL_YES;
+            if (alias == AL_YES) { m.valid = false; break; }
+            if (alias == AL_DEFER) m.valid = m.valid.Both(DistinctGrowth(owner, exact, a.root));
+        }
+        if (!m.valid.Available()) {
             it = cur.links.lengths.erase(it);
             continue;
         }

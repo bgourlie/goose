@@ -237,6 +237,45 @@ fn empty(nodes: Node[>..]&) {
     keep(nodes);
 }
 
+fn pop_saved_length(nodes: Node[>..]&) {
+    let alias .= nodes;
+    const n = nodes.len;
+    alias.pop_n(n);
+}
+
+fn pop_after_named_resize(limit: i64) {
+    var nodes: Node[>..] = [Node {}, Node {}, Node {}];
+    nodes.resize(limit);
+    nodes[0].next .= nodes[1];
+    nodes.pop_n(limit);
+    assert(nodes.len == 0);
+}
+
+fn pop_selected(first: bool) {
+    var a: Node[>..] = [Node {}, Node {}];
+    var b: Node[>..] = [Node {}, Node {}, Node {}];
+    a[0].next .= a[1];
+    b[0].next .= b[2];
+    let selected: Node[>..]& = if first { a } else { b };
+    const count = selected.len;
+    selected.pop_n(count);
+    if first { assert(a.len == 0 && b[0].next .== b[2]); }
+    else { assert(b.len == 0 && a[0].next .== a[1]); }
+}
+
+fn empty_with_saved_count() {
+    var nodes: Node[>..] = [Node {}, Node {}];
+    nodes[0].next .= nodes[1];
+    pop_saved_length(nodes);
+    assert(nodes.len == 0);
+    nodes.push(Node {});
+    nodes.push(Node {});
+    nodes[0].next .= nodes[1];
+    let n = nodes.len;
+    { defer nodes.pop_n(n); }
+    assert(nodes.len == 0);
+}
+
 fn empty_with_known_count() {
     const local: i64 = TYPED_ZERO;
     var nodes: Node[>..] = [Node {}, Node {}];
@@ -272,6 +311,10 @@ export fn pop_shared() { shared.pop_n(zero_count); }
 
 fn main() {
     empty_with_known_count();
+    empty_with_saved_count();
+    pop_selected(true);
+    pop_selected(false);
+    pop_after_named_resize(2);
     var points = Points { values: [Point { coords: [4, 2] }] };
     points.cursor .= points.values[0];
     points.values.resize(points.values.len, Point { coords: [7, 8] });
