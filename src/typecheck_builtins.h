@@ -4439,14 +4439,24 @@ inline bool TypeCheck::SameIndexValue(Node *a, Node *b) {
 // an earlier element. Only inline fields stay within the indexed element.
 inline bool TypeCheck::BackwardElementRebind(Node *slot, Node *value) {
     auto u = Is<Unary>(value);
-    // Follow inline fields to the bound element that contains the link.
-    auto field = slot;
-    while (auto d = Is<Dot>(field)) {
-        if (d->fieldidx < 0) break;
-        field = d->obj;
-        if (!field->exprtype || IsRefOrSlice(field->exprtype)) break;
+    // A binding or push result can name the element by reference. Loading a
+    // reference out of one of its fields or slots leaves that element.
+    auto element = [](Node *n) -> Node * {
+        while (auto d = Is<Dot>(n)) {
+            if (d->fieldidx < 0 || !d->obj->exprtype) return nullptr;
+            n = d->obj;
+            if (IsRefOrSlice(n->exprtype))
+                return Is<Ident>(n) || Is<Call>(n) ? n : nullptr;
+        }
+        return n;
+    };
+    auto field = element(slot);
+    Node *targetbase = Is<Ident>(value);
+    if (u && u->op == T_BITAND) {
+        auto path = AddressedPath(u);
+        targetbase = path == u ? Is<Ident>(u->child) : element(path);
     }
-    auto source = Is<Ident>(field), targetref = Is<Ident>(u && u->op == T_BITAND ? u->child : value);
+    auto source = Is<Ident>(field), targetref = Is<Ident>(targetbase);
     auto binding = targetref ? targetref->vdef : nullptr;
     if (binding && source && source->vdef == binding && !binding->isvar && IsAddressRef(binding->type))
         return true;
@@ -4462,15 +4472,7 @@ inline bool TypeCheck::BackwardElementRebind(Node *slot, Node *value) {
             prior->elementdecl < origin->elementdecl) return true;
     }
     if (!u || u->op != T_BITAND) return false;
-    auto target = AddressedPath(u);
-    auto element = [](Node *n) -> Index * {
-        while (auto d = Is<Dot>(n)) {
-            if (d->fieldidx < 0 || !d->obj->exprtype || IsRefOrSlice(d->obj->exprtype)) return nullptr;
-            n = d->obj;
-        }
-        return Is<Index>(n);
-    };
-    auto a = element(slot), b = element(target);
+    auto a = Is<Index>(field), b = Is<Index>(targetbase);
     if (!b) return false;
     if (a && SamePath(a, b, PathInterval::ConsecutiveReads)) return true;
     auto array = a ? a->arrayheader : origin ? origin->elementarray : appended;
