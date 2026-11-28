@@ -2390,6 +2390,7 @@ struct VarDef {
     VarDef *subscript = nullptr; // Synthetic element binding for relative overwrite paths.
     VarDef *elementorigin = nullptr; // The original binding, including through let aliases.
     const LinkField *elementarray = nullptr;
+    int64_t elementindex = -1; // Known subscript captured by the original element binding.
     int elementdecl = -1; // Its position among active locals.
     bool appended = false; // The initializer appended this element.
     RefPlace refplace;       // Pointee or viewed elements known on this control-flow path.

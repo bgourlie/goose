@@ -4557,28 +4557,31 @@ inline bool TypeCheck::BackwardElementOrder(const ElementPosition &slot, const E
     auto origin = source && source->vdef ? source->vdef->elementorigin : nullptr;
     if (origin && !InScope(origin, origin->elementdecl)) origin = nullptr;
     auto prior = binding ? binding->elementorigin : nullptr;
-    if (prior && InScope(prior, prior->elementdecl)) {
+    if (prior && !InScope(prior, prior->elementdecl)) prior = nullptr;
+    if (prior) {
         if (appended && appended == prior->elementarray) return true;
         if (origin == prior) return true;
         if (origin && origin->appended && prior->elementarray == origin->elementarray &&
             prior->elementdecl < origin->elementdecl) return true;
     }
     auto a = Is<Index>(slot.base), b = Is<Index>(target.base);
-    if (!b) return false;
+    if (!b && !prior) return false;
     consecutive &= slot.consecutive;
-    if (a && consecutive && !written && SamePath(a, b, PathInterval::ConsecutiveReads)) return true;
+    if (a && b && consecutive && !written && SamePath(a, b, PathInterval::ConsecutiveReads)) return true;
     auto array = a ? a->arrayheader : origin ? origin->elementarray : appended;
-    if (!array || array != b->arrayheader) {
+    if (!array || array != (b ? b->arrayheader : prior->elementarray)) {
         // A slice has no absolute array header. Reads of the same slice
         // variable still share its start; writing its elements leaves the
         // variable's own header alone.
-        auto left = a ? Is<Ident>(a->obj) : nullptr, right = Is<Ident>(b->obj);
+        auto left = a ? Is<Ident>(a->obj) : nullptr, right = b ? Is<Ident>(b->obj) : nullptr;
         if (!consecutive || !left || !right || !left->vdef || left->vdef != right->vdef ||
             left->vdef->type->kind != TY_SLICE || !EvalMeets(a->idx, EvalRequirement::ReadOnly)) return false;
     }
-    if (b->constantindex == 0) return true; // Every valid source index is at least zero.
-    if (!a) return false;
-    if (a->constantindex >= 0 && b->constantindex >= 0) return b->constantindex <= a->constantindex;
+    auto targetindex = b ? b->constantindex : prior->elementindex;
+    if (targetindex == 0) return true; // Every valid source index is at least zero.
+    auto slotindex = a ? a->constantindex : origin ? origin->elementindex : -1;
+    if (slotindex >= 0 && targetindex >= 0) return targetindex <= slotindex;
+    if (!a || !b) return false;
     // The right-hand base runs between the two subscript evaluations. It
     // can return the same array while changing a variable the index reads.
     // Even read-only field expressions can be separated by writes to the

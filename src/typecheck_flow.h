@@ -3179,6 +3179,7 @@ inline void TypeCheck::CheckVarDecl(VarDecl *vd, bool global) {
                 } else if (auto ix = Is<Index>(AddressedPath(init)); ix && ix->arrayheader &&
                            ix->exprtype && !IsRefOrSlice(ix->exprtype)) {
                     d->elementarray = ix->arrayheader;
+                    d->elementindex = ix->constantindex;
                 } else if (binding && binding->vdef) {
                     d->elementorigin = binding->vdef->elementorigin;
                 }

@@ -173,6 +173,21 @@ fn backward_link() {
     assert(nodes.len == 1);
 }
 
+fn bound_indices() {
+    var nodes: Node[>..] = [Node {}; 5];
+    {
+        let first .= nodes[0];
+        let middle .= nodes[1];
+        let alias .= middle;
+        nodes[3].next .= alias;
+        middle.next .= first;
+        let third .= nodes[2];
+        third.next .= nodes[1];
+    }
+    nodes.pop();
+    assert(nodes[3].next .== nodes[1] && nodes[2].next .== nodes[1] && nodes[1].next .== nodes[0]);
+}
+
 struct InitNode { tag: i64 = 0, next: InitNode&<u32>? }
 struct FirstLink { selected: i64&<u32>?, value: i64 = 7 }
 
@@ -548,6 +563,7 @@ fn deferred_clear(i: i64) {
 }
 
 fn main() {
+    bound_indices();
     assign_whole_elements(1);
     pop_resized_slots();
     deferred_clear(0);
