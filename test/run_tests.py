@@ -600,7 +600,7 @@ class Runner:
             return None
         if not self.check_stderr(name, label, err, required=aborts):
             return None
-        return joined(out)
+        return out
 
     def check_stderr(self, name, label, err, required=False):
         stderr_file = HERE / "expected" / f"{name}.stderr"
@@ -621,30 +621,29 @@ class Runner:
             self.fail(f"missing expected-output {label}")
             return False
         want = joined(tc.decode(expfile.read_bytes()))
-        if known is not None:
-            if out == want:
+        if joined(out) == want:
+            if known is not None:
                 self.fail(f"XPASS {label}: remove the xfail marker")
                 return False
-            if out == known:
-                self.ok(f"XFAIL {label}")
-                return True
-        if out != want:
-            self.fail(f"expected-output {label}", f"--- got:\n{out}\n--- want:\n{want}")
-            return False
-        return True
+            return True
+        if known is not None and out.removesuffix("\n") == known:
+            self.ok(f"XFAIL {label}")
+            return True
+        self.fail(f"expected-output {label}", f"--- got:\n{out}\n--- want:\n{want}")
+        return False
 
     def check_outputs(self, f, label, runs):
+        """Report one outcome for this backend after checking its optimization levels."""
         marker = self.xfail_outputs.get(f)
         if marker is not None:
             for level, out in runs.items():
-                if not self.check_stdout(f.stem, f"{label} -O{level} {f.name}", out,
-                                         known=marker if level == "2" else None):
-                    return False
-            return True
-        if len(set(runs.values())) != 1:
+                if level != "2" and not self.check_stdout(f.stem, f"{label} -O{level} {f.name}", out):
+                    return
+            self.check_stdout(f.stem, f"{label} -O2 {f.name}", runs["2"], known=marker)
+        elif len({joined(out) for out in runs.values()}) != 1:
             self.fail(f"{label}-output-differs-by-O {f.name}")
-            return False
-        return self.check_stdout(f.stem, f"{label} {f.name}", runs["2"])
+        elif self.check_stdout(f.stem, f"{label} {f.name}", runs["2"]):
+            self.ok(f"{'cgen+run' if label == 'cgen' else label} {f.name}")
 
     def known_compile_failure(self, f, stage, detail):
         """Check the failing compiler phase without scheduling dependent builds or runs."""
@@ -955,8 +954,8 @@ class Runner:
                         bad = True
                         continue
                     runs[ol] = out
-                if not bad and self.check_outputs(f, "cgen", runs):
-                    self.ok(f"cgen+run {f.name}")
+                if not bad:
+                    self.check_outputs(f, "cgen", runs)
 
         if not self.jit:
             return
@@ -988,8 +987,7 @@ class Runner:
                 runs[ol] = out
             if bad:
                 return
-            if self.check_outputs(f, "jit", runs):
-                self.ok(f"jit {f.name}")
+            self.check_outputs(f, "jit", runs)
 
     def dump_program(self, f, res, argv):
         """A stable dump can still change grouping and therefore semantics:
@@ -1740,7 +1738,7 @@ def main():
         code, out, err = r.goose("--tokens", HERE / "syntax" / "lexer_tokens.goose")
         if code != 0:
             r.fail("lex lexer_tokens.goose", out + err)
-        elif r.check_stdout("lexer_tokens", "lexer_tokens.goose", joined(out)):
+        elif r.check_stdout("lexer_tokens", "lexer_tokens.goose", out):
             r.ok("lex lexer_tokens.goose")
     r.show_task(lexer_tokens)
 
@@ -2395,7 +2393,7 @@ def main():
                     out = r.check_run(name, label, *tc.run_capture([out_exe, "modes"]))
                     if out is None:
                         continue
-                    lines = out.splitlines()
+                    lines = joined(out).splitlines()
                     got = lines[-1].split() if lines else []
                     plain = {"fused" if arm else "separate"}
                     simd = ({"fused"} if arm else {"separate"} if level == "0" else
