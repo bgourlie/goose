@@ -341,17 +341,8 @@ struct TypeCheck {
                 fresh[header] = { value.owner, std::max(FreshCount(header, value.owner), value.count) };
             suffixeffects.Combine(tc, body.suffixeffects, SuffixEffects::Sequence);
         }
-        struct LengthKey {
-            VarDef *binding;
-            const LinkField *header;
-            auto operator<=>(const LengthKey &) const = default;
-            auto operator<=>(VarDef *v) const { return std::compare_three_way {}(binding, v); }
-        };
-        struct Measurement {
-            Roots owners; // Exact storage alternatives for the one header selected at the read.
-            CountProof valid = true; // Possible writers that must name a different array.
-            bool operator==(const Measurement &) const = default;
-        };
+        using LengthKey = ArrayLengthKey;
+        using Measurement = ArrayLengthBound;
         static Roots MeasuredOwners(const Roots &value) {
             Roots owners;
             if (value.unknown) return owners;
@@ -653,7 +644,7 @@ struct TypeCheck {
     struct DeferEnv;
     struct DeferEffects {
         Defer *statement = nullptr;
-        set<tuple<VarDef *, bool, TypeExpr *>> growths; // Headers that can grow when this defer runs.
+        set<tuple<VarDef *, bool, TypeExpr *, const LinkField *>> growths; // Headers that can grow when this defer runs.
         vector<FnRecord::StorageRead> reads;
         vector<FnRecord::StorageWrite> writes;
         vector<pair<VarDef *, RefPlace>> bindings; // Captures rebound on normal completion.
@@ -2002,6 +1993,7 @@ struct TypeCheck {
     static EnvRead EnvReadOf(VarDef *vd);
     static bool SameEnvFacts(const VarDef *vd, const EnvRead &r);
     void NoteEnvRead(VarDef *vd);
+    void NoteLengthRead(LinkFlow::LengthKey key);
     void NoteCalleeEnvReads(FnSpec *callee);
     bool EnvUnchanged(const FnSpec *spec);
     void ShareCycleEnvReads(FnSpec *head);
@@ -3146,8 +3138,8 @@ struct TypeCheck {
     StrLit *ConstStrLit(Node *n);
     const string *EmbedShader(Call *c, vector<Node *> &args);
     const string *EmbedFile(Call *c, vector<Node *> &args);
-    void CheckGrowShrink(Node *at, const BuiltinDef &op, Node *recv, const Val &rv, const SlotChange &slots,
-                         CountProof savedlength, const LinkField *popheader, int64_t popped);
+    void CheckGrowShrink(Node *at, const BuiltinDef &op, Node *recv, const Val &rv, CountProof preserves,
+                         CountProof empties, const LinkField *popheader, int64_t popped);
     bool RelyOnCountProof(CountProof proof, Node *at, const char *use);
     bool LiveConversionTargets(const ValueLinks &links, CountProof whole, Node *at);
     void GrowOnlyAssignKnown(Assign *a, const Roots &built, bool whole);
@@ -3518,6 +3510,7 @@ struct TypeCheck {
     // checked against the growths and shrinks logged meanwhile
     // (CheckGrowsSince), and callers learn a body's growths as they learn
     // its shrinks.
+    using GrowthEffect = FnRecord::GrowthEffect;
     struct GrowEvent {
         Node *at = nullptr;
         VarDef *root = nullptr;
@@ -3527,7 +3520,8 @@ struct TypeCheck {
         // The type of the resizable array grown or shrunk (SoleResizableIn),
         // null where the checker cannot tell.
         TypeExpr *arr = nullptr;
-        bool stackonly = false;
+        GrowthEffect effect = GrowthEffect::Length;
+        const LinkField *field = nullptr;
     };
 
     // A whole resizable assignment remains open while its RHS is checked.
@@ -3660,13 +3654,16 @@ struct TypeCheck {
         }
     };
     // Each takes the type of the storage grown, shrunk or built in.
-    void RecordGrowth(Node *at, const Roots &roots, const string &what, TypeExpr *array, bool stackonly = false);
-    void InvalidateLengths(VarDef *owner, bool exact, TypeExpr *array, const LinkFlow *exit = nullptr);
+    const LinkField *GrowthField(const RefPlace &place);
+    void NoteLimitedReplacement(Node *at, const Roots &storage, TypeExpr *type, const RefPlace &place);
+    void RecordGrowth(Node *at, const Roots &roots, const string &what, TypeExpr *array,
+                      GrowthEffect effect = GrowthEffect::Length, const LinkField *field = nullptr);
+    void InvalidateLengths(VarDef *owner, bool exact, TypeExpr *array, const LinkField *field, const LinkFlow *exit = nullptr);
     CountProof DistinctGrowth(VarDef *writer, bool exact, VarDef *measured);
     void NoteGrow(Node *at, const Roots &roots, const string &what, TypeExpr *t);
     void NoteShrinkEvent(Node *at, VarDef *root, TypeExpr *bound, const string &what,
                          TypeExpr *t);
-    template<typename F> void AliasingGrowsSince(size_t base, const Roots &roots, TypeExpr *array, F visit);
+    template<typename F> void AliasingGrowsSince(size_t base, const Roots &roots, TypeExpr *array, F visit, bool construction = false);
     void CheckGrowsSince(size_t base, const Roots &built, const string &what, TypeExpr *t);
     // The type of the one resizable array a value of type t holds (§1.3,
     // §3.4), where every value of t holds one of the same type: null where

@@ -2573,8 +2573,8 @@ inline void TypeCheck::RunExitDefers(int first, ScopeExit exit, span<const FnRec
     for (auto i = (int)scopes.size(); i-- > first;) {
         for (auto it = scopes[i].defers.rbegin(); it != scopes[i].defers.rend(); ++it) {
             RefreshDeferredBody(*it);
-            for (auto [owner, exact, array] : it->growths)
-                InvalidateLengths(owner, exact, array, &it->exit.writes);
+            for (auto [owner, exact, array, field] : it->growths)
+                InvalidateLengths(owner, exact, array, field, &it->exit.writes);
             // A nonlocal return can unwind a frame using the same result stack.
             // On a local exit only channels reached by a return operand are in use.
             auto channels = exit == ScopeExit::Local ? cur.delivering : SIZE_MAX;
@@ -3370,7 +3370,7 @@ inline void TypeCheck::CheckVarDecl(VarDecl *vd, bool global) {
             d->markof = len->obj;
             auto array = len->obj->exprtype;
             if (IsPlainRef(array)) array = array->ref->sub;
-            if (len->measuredarray && IsArrayKind(array, A_GROW)) {
+            if (len->measuredarray && (IsArrayKind(array, A_GROW) || IsArrayKind(array, A_LIMITED))) {
                 auto value = nodevals.find(len->obj);
                 if (value) {
                     auto owners = LinkFlow::MeasuredOwners(*value);
@@ -3450,21 +3450,7 @@ inline Val TypeCheck::CheckAssignedValue(Assign *a, TypeExpr *target, TypeExpr *
     // result starts writing early only if it needs its destination's address.
     // A runtime-capacity limited array copies the completed source (§4.4).
     Construction construction { true };
-    if (reachable && !cur.probingtypes && IsAggregate(target)) {
-        // An aggregate type can recur in many variant fields. Each limited
-        // header type contributes the same effect at this assignment.
-        set<TypeExpr *> visited;
-        auto headers = [&](auto &&walk, TypeExpr *t) -> void {
-            if (!IsAggregate(t) || !visited.insert(t).second) return;
-            if (t->kind == TY_ARRAY) {
-                if (IsArrayKind(t, A_LIMITED)) RecordGrowth(a, built, "replace limited array", t);
-                walk(walk, t->arr->sub);
-            } else {
-                EachField(t, [&](TypeExpr *field) { walk(walk, field); });
-            }
-        };
-        headers(headers, target);
-    }
+    NoteLimitedReplacement(a, built, target, built.place);
     if (IsArrayKind(target, A_LIMITED) && FixedPlacedResult(target))
         NoteStorageWrite(built, target, built.place, reachable, StorageWrite::PrefixOnly);
     if (hasdefers && IsAggregate(target)) {
@@ -3517,6 +3503,7 @@ inline Val TypeCheck::CheckAssignedValue(Assign *a, TypeExpr *target, TypeExpr *
     // Limited assignment keeps the destination's capacity. A complete
     // replacement covering every slot establishes the live-prefix proof
     // even if an earlier shrink lost it. An exit during the RHS cannot.
+    NoteLimitedReplacement(a, built, target, built.place);
     bool full = false;
     if (reachable && IsArrayKind(target, A_LIMITED) && v.extent.length >= 0) {
         auto owner = built.Exact() ? built.Root() : nullptr;

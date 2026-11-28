@@ -133,17 +133,18 @@ inline bool TypeCheck::MeasuresReceiver(Node *expr, Node *receiver, const Val &v
                                        (d->measuredarray && d->measuredarray == ArrayHeader(value, array)));
 }
 
-// An immutable binding and an exact grow-only array header identify a
+// An immutable binding and an exact array header identify a
 // saved upper bound. A let's value also depends on no writable borrow.
 inline pair<TypeCheck::LinkFlow::LengthKey, CountProof> TypeCheck::SavedLengthBound(Node *count, const Val &receiver,
                                                                                    TypeExpr *array) {
     auto id = Is<Ident>(count);
-    if (!IsArrayKind(array, A_GROW) || !id || !id->vdef || id->vdef->isvar || !IsIntT(id->vdef->type)) return {};
+    if ((!IsArrayKind(array, A_GROW) && !IsArrayKind(array, A_LIMITED)) || !id || !id->vdef || id->vdef->isvar || !IsIntT(id->vdef->type)) return {};
     LinkFlow::LengthKey key { id->vdef, ArrayHeader(receiver, array) };
     if (!key.header) return {};
     auto owners = LinkFlow::MeasuredOwners(receiver);
     if (owners.None()) return {};
     if (cur.deferring && key.binding->isglobal) NoteDeferMention(key.binding);
+    NoteLengthRead(key);
     auto measured = cur.links.Measured(key);
     if (measured.owners != owners) return { key, false };
     auto valid = measured.valid;
@@ -162,7 +163,9 @@ inline CountProof TypeCheck::PreservesMeasuredLength(size_t since, Node *operand
     if (limited && !EvalMeets(operand, EvalRequirement::LoggedGrowth)) return false;
     CountProof preserves = true;
     AliasingGrowsSince(since, receiver, array, [&](const GrowEvent &e, const RootAlt &target, Alias alias) {
-        if (e.stackonly) return;
+        if (e.effect == GrowthEffect::StorageOnly) return;
+        auto header = ArrayHeader(receiver, array);
+        if (header && e.field && e.field->ApartFrom(header->base, header->path)) return;
         if (!limited && !SuffixOwnersOverlap(e.root, e.exact, target.root, target.exact)) return;
         if (alias == AL_YES) preserves = false;
         else preserves = preserves.Both(DistinctGrowth(e.root, e.exact && target.exact, target.root));
@@ -640,6 +643,7 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
             Error(c, cat(".move_from takes a slice of ", TypeStr(elem), ", got ", TypeStr(sv.type)));
         if (HasRelRefT(elem))
             Error(c, ".move_from cannot copy elements containing self-relative references");
+        NoteLimitedReplacement(c, rv, elem, rv.ElementPlace(ast.places));
         NoteStorageWrite(rv, elem, rv.ElementPlace(ast.places));
         AppendedCopies(args[1], sv, elem, rv);
         return VoidVal();
@@ -662,10 +666,15 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
     // For counted operations the operands determine whether the receiver
     // can grow. Growth within an operand is logged by the operand itself.
     auto grow = [&](bool stackonly = false) {
-        RecordGrowth(c, rv, cat(d.grows, " ", ExprStr(args[0])), SoleResizableIn(recvarr), stackonly);
+        RecordGrowth(c, rv, cat(d.grows, " ", ExprStr(args[0])), ak == A_LIMITED ? recvarr : SoleResizableIn(recvarr),
+                     stackonly ? GrowthEffect::StorageOnly : GrowthEffect::Length, GrowthField(rv.refplace));
     };
-    bool countedgrowth = ak == A_GROW && (d.kind == B_APPEND || d.kind == B_RESIZE);
-    if (*d.grows && !(d.flags & BF_OUTARG) && !countedgrowth) grow();
+    bool countedgrowth = (ak == A_GROW || ak == A_LIMITED) && (d.kind == B_APPEND || d.kind == B_RESIZE);
+    auto push = d.kind == B_PUSH;
+    if (*d.grows && !(d.flags & BF_OUTARG)) {
+        if (ak == A_LIMITED || push) grow(true); // Keep construction conflicts visible during operand evaluation.
+        else if (!countedgrowth) grow();
+    }
     // The serialization pair (docs/design/serialization.md §4). to_bytes
     // builds the image -- a varint byte count then the element region --
     // either as a fresh u8[>..] or appended to a builder the caller owns, so
@@ -943,22 +952,31 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
     }
     // An appended result can occupy the receiving stack while under
     // construction even when its final live element count is zero.
+    if (push && reachable) grow();
     if (countedgrowth && d.kind == B_APPEND) grow(!reachable || added == 0);
+    if (reachable && (d.kind == B_PUSH || (d.kind == B_APPEND && added != 0) ||
+                      (d.kind == B_RESIZE && args.size() == 3)))
+        NoteLimitedReplacement(c, rv, elem, rv.ElementPlace(ast.places));
+    auto preserves = slots.Preserves();
+    auto empties = slots.Empties();
+    // Resizing to an upper bound preserves all slots. Popping an upper bound
+    // can succeed only at equality, in which case it removes the entire prefix.
+    if (d.kind == B_RESIZE) preserves = preserves.Prefer(savedlength);
+    if (d.kind == B_POP_N) empties = empties.Prefer(savedlength);
     // Record a write even if its count preserves every limited-array slot.
     if (d.flags & BF_WRITE) {
-        auto preserves = removal == SlotRemoval::None || removal == SlotRemoval::ToCapacity;
-        auto write = preserves ? StorageWrite::Storage : StorageWrite::MayDropSlots;
+        auto write = preserves.Unconditional() || removal == SlotRemoval::ToCapacity ? StorageWrite::Storage : StorageWrite::MayDropSlots;
         NoteStorageWrite(rv, recvarr, rv.refplace, reachable || writesduringargs, write,
-                         removal == SlotRemoval::PreservesIfUnchanged && ak == A_LIMITED ? countcondition : CountProof());
+                         ak == A_LIMITED ? preserves : CountProof());
     }
     // On successful completion every slot of this particular limited array
     // is live, even if an earlier shrink discarded its original prefix proof.
     if (removal == SlotRemoval::ToCapacity) RestoreLimitedPrefix(rv, rv.refplace, recvarr);
     // Emptying a limited array unpublishes its whole live prefix, just as
     // assigning [] does. Existing slot views keep their storage (§5.3).
-    if (auto empty = slots.Empties(); ak == A_LIMITED && empty.Available()) {
-        if (HasRelRefT(elem)) NoteOverwrite(args[0], rv, storeevents.size(), recvarr, &rv.refplace, nullptr, empty);
-        if (HoldsPlainRef(elem)) NoteOverwrite(args[0], rv, storeevents.size(), recvarr, nullptr, nullptr, empty);
+    if (ak == A_LIMITED && empties.Available()) {
+        if (HasRelRefT(elem)) NoteOverwrite(args[0], rv, storeevents.size(), recvarr, &rv.refplace, nullptr, empties);
+        if (HoldsPlainRef(elem)) NoteOverwrite(args[0], rv, storeevents.size(), recvarr, nullptr, nullptr, empties);
     }
     // A grow-only array shrinks only where nothing can still be rooted in
     // it (§5.1); pop, pop_n and resize also need an element the shrink can
@@ -971,7 +989,7 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
     SuffixEffects::Paths before;
     if (header && TracksSuffix(suffixowner, true)) before = cur.links.suffixeffects.PathsFor(*this, header, suffixowner);
     if (ak == A_GROW && shrink) {
-        CheckGrowShrink(c, d, args[0], rv, slots, savedlength, header, popped);
+        CheckGrowShrink(c, d, args[0], rv, preserves, empties, header, popped);
         if (popped > 0 && popped < fresh) cur.links.fresh[header] = { suffixowner, fresh - popped };
         if (!before.empty() && popped > 0)
             cur.links.suffixeffects.Shift(header, suffixowner, before, -popped);
@@ -1154,7 +1172,8 @@ inline void TypeCheck::CheckByteOut(Call *c, Node *out, const string &form) {
     if (!ov.writable)
         Error(c, "cannot append through a non-writable value (let, or "
                  "non-writable provenance, §9.5)");
-    NoteGrow(c, ov, cat(BuiltinByKind(c->builtin).grows, " ", ExprStr(out)), ot);
+    RecordGrowth(c, ov, cat(BuiltinByKind(c->builtin).grows, " ", ExprStr(out)), ot,
+                 GrowthEffect::Length, GrowthField(ov.refplace));
     NoteStorageWrite(ov, ot, ov.refplace);
 }
 
@@ -1263,7 +1282,10 @@ inline void TypeCheck::CheckPrintable(Call *c, const char *what, vector<Node *> 
     auto context = ast.New<Call>(c->line, c->callee);
     CheckRenderable(context, what, av.type, a, seen, av, builder);
     // A limited receiver copies this argument's completed text from the temporary.
-    if (receiver && !seen.direct) NoteStorageWrite(*out, receiver, out->refplace);
+    if (receiver && !seen.direct && reachable) {
+        RecordGrowth(c, *out, "format into limited array", receiver, GrowthEffect::Length, GrowthField(out->refplace));
+        NoteStorageWrite(*out, receiver, out->refplace);
+    }
     // A type that reaches itself through references is rendered below its
     // first level by a function of its own, which runs no format overload
     // (RenderFn): an overload for a part of it needs one for the type.
@@ -1657,19 +1679,13 @@ inline const string *TypeCheck::EmbedShader(Call *c, vector<Node *> &args) {
 // reference is what shrinks, or it is a struct's tail field, which shrinks
 // the storage the struct lies in, as a reference to the field would.
 inline void TypeCheck::CheckGrowShrink(Node *at, const BuiltinDef &op, Node *recv, const Val &rv,
-                                       const SlotChange &slots, CountProof savedlength,
+                                       CountProof preserves, CountProof empties,
                                        const LinkField *popheader, int64_t popped) {
     auto at_type = IsPlainRef(rv.type) ? rv.type->ref->sub : rv.type;
     assert(at_type->kind == TY_ARRAY);
     auto roots = rv.AsRoots();
     if (!ShrinkRootsKnown(roots))
         Error(at, cat(op.name, " through a reference whose array is not known (§5.1)"));
-    auto empties = slots.Empties();
-    auto preserves = slots.Preserves();
-    // A resize to an upper bound cannot remove a slot. A successful pop_n
-    // must have count <= length, so popping an upper bound removes every slot.
-    if (op.kind == B_RESIZE) preserves = preserves.Prefer(savedlength);
-    if (op.kind == B_POP_N) empties = empties.Prefer(savedlength);
     if (empties.Available() && HasRelRefT(at_type))
         NoteOverwrite(recv, roots, storeevents.size(), at_type, &rv.refplace, nullptr, empties);
     ShrinkEffect effect { SB_UNBALANCED, empties.Available() ? at_type : nullptr };
@@ -5693,7 +5709,34 @@ inline TypeExpr *TypeCheck::SoleResizableIn(TypeExpr *t) {
 }
 
 inline void TypeCheck::NoteGrow(Node *at, const Roots &roots, const string &what, TypeExpr *t) {
-    RecordGrowth(at, roots, what, SoleResizableIn(t));
+    RecordGrowth(at, roots, what, IsArrayKind(t, A_LIMITED) ? t : SoleResizableIn(t));
+}
+
+// A containing path suffices to rule out writes to a disjoint sibling.
+inline const LinkField *TypeCheck::GrowthField(const RefPlace &place) {
+    auto p = place.fields.Cover();
+    if ((!p.base || p.enclosing) && place.bound && !place.boundenclosing) p = ast.places.PathOf(*place.bound);
+    if (!p.base || (p.base->type && IsRefOrSlice(p.base->type) && p.base->isvar)) return nullptr;
+    return ast.places.Bound(p.base, string(p.Path()));
+}
+
+// Replacing an aggregate can replace any limited header stored inline, even
+// when the containing value is fixed-size. Calls and defers replay these
+// events through the same growth log as an array member operation.
+inline void TypeCheck::NoteLimitedReplacement(Node *at, const Roots &storage, TypeExpr *type, const RefPlace &place) {
+    if (!reachable || cur.probingtypes || !IsAggregate(type)) return;
+    set<TypeExpr *> visited;
+    auto headers = [&](auto &&walk, TypeExpr *t) -> void {
+        if (!IsAggregate(t) || !visited.insert(t).second) return;
+        if (t->kind == TY_ARRAY) {
+            if (IsArrayKind(t, A_LIMITED)) RecordGrowth(at, storage, "replace limited array", t,
+                                                       GrowthEffect::HeaderReplacement, GrowthField(place));
+            walk(walk, t->arr->sub);
+        } else {
+            EachField(t, [&](TypeExpr *field) { walk(walk, field); });
+        }
+    };
+    headers(headers, type);
 }
 
 // Distinct parameter classes identify different arrays only for exact
@@ -5712,11 +5755,12 @@ inline CountProof TypeCheck::DistinctGrowth(VarDef *writer, bool exact, VarDef *
     return false;
 }
 
-inline void TypeCheck::InvalidateLengths(VarDef *owner, bool exact, TypeExpr *array, const LinkFlow *exit) {
-    if (cur.deferring) cur.deferring->growths.emplace(owner, exact, array);
+inline void TypeCheck::InvalidateLengths(VarDef *owner, bool exact, TypeExpr *array, const LinkField *field, const LinkFlow *exit) {
+    if (cur.deferring) cur.deferring->growths.emplace(owner, exact, array, field);
     for (auto it = cur.links.lengths.begin(); it != cur.links.lengths.end();) {
         auto &m = it->second;
         if ((exit && exit->Measured(it->first) == m) ||
+            (field && field->ApartFrom(it->first.header->base, it->first.header->path)) ||
             (array && !TopConstEq(FieldPathType(it->first.header->base, it->first.header->path), array))) {
             ++it;
             continue;
@@ -5734,22 +5778,27 @@ inline void TypeCheck::InvalidateLengths(VarDef *owner, bool exact, TypeExpr *ar
     }
 }
 
-inline void TypeCheck::RecordGrowth(Node *at, const Roots &roots, const string &what, TypeExpr *arr, bool stackonly) {
+inline void TypeCheck::RecordGrowth(Node *at, const Roots &roots, const string &what, TypeExpr *arr,
+                                    GrowthEffect effect, const LinkField *field) {
     if (cur.probingtypes) return;
-    bool changeslength = !stackonly && (!arr || IsArrayKind(arr, A_GROW));
-    if (changeslength && roots.unknown) InvalidateLengths(nullptr, false, arr);
+    bool changeslength = effect != GrowthEffect::StorageOnly && (!arr || IsArrayKind(arr, A_GROW) || IsArrayKind(arr, A_LIMITED));
+    if (changeslength && roots.unknown) InvalidateLengths(nullptr, false, arr, field);
     for (auto &a : roots.alts) {
         auto root = a.root;
-        if (changeslength && (root || !a.exact)) InvalidateLengths(root, a.exact, arr);
+        if (changeslength && (root || !a.exact)) InvalidateLengths(root, a.exact, arr, field);
         if (!root || IsTemp(root)) continue;
-        cur.growlog.push_back({ at, root, a.exact, what, false, arr, stackonly });
+        cur.growlog.push_back({ at, root, a.exact, what, false, arr, effect, field });
         auto note = [&](vector<FnRecord::Growth> &growths) {
+            auto sp = CurRealFrame().spec;
+            auto path = sp && (sp->incycle || sp->sf->isrec) ? nullptr : field;
+            if (path && path->base->ownerspec == sp && !path->base->isparam && !path->base->componentowner)
+                path = nullptr;
             for (auto &g : growths)
-                if (g.stackonly == stackonly && !g.array == !arr && (!arr || TypeEq(g.array, arr))) {
+                if (g.field == path && g.effect == effect && !g.array == !arr && (!arr || TypeEq(g.array, arr))) {
                     g.exact &= a.exact;
                     return;
                 }
-            growths.push_back({ arr, a.exact, stackonly });
+            growths.push_back({ arr, a.exact, effect, path });
         };
         NoteRootEvent(root, [&](FnSpec *s, int i) { note(s->record.growparams[i]); },
                       [&](FnSpec *s, VarDef *r) { note(s->record.growexternals[r]); });
@@ -5766,13 +5815,14 @@ inline void TypeCheck::NoteShrinkEvent(Node *at, VarDef *root, TypeExpr *bound,
 }
 
 template<typename F> inline void TypeCheck::AliasingGrowsSince(size_t base, const Roots &roots,
-                                                              TypeExpr *array, F visit) {
+                                                              TypeExpr *array, F visit, bool construction) {
     for (auto i = base; i < cur.growlog.size(); i++) {
         const auto &e = cur.growlog[i];
         // Replacing a limited header changes length without allocating or
         // releasing stack storage. Only a measured limited length observes it.
-        if (e.arr && IsArrayKind(e.arr, A_LIMITED) && (!array || !IsArrayKind(array, A_LIMITED))) continue;
-        if (array && e.arr && !TopConstEq(array, e.arr)) continue;
+        if (construction && e.effect == GrowthEffect::HeaderReplacement) continue;
+        auto limited = e.arr && IsArrayKind(e.arr, A_LIMITED);
+        if (array && e.arr && !(construction && limited) && !TopConstEq(array, e.arr)) continue;
         for (auto &b : roots.alts) {
             auto may = MayAliasRoots(e.root, e.exact, b.root, b.exact);
             if (may != AL_NO) visit(e, b, may);
@@ -5795,7 +5845,7 @@ inline void TypeCheck::CheckGrowsSince(size_t base, const Roots &built, const st
                                         : "growth would land inside it", " (§1.3)");
         if (may == AL_YES) Error(e.at, msg);
         growconflicts.push_back({ e.at, CurRealFrame().spec, e.root, target.root, msg });
-    });
+    }, true);
 }
 
 // The callee's growths are the caller's (§1.3(4)): an argument it grows
@@ -5807,6 +5857,11 @@ inline void TypeCheck::CheckGrowsSince(size_t base, const Roots &built, const st
 inline void TypeCheck::ApplyCalleeGrows(Node *at, FnSpec *spec, vector<Val> &argvals,
                                         string_view name) {
     // A record notes a growth of a parameter's class (ClassArgRoot).
+    auto field = [&](FnRecord::Growth growth, VarDef *owner, const Roots &mapped) -> const LinkField * {
+        if (!growth.field) return nullptr;
+        auto part = MapStoreField(spec, argvals, owner, mapped, *growth.field);
+        return part.base ? ast.places.Bound(part.base, part.path) : nullptr;
+    };
     auto grows = [&](size_t i, const char *how, FnRecord::Growth growth) {
         auto view = i >= spec->params.size();
         if (view) i -= spec->params.size();
@@ -5816,11 +5871,14 @@ inline void TypeCheck::ApplyCalleeGrows(Node *at, FnSpec *spec, vector<Val> &arg
         auto root = roots.Root();
         if (!root || IsTemp(root)) return;
         if (!growth.exact) roots.Weaken();
-        RecordGrowth(at, roots, cat("call ", name, ", which ", how, " ", root->name), growth.array, growth.stackonly);
+        RecordGrowth(at, roots, cat("call ", name, ", which ", how, " ", root->name), growth.array,
+                     growth.effect, field(growth, nullptr, roots));
     };
     if (spec->sf->isextern) {
         for (size_t i = 0; i < spec->argtypes.size(); i++) {
             auto pt = spec->argtypes[i];
+            if (IsRefOrSlice(pt) && !pt->cq) NoteLimitedReplacement(at, argvals[i], PointeeOf(pt),
+                pt->kind == TY_SLICE ? argvals[i].ElementPlace(ast.places) : argvals[i].refplace);
             if (IsPlainRef(pt) && ClassOf(pt->ref->sub) == SC_RESIZABLE)
                 grows(i, "may grow", { SoleResizableIn(pt->ref->sub), true });
         }
@@ -5836,7 +5894,8 @@ inline void TypeCheck::ApplyCalleeGrows(Node *at, FnSpec *spec, vector<Val> &arg
         for (auto growth : arrs) {
             auto roots = MapClass(spec, vd, argvals);
             if (!growth.exact) roots.Weaken();
-            RecordGrowth(at, roots, cat("call ", name, ", which grows ", vd->name), growth.array, growth.stackonly);
+            RecordGrowth(at, roots, cat("call ", name, ", which grows ", vd->name), growth.array,
+                         growth.effect, field(growth, vd, roots));
         }
 }
 

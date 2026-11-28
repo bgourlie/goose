@@ -2001,6 +2001,15 @@ inline void TypeCheck::NoteEnvRead(VarDef *vd) {
     spec->envreads.push_back(EnvReadOf(vd));
 }
 
+// A nested helper can read a count and header belonging to its caller.
+// Cache the entry bound it actually consulted, including an absent one.
+inline void TypeCheck::NoteLengthRead(LinkFlow::LengthKey key) {
+    auto s = CurRealFrame().spec;
+    if (!s || !s->lexparent || s->incycle || s->sf->isrec || outerbodies.empty() ||
+        key.binding->ownerspec == s || key.header->base->ownerspec == s) return;
+    s->lengthreads.try_emplace(key, outerbodies.back()->links.Measured(key));
+}
+
 // The caller's check stands on what the callee's did outside its activation,
 // where that lies outside the caller's activation too. The callee finds such
 // a variable as the caller's check began with it, unless the caller named it
@@ -2008,6 +2017,7 @@ inline void TypeCheck::NoteEnvRead(VarDef *vd) {
 inline void TypeCheck::NoteCalleeEnvReads(FnSpec *callee) {
     auto spec = CurRealFrame().spec;
     if (!spec || spec == callee) return;
+    for (auto &[key, bound] : callee->lengthreads) NoteLengthRead(key);
     for (auto &r : callee->envreads) {
         if (r.var->ownerspec == spec) continue;
         auto known = false;
@@ -2032,6 +2042,8 @@ inline bool TypeCheck::SameEnvFacts(const VarDef *vd, const EnvRead &r) {
 // Whether each variable the body read outside its activation is as it was
 // then, so its check stands for a call now.
 inline bool TypeCheck::EnvUnchanged(const FnSpec *spec) {
+    for (auto &[key, bound] : spec->lengthreads)
+        if (cur.links.Measured(key) != bound) return false;
     for (auto &r : spec->envreads)
         if (r.var->refplace != r.refplace || !SameEnvFacts(r.var, r)) return false;
     return true;
@@ -3223,7 +3235,8 @@ inline bool TypeCheck::SameRecord(const FnRecord &a, const FnRecord &b, const Fn
         for (auto i = x.begin(), j = y.begin(); i != x.end(); ++i, ++j) {
             if (i->first != j->first || i->second.size() != j->second.size()) return false;
             for (size_t k = 0; k < i->second.size(); k++)
-                if (i->second[k].exact != j->second[k].exact || i->second[k].stackonly != j->second[k].stackonly ||
+                if (i->second[k].exact != j->second[k].exact || i->second[k].effect != j->second[k].effect ||
+                    i->second[k].field != j->second[k].field ||
                     !sametype(i->second[k].array, j->second[k].array))
                     return false;
         }
@@ -3285,6 +3298,7 @@ inline void TypeCheck::CheckSpecBodyOnce(FnSpec *spec, vector<Val> *argvals, Lin
     if (sf->isextern) { CheckExternSpec(spec); return; }
     spec->record.eventstart = storeevents.size();
     spec->envreads.clear();
+    spec->lengthreads.clear();
     // A cycle's rounds keep the parameters' identity, as they keep the
     // class roots: the records name them.
     auto oldparams = std::move(spec->params);
@@ -3349,6 +3363,8 @@ inline void TypeCheck::CheckSpecBodyOnce(FnSpec *spec, vector<Val> *argvals, Lin
     // Ordinary callees check incoming global links when their shrink
     // summary is applied, including later calls to the same specialization.
     if (!argvals && !sf->isthread) cur.links = bodyscope.saved.links;
+    else if (spec->lexparent && !spec->incycle && !sf->isrec)
+        cur.links.lengths = bodyscope.saved.links.lengths;
     frames[fi].bodyidx = (int)outerbodies.size();
     auto savereach = reachable;
     DestScope ds(*this, Dest {});

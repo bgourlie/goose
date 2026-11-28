@@ -162,7 +162,30 @@ fn empty_limited_slots() {
     x.slots[0].link .= x.values[0];
     x.slots.pop_n(x.slots.len);
     x.values.clear();
+    x.values.push(45);
+    x.slots.push(Entry {});
+    x.slots[0].link .= x.values[0];
+    let slots .= x.slots;
+    const used = slots.len;
+    { defer x.slots.pop_n(used); }
+    x.values.clear();
     assert(x.slots.len == 0 && x.values.len == 0);
+}
+
+struct Siblings { slots: Entry[..3], other: Entry[..3], values: i64[>..] }
+
+fn add_other(x: Siblings&) { x.other.push(Entry {}); }
+
+fn empty_saved_slots() {
+    var x = Siblings { slots: [Entry {}], other: [], values: [42] };
+    const n = x.slots.len;
+    x.other = [Entry {}];
+    add_other(x);
+    x.slots[0].link .= x.values[0];
+    fn empty() { x.slots.pop_n(n); }
+    empty();
+    x.values.clear();
+    assert(x.slots.len == 0 && x.other.len == 2 && x.values.len == 0);
 }
 
 fn pop_all_nodes() {
@@ -277,6 +300,7 @@ fn main() {
     replace_all_slots();
     released_slot_view();
     empty_limited_slots();
+    empty_saved_slots();
     pop_all_nodes();
     flat_slot_view();
     replace_in_branches(0);

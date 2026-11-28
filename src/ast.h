@@ -3067,6 +3067,18 @@ struct LitFlow {
     int toparam = 0;
 };
 
+struct ArrayLengthKey {
+    VarDef *binding;
+    const LinkField *header;
+    auto operator<=>(const ArrayLengthKey &) const = default;
+    auto operator<=>(VarDef *v) const { return std::compare_three_way {}(binding, v); }
+};
+struct ArrayLengthBound {
+    Roots owners; // Exact storage alternatives for the one header selected at the read.
+    CountProof valid = true; // Possible writers that must name a different array.
+    bool operator==(const ArrayLengthBound &) const = default;
+};
+
 // What a body found of a variable outside its activation that it names (a
 // nested function's free variable, one a function value it calls names):
 // the variable's checking state (VarDef) as the body's check began with it.
@@ -3263,10 +3275,12 @@ struct FnRecord {
     // (§1.3(4)), in the same form, each with the types of the resizable
     // arrays grown, null for one the checker cannot tell
     // (TypeCheck::GrowEvent::arr).
+    enum class GrowthEffect { Length, StorageOnly, HeaderReplacement };
     struct Growth {
         TypeExpr *array;
         bool exact; // False if this owner only bounds the storage that grew.
-        bool stackonly = false; // Construction can occupy the top without publishing any elements.
+        GrowthEffect effect = GrowthEffect::Length;
+        const LinkField *field = nullptr; // Known storage containing the changed header.
     };
     map<VarDef *, vector<Growth>> growexternals;
     map<int, vector<Growth>> growparams;
@@ -3431,6 +3445,7 @@ struct FnSpec {
     // references elsewhere, says nothing of a call where it is otherwise
     // (TypeCheck::EnvUnchanged). Filled while the body is checked.
     vector<EnvRead> envreads;
+    map<ArrayLengthKey, ArrayLengthBound> lengthreads; // Captured bounds used by this specialization.
     // The same variables as the check left them, which a call reusing it
     // leaves them as too (TypeCheck::ReplayEnvExits).
     vector<EnvRead> envexits;
