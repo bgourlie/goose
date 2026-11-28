@@ -835,9 +835,11 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
             // The pool claims its slots before constructing their defaults.
             writesduringargs = reachable;
             int64_t lo = 0, hi = -1;
-            if (!length.constfrom && IntConsts(length, lo, hi)) {
+            if (ConstantBindings(length) == ConstantBinding::Immutable && IntConsts(length, lo, hi)) {
                 lo = std::max<int64_t>(0, lo);
                 hi = std::max<int64_t>(0, hi);
+            } else if (auto count = FixedCountOperand(args.back())) {
+                lo = hi = std::max<int64_t>(0, *count);
             }
             // Reallocation only defaults the portion beyond the old length.
             if (d.kind == B_REALLOC_SLICE) lo = 0;

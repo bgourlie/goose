@@ -4,7 +4,17 @@ fn tick() -> i64 { count++; count }
 struct S<T> { first: i64 = tick(), middle: i64, last: i64 = seed }
 struct D { n: i64 = tick() }
 enum E { One { n: i64 = tick() }, Two }
+
+fn finish() -> i64 { return 42 from make; }
+struct Exits { n: i64 = finish() }
+fn make() -> i64 {
+    const ONE: i64 = 1;
+    reusable[] var pool: Exits[>..] = [];
+    pool.alloc_slice(ONE);
+}
+
 fn main() {
+    assert(make() == 42);
     let seed = 99;
     fn tick() -> i64 { 999 }
     let a = S<u8> { middle: ::tick() };
@@ -16,9 +26,14 @@ fn main() {
     reusable[] var pool: D[>..] = [];
     let run = pool.alloc_slice(2);
     print(run, " ", count);
-    let empty = pool.alloc_slice(0);
-    let one = pool.realloc_slice(run, 1);
+    const ONE: u8 = 1;
+    let empty = pool.alloc_slice(ONE - 1);
+    let one = pool.realloc_slice(run, ONE);
     assert(empty.len == 0 && one.len == 1 && count == 9);
-    let grown = pool.realloc_slice(one, 2);
+    let grown = pool.realloc_slice(one, ONE + 1);
     assert(grown[1].n == 10 && count == 10);
+    // This default can only run inside make. A zero count skips it here.
+    reusable[] var skips: Exits[>..] = [];
+    let skipped = skips.alloc_slice(ONE - 1);
+    assert(skipped.len == 0);
 }
