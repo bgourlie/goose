@@ -278,12 +278,19 @@ fn empty_with_saved_count() {
 
 fn empty_with_known_count() {
     const local: i64 = TYPED_ZERO;
+    const ONE: u8 = 1;
     var nodes: Node[>..] = [Node {}, Node {}];
     nodes[0].next .= nodes[1];
     nodes.pop_n(local);
     nodes.pop_n(TYPED_ZERO);
+    nodes.pop_n(ONE - 1);
     assert(nodes.len == 2 && nodes[0].next .== nodes[1]);
     nodes.resize(local);
+    assert(nodes.len == 0);
+    nodes.push(Node {});
+    nodes.push(Node {});
+    nodes[0].next .= nodes[1];
+    nodes.resize(ONE - 1);
     assert(nodes.len == 0);
 }
 

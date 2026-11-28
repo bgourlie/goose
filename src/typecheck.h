@@ -2121,7 +2121,7 @@ struct TypeCheck {
     TypeExpr *DeclType(TypeExpr *t, TypeExpr *s);
     static bool ImplicitInt(IntStorage from, IntStorage to);
     Val CheckIntAny(Node *n);
-    static int64_t KnownIndex(Node *n, const Val &v);
+    int64_t KnownIndex(Node *n, const Val &v);
     std::optional<int64_t> FixedCountOperand(Node *n);
     bool HasRelRefT(TypeExpr *t, bool inpool = false);
     bool BuiltWhereReceived(Node *n, size_t result);

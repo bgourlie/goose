@@ -811,15 +811,13 @@ inline Val TypeCheck::CheckIntAny(Node *n) {
     return v;
 }
 
-// A fixed-type literal or a read of a typed constant still identifies a
-// slot even though its value cannot adapt to another integer type.
+// Indices and counts can be known even when their type is fixed and they
+// cannot adapt like literals. A negative value is never a valid index.
 inline int64_t TypeCheck::KnownIndex(Node *n, const Val &v) {
     int64_t lo, hi;
     if (IntConsts(v, lo, hi) && lo == hi && lo >= 0 && ConstantBindings(v) == ConstantBinding::Immutable)
         return lo;
-    if (auto literal = Is<IntLit>(n); literal && literal->val >= 0) return literal->val;
-    if (auto id = Is<Ident>(n); id && id->vdef) return std::max<int64_t>(-1, id->vdef->fixedint.value_or(-1));
-    return -1;
+    return std::max<int64_t>(-1, FixedCountOperand(n).value_or(-1));
 }
 
 // Runtime arithmetic can have a fixed value even when a typed constant

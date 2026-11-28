@@ -2400,15 +2400,11 @@ inline Val TypeCheck::CheckBinaryResult(Binary *b, Val &lv, Val &rv) {
     auto v = NumericBinary(b, lv, rv, ct, false);
     b->lenoffset = -1;
     if (b->op == T_PLUS && IsIntT(v.type) && v.type->intstorage == IS_I64) {
-        auto offset = [&](Node *n, const Val &operand) {
-            auto k = KnownIndex(n, operand);
-            return k >= 0 ? k : FixedCountOperand(n).value_or(-1);
-        };
         if (auto d = Is<Dot>(l); d && d->member == B_LEN) {
-            auto k = offset(r, rv);
+            auto k = KnownIndex(r, rv);
             if (k >= 0) b->lenoffset = k;
         }
-        if (auto d = Is<Dot>(r); d && d->member == B_LEN && b->lenoffset < 0) b->lenoffset = offset(l, lv);
+        if (auto d = Is<Dot>(r); d && d->member == B_LEN && b->lenoffset < 0) b->lenoffset = KnownIndex(l, lv);
     }
     JudgeBinaryCasts(b, l, r, lv, rv, v, ct);
     return v;
