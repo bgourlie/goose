@@ -731,8 +731,10 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
     auto &[removal, countcondition, added] = slots;
     CountProof savedlength;
     if (d.flags & BF_SHRINKS) removal = d.kind == B_CLEAR ? SlotRemoval::All : SlotRemoval::Possible;
+    int64_t resized = -1;
     if (d.kind == B_RESIZE) {
         auto length = CheckIntAny(args[1]);
+        resized = KnownIndex(args[1], length);
         auto [key, bound] = SavedLengthBound(args[1], rv, recvarr);
         CountProof fillpreserves = true;
         if (args.size() == 3) {
@@ -984,22 +986,33 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
     // it (§5.1); pop, pop_n and resize also need an element the shrink can
     // find, which a sequential array has not got.
     auto shrink = (d.flags & BF_SHRINKS) != 0;
-    auto header = ak == A_GROW && rv.Exact() && (added > 0 || popped > 0) && reachable && !cur.probingtypes
+    auto header = ak == A_GROW && rv.Exact() && (added > 0 || popped > 0 || resized >= 0) && reachable && !cur.probingtypes
                       ? CanonicalSuffixHeader(ArrayHeader(rv, recvarr)) : nullptr;
     auto suffixowner = header ? SuffixOwner(rv.Root()) : nullptr;
     auto fresh = cur.links.FreshCount(header, suffixowner);
     SuffixEffects::Paths before;
-    if (header && TracksSuffix(suffixowner, true)) before = cur.links.suffixeffects.PathsFor(*this, header, suffixowner);
+    if (header && TracksSuffix(suffixowner, true)) before = cur.links.counts.fresh.PathsFor(*this, header, suffixowner);
+    SuffixEffects::Paths beforelength;
+    if (header && TracksLength(suffixowner, true)) beforelength = cur.links.counts.length.PathsFor(*this, header, suffixowner);
     if (ak == A_GROW && shrink) {
-        CheckGrowShrink(c, d, args[0], rv, preserves, empties, header, popped);
+        auto retained = resized >= 0 ? resized : RetainedAfterPop(header, suffixowner, popped);
+        CheckGrowShrink(c, d, args[0], rv, preserves, empties, header, popped,
+                        header && retained > 0 ? ArrayPrefix{header, retained} : ArrayPrefix{});
+        if (!beforelength.empty()) {
+            if (resized >= 0)
+                cur.links.counts.length.changes[header] = { suffixowner, {{ resized, SuffixEffects::discarded }} };
+            else if (popped > 0) cur.links.counts.length.Shift(header, suffixowner, beforelength, -popped);
+        }
         if (popped > 0 && popped < fresh) cur.links.fresh[header] = { suffixowner, fresh - popped };
         if (!before.empty() && popped > 0)
-            cur.links.suffixeffects.Shift(header, suffixowner, before, -popped);
+            cur.links.counts.fresh.Shift(header, suffixowner, before, -popped);
         if (d.kind != B_CLEAR && ClassOf(elem) != SC_FIXED)
             Error(c, cat(".", d.name, " needs fixed-size elements: ", TypeStr(rv.type),
                          " is sequential (§3.3)"));
     }
     if (header && added > 0) {
+        if (!beforelength.empty() && resized < 0)
+            cur.links.counts.length.Shift(header, suffixowner, beforelength, added);
         // A link installed during construction could already target the new slot.
         auto intoarray = [&](const StoreEvent &e) {
             return e.elementlink.direction == EL_ANY && MayAliasRoots(rv.Root(), true, e.container, !e.bound) != AL_NO;
@@ -1007,7 +1020,7 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
         if (none_of(storeevents.begin() + beforestores, storeevents.end(), intoarray)) {
             cur.links.fresh[header] = { suffixowner, SuffixEffects::Add(fresh, added) };
             if (!before.empty())
-                cur.links.suffixeffects.Shift(header, suffixowner, before, added);
+                cur.links.counts.fresh.Shift(header, suffixowner, before, added);
         }
     }
     // A grow-shrink array shrinks from anywhere, provided nothing in scope
@@ -1682,7 +1695,7 @@ inline const string *TypeCheck::EmbedShader(Call *c, vector<Node *> &args) {
 // the storage the struct lies in, as a reference to the field would.
 inline void TypeCheck::CheckGrowShrink(Node *at, const BuiltinDef &op, Node *recv, const Val &rv,
                                        CountProof preserves, CountProof empties,
-                                       const LinkField *popheader, int64_t popped) {
+                                       const LinkField *popheader, int64_t popped, ArrayPrefix retained) {
     auto at_type = IsPlainRef(rv.type) ? rv.type->ref->sub : rv.type;
     assert(at_type->kind == TY_ARRAY);
     auto roots = rv.AsRoots();
@@ -1692,6 +1705,7 @@ inline void TypeCheck::CheckGrowShrink(Node *at, const BuiltinDef &op, Node *rec
         NoteOverwrite(recv, roots, storeevents.size(), at_type, &rv.refplace, nullptr, empties);
     ShrinkEffect effect { SB_UNBALANCED, empties.Available() ? at_type : nullptr };
     effect.preserves = preserves;
+    effect.retained = retained;
     if (effect.replaced) effect.replacesif = empties;
     ShrinkThrough(at, op.name, ExprStr(recv), roots, at_type, effect, popheader, popped);
 }
@@ -1733,7 +1747,7 @@ inline bool TypeCheck::RetainsRelativeSlot(TypeExpr *part, TypeExpr *array, Type
 // also carry links into a body from its caller, until a proven overwrite.
 inline ValueLinks TypeCheck::LiveElementLinks(VarDef *owner, TypeExpr *target, TypeExpr *replaced,
                                               bool callerchecks, Node *shrink, GlobalSlots *globalSlots,
-                                              CountProof *requirements) {
+                                              CountProof *requirements, ArrayPrefix retained) {
     if (!owner->elementlinks) return {};
     auto storage = OwnerType(owner);
     auto t = storage ? LoadType(storage) : target;
@@ -1783,6 +1797,8 @@ inline ValueLinks TypeCheck::LiveElementLinks(VarDef *owner, TypeExpr *target, T
     for (auto &[part, write] : cur.links.live) {
         if (part.owner != owner) continue;
         if (storage && cleared && write.at < since) continue;
+        if (retained.header && retained.header == write.target.header && write.target.length <= retained.length)
+            continue;
         retain(part.link, part.field, part.target, write.suffix,
                write.liveprefix.array == owner ? write.liveprefix.proof : CountProof(), write.cleared);
     }
@@ -2656,6 +2672,10 @@ inline void TypeCheck::CheckLinkShrink(LinkShrink s) {
     if (!reachable || cur.probingtypes) return;
     if (s.popheader && s.popped > 0 && s.popped <= cur.links.FreshCount(s.popheader, SuffixOwner(s.owner)))
         s.effect.keepslinks = true;
+    if (!s.effect.retained.header) {
+        auto length = RetainedAfterPop(s.popheader, SuffixOwner(s.owner), s.popped);
+        if (length > 0) s.effect.retained = { s.popheader, length };
+    }
     if (cur.deferring) {
         cur.deferring->shrinks.emplace_back(s, CurrentLinkEffects());
         return;
@@ -2665,7 +2685,7 @@ inline void TypeCheck::CheckLinkShrink(LinkShrink s) {
     if (!effect.keepslinks && !effect.preserves.Committed()) {
         auto safe = [&](TypeExpr *replaced, CountProof proof, GlobalSlots &views) {
             auto links = LiveElementLinks(s.owner, s.array, replaced, !s.viaclass, s.at,
-                                          s.owner->isglobal && !s.viaclass ? &views : nullptr, &proof);
+                                          s.owner->isglobal && !s.viaclass ? &views : nullptr, &proof, effect.retained);
             return links.MayPointForward() ? CountProof(false) : proof;
         };
         auto proof = safe(effect.replacesif.Committed() ? effect.replaced : nullptr, true, slots);
@@ -2906,46 +2926,29 @@ inline const LinkField *TypeCheck::CallerSuffixHeader(FnSpec *spec, const vector
     return CanonicalSuffixHeader(ast.places.Bound(field.base, field.path));
 }
 
-inline void TypeCheck::ApplyCalleeSuffixes(FnSpec *spec, const vector<Val> &args, const SuffixEffects &exit,
-                                          const LinkFlow &entry) {
-    // Only invalidations reaching this exit apply; a shrink on a path
-    // returning from the caller does not change the ordinary continuation.
-    if (exit.invaliddepth >= 0) {
-        cur.links.suffixeffects.invaliddepth = std::max(cur.links.suffixeffects.invaliddepth, exit.invaliddepth);
-        auto exposed = [&](VarDef *v) { return Depth(v) <= exit.invaliddepth || IsClassRoot(v); };
-        erase_if(cur.links.fresh, [&](const auto &p) { return exposed(p.second.owner); });
-        erase_if(cur.links.suffixeffects.changes, [&](const auto &p) { return exposed(p.second.owner); });
-    }
+inline SuffixEffects TypeCheck::CallerCountEffects(FnSpec *spec, const vector<Val> &args, const SuffixEffects &exit) {
+    SuffixEffects result;
+    result.invaliddepth = exit.invaliddepth;
     for (auto [owner, exact] : exit.invalidated) {
         auto mapped = MapClass(spec, owner, args);
-        for (auto &alt : mapped.alts) cur.links.ForgetSuffixes(*this, alt.root, exact && alt.exact);
+        for (auto &alt : mapped.alts) result.invalidated.emplace(SuffixOwner(alt.root), exact && alt.exact);
     }
     // Distinct paths in the callee can name one header at the call. Each
     // summary is a lower bound, so combining them must not count slots twice.
-    decltype(exit.changes) effects;
     for (auto &[header, change] : exit.changes) {
         auto mapped = MapClass(spec, change.owner, args);
         auto caller = CallerSuffixHeader(spec, args, header, change.owner, mapped);
         if (!caller) continue;
         auto owner = SuffixOwner(mapped.Root());
-        auto [it, inserted] = effects.try_emplace(caller, SuffixEffects::Change { owner, change.paths });
+        auto [it, inserted] = result.changes.try_emplace(caller, SuffixEffects::Change { owner, change.paths });
         if (!inserted) {
             auto &both = it->second;
             if (both.owner != owner) both.owner = nullptr;
             both.paths = SuffixEffects::Join(std::move(both.paths), change.paths, false);
         }
     }
-    for (auto &[header, change] : effects) {
-        auto owner = change.owner;
-        if (!owner) continue;
-        auto count = SuffixEffects::Guaranteed(change.paths, entry.FreshCount(header, owner));
-        if (count > 0) cur.links.fresh[header] = { owner, count };
-        else cur.links.fresh.erase(header);
-        if (TracksSuffix(owner, true)) {
-            auto before = entry.suffixeffects.PathsFor(*this, header, owner);
-            cur.links.suffixeffects.changes[header] = { owner, SuffixEffects::Sequence(before, change.paths) };
-        }
-    }
+    erase_if(result.changes, [](const auto &p) { return !p.second.owner; });
+    return result;
 }
 
 // Internal links move with the complete element run. The destination alone
@@ -2968,7 +2971,7 @@ inline void TypeCheck::RecordElementLinks(const Dest &dest, TypeExpr *type, cons
 
 inline void TypeCheck::StoreElementLink(const Dest &dest, TypeExpr *type, ElementLink link, Node *at,
                                        const Roots &borrowed, string_view path, const LinkField &target,
-                                       LiveTarget liveprefix) {
+                                       LiveTarget liveprefix, ArrayPrefix targetprefix) {
     if (!reachable || dest.discarded || dest.roots.None()) return;
     auto reached = dest.reached ? dest.reached : type;
     std::optional<FnRecord::LimitedSuffix> suffix;
@@ -2991,7 +2994,7 @@ inline void TypeCheck::StoreElementLink(const Dest &dest, TypeExpr *type, Elemen
     auto indexed = dest.indexed;
     indexed.element = ast.places.Project(indexed.element, path);
     RecordLinkStore(dest.roots, reached, link, at, dest.place, field, target, bound,
-                    { suffix, liveprefix, cleared }, indexed);
+                    { suffix, liveprefix, cleared, targetprefix }, indexed);
 }
 
 inline void TypeCheck::FinishFill(ArrayLit *fill, const Dest &dest) {
@@ -3039,7 +3042,10 @@ inline void TypeCheck::RecordLinkStore(const Roots &owners, TypeExpr *reached,
         auto index = storeevents.size() - 1;
         auto write = state;
         if (!e.storefield.base) write.suffix.reset();
-        if (d.bound || !owners.Exact() || d.root != owners.Root()) write.liveprefix = nullptr;
+        if (d.bound || !owners.Exact() || d.root != owners.Root()) {
+            write.liveprefix = nullptr;
+            write.target = {};
+        }
         cur.links.Store(*this, storeevents.back(), index, write);
     }
 }
@@ -4267,6 +4273,8 @@ inline void TypeCheck::NoteRootEvent(VarDef *root, P param, X external) {
 // it is.
 inline void TypeCheck::NoteShrink(VarDef *root, TypeExpr *bound, ShrinkEffect effect) {
     auto merge = [&](ShrinkEffect &prior) {
+        if (prior.retained.header != effect.retained.header) prior.retained = {};
+        else prior.retained.length = std::min(prior.retained.length, effect.retained.length);
         prior.balance = std::max(prior.balance, effect.balance);
         if (!prior.arrayreceiver || !effect.arrayreceiver ||
             !TopConstEq(prior.arrayreceiver, effect.arrayreceiver)) prior.arrayreceiver = nullptr;
@@ -4404,9 +4412,9 @@ inline void TypeCheck::NoteShrinkOrder(const LinkShrink &shrink) {
             if (!shrink.effect.keepslinks) {
                 o.required = -1;
                 if (known && shrink.popheader && shrink.popped > 0) {
-                    auto paths = cur.links.suffixeffects.PathsFor(*this, shrink.popheader, SuffixOwner(root));
+                    auto paths = cur.links.counts.fresh.PathsFor(*this, shrink.popheader, SuffixOwner(root));
                     if (cur.iterationprefix)
-                        paths = SuffixEffects::Sequence(cur.iterationprefix->PathsFor(*this, shrink.popheader, SuffixOwner(root)), paths);
+                        paths = SuffixEffects::Sequence(cur.iterationprefix->fresh.PathsFor(*this, shrink.popheader, SuffixOwner(root)), paths);
                     o.required = SuffixEffects::Required(paths, shrink.popped);
                     if (o.required > 0) o.popheader = shrink.popheader;
                 }
@@ -4420,7 +4428,7 @@ inline void TypeCheck::NoteShrinkOrder(const LinkShrink &shrink) {
                 (bound && !TypeEq(e.bound, bound)) || !sametype(e.effect.replaced, o.effect.replaced) ||
                 !sametype(e.effect.arrayreceiver, o.effect.arrayreceiver) ||
                 e.effect.preserves != o.effect.preserves || e.effect.replacesif != o.effect.replacesif ||
-                e.effect.keepslinks != o.effect.keepslinks || e.popheader != o.popheader)
+                e.effect.keepslinks != o.effect.keepslinks || e.effect.retained != o.effect.retained || e.popheader != o.popheader)
                 continue;
             e.before = std::max(e.before, o.before);
             FnRecord::IntersectKills(e.kills, o.kills);
@@ -4596,6 +4604,25 @@ inline bool TypeCheck::BackwardElementOrder(const ElementPosition &slot, const E
            SameIndexedElement(i->vdef).Committed();
 }
 
+// Only an address into the growable array establishes an absolute element
+// position. Reading a reference stored at that position loads a different target.
+inline ArrayPrefix TypeCheck::GrowArrayTarget(Node *value) {
+    auto path = AddressedPath(value);
+    if (path == value && !Is<Ident>(path)) return {};
+    for (auto &position : InlineElementPath(path, false)) {
+        auto ix = Is<Index>(position.base);
+        auto id = Is<Ident>(position.base);
+        auto origin = id && id->vdef ? id->vdef->elementorigin : nullptr;
+        if (origin && !InScope(origin, origin->elementdecl)) origin = nullptr;
+        auto header = ix ? ix->arrayheader : origin ? origin->elementarray : nullptr;
+        auto index = ix ? ix->constantindex : origin ? origin->elementindex : -1;
+        if (!header || index < 0 || index == INT64_MAX) continue;
+        if (IsArrayKind(FieldPathType(header->base, header->path), A_GROW))
+            return { CanonicalSuffixHeader(header), index + 1 };
+    }
+    return {};
+}
+
 inline bool TypeCheck::BackwardElementLink(const AssignedElement &element, Node *value, const Val &read) {
     if (!element.assignment || !value) return false;
     bool consecutive = element.next == value;
@@ -4728,6 +4755,8 @@ inline void TypeCheck::ShrinkThrough(Node *at, const string &verb, const string 
                                                     " may point at");
             ShrinkGrowShrink(at, cat(verb, " ", recv), t.root, what, bound, effect.balance);
         }
+        if (!effect.preserves.Committed() && TracksLength(t.root, !bound))
+            cur.links.counts.length.Forget(*this, SuffixOwner(t.root), !bound);
         NoteShrinkEvent(at, t.root, bound, cat(verb, " ", recv), arr);
     }
 }
@@ -5409,6 +5438,12 @@ inline void TypeCheck::ApplyCalleeShrinks(Node *at, FnSpec *spec, vector<Val> &a
                 state.cleared = it->second.cleared;
                 auto &from = spec->record.classevents[origins[i]];
                 if (!e.bound) {
+                    auto prefix = it->second.target;
+                    if (prefix.header) {
+                        auto mapped = MapClass(spec, from.container, argvals);
+                        if (auto header = CallerSuffixHeader(spec, argvals, prefix.header, from.container, mapped))
+                            state.target = { header, prefix.length };
+                    }
                     auto fields = PlacePaths::Of(ast.places.PathOf(from.linktarget), ast.places);
                     state.liveprefix = CallerLiveTarget(it->second.liveprefix, fields,
                                                         e.container, spec, argvals, survivingargs);
@@ -5461,16 +5496,18 @@ inline void TypeCheck::ApplyCalleeShrinks(Node *at, FnSpec *spec, vector<Val> &a
                                  ? &h.order->atremoval->stores : nullptr, {});
             const LinkField *popheader = nullptr;
             auto effect = h.effect;
+            effect.retained = {};
             if (h.order && !h.bound && !h.viaclass) {
+                auto owner = h.order->external;
+                auto p = size_t(h.order->param);
+                if (!owner && p < spec->params.size()) owner = spec->params[p]->ref.Root();
                 if (h.order->required == 0) effect.keepslinks = true;
-                else if (h.order->popheader) {
-                    auto owner = h.order->external;
-                    auto p = size_t(h.order->param);
-                    if (!owner && p < spec->params.size()) owner = spec->params[p]->ref.Root();
-                    if (owner) {
-                        auto mapped = MapClass(spec, owner, argvals);
-                        if (mapped.Root() == h.root)
-                            popheader = CallerSuffixHeader(spec, argvals, h.order->popheader, owner, mapped);
+                if (owner && (h.effect.retained.header || h.order->popheader)) {
+                    auto mapped = MapClass(spec, owner, argvals);
+                    if (mapped.Root() == h.root) {
+                        auto header = CallerSuffixHeader(spec, argvals, h.effect.retained.header, owner, mapped);
+                        if (header) effect.retained = { header, h.effect.retained.length };
+                        popheader = CallerSuffixHeader(spec, argvals, h.order->popheader, owner, mapped);
                     }
                 }
             }
@@ -5478,7 +5515,7 @@ inline void TypeCheck::ApplyCalleeShrinks(Node *at, FnSpec *spec, vector<Val> &a
             // in the callee. It is a condition on the caller at entry.
             if (popheader) {
                 cur.links.fresh = entrylinks.fresh;
-                cur.links.suffixeffects = entrylinks.suffixeffects;
+                cur.links.counts.fresh = entrylinks.counts.fresh;
             }
             GrowOnlyShrinkAt(at, what, h.root, string(h.root->name), h.bound, h.arr, h.viaclass, effect,
                              popheader, popheader ? h.order->required : 0);
@@ -5666,6 +5703,7 @@ inline void TypeCheck::ApplyCalleeShrinks(Node *at, FnSpec *spec, vector<Val> &a
         apply(h, judge(h));
         if (!h.effect.preserves.Committed()) {
             cur.links.ForgetSuffixes(*this, h.root, !h.bound);
+            if (TracksLength(h.root, !h.bound)) cur.links.counts.length.Forget(*this, SuffixOwner(h.root), !h.bound);
         }
     }
     ApplyCalleeLiveShrinks(at, spec, argvals, name);
@@ -5680,7 +5718,17 @@ inline void TypeCheck::ApplyCalleeShrinks(Node *at, FnSpec *spec, vector<Val> &a
         ApplyCalleeWrites(spec, argvals);
         if (ordered) {
             projectlinks(&exit.stores, argnodes);
-            ApplyCalleeSuffixes(spec, argvals, exit.suffixes, entrylinks);
+            auto suffix = CallerCountEffects(spec, argvals, exit.counts.fresh);
+            // An explicit transfer includes the effects of stores replayed above.
+            // Apply it to the call's entry. Elsewhere those stores still count.
+            for (auto &[header, change] : suffix.changes) {
+                auto owner = change.owner;
+                auto count = entrylinks.FreshCount(header, owner);
+                if (count) cur.links.fresh[header] = { owner, count };
+                else cur.links.fresh.erase(header);
+                cur.links.counts.fresh.changes[header] = { owner, entrylinks.counts.fresh.PathsFor(*this, header, owner) };
+            }
+            cur.links.ApplyCounts(*this, { std::move(suffix), CallerCountEffects(spec, argvals, exit.counts.length) });
         }
         if (!spec->inprogress) ApplyCalleePrefixes(exit.prefixes, spec, argvals);
     };

@@ -1934,11 +1934,11 @@ inline TypeCheck::Scope TypeCheck::CheckLoopPasses(Node *x, FlowState &head,
     auto warnbase = cur.pendingwarnings.size();
     auto settled = false;
     Scope sc;
-    std::optional<SuffixEffects> step;
+    std::optional<ArrayCountEffects> step;
     auto applyruns = [&](FlowState &state, int64_t lo, int64_t hi) {
         state.links.fresh = entry.links.fresh;
-        state.links.suffixeffects = entry.links.suffixeffects;
-        state.links.ApplySuffixes(*this, step->OverRuns(*this, lo, hi));
+        state.links.counts = entry.links.counts;
+        state.links.ApplyCounts(*this, step->OverRuns(*this, lo, hi));
     };
     // What a pass feeds back only grows, so the passes are bounded by the
     // variables in scope and their roots. A pass may move a fact on by just
@@ -1951,12 +1951,12 @@ inline TypeCheck::Scope TypeCheck::CheckLoopPasses(Node *x, FlowState &head,
         RestoreFlow(head);
         cur.pendingwarnings.resize(warnbase);
         cur.looppasses.push_back({ (int)scopes.size(), firstbase, storeevents.size(), settled });
-        SuffixEffects prefix;
+        ArrayCountEffects prefix;
         if (bounds.max > 0) {
-            prefix = BodySuffixes();
-            cur.links.suffixeffects = {};
+            prefix = BodyCounts();
+            cur.links.counts = {};
         }
-        Saved<const SuffixEffects *> recording(cur.iterationprefix, bounds.max > 0 ? &prefix : cur.iterationprefix);
+        Saved<const ArrayCountEffects *> recording(cur.iterationprefix, bounds.max > 0 ? &prefix : cur.iterationprefix);
         PushScope(SK_LOOP, x);
         pass();
         if (reachable) RunExitDefers((int)scopes.size() - 1);
@@ -1976,16 +1976,16 @@ inline TypeCheck::Scope TypeCheck::CheckLoopPasses(Node *x, FlowState &head,
             if (sc.breakflows) {
                 // A break only executes the prefix of this iteration that
                 // reached it, after any iterations represented by the head.
-                auto &effects = sc.breakflow.links.suffixeffects;
+                auto &effects = sc.breakflow.links.counts;
                 effects.ForgetBindings(expired);
-                auto before = head.links.suffixeffects;
+                auto before = head.links.counts;
                 before.Combine(*this, effects, SuffixEffects::Sequence);
                 effects = std::move(before);
             }
             if (sc.backedges) {
                 // Both fallthrough and continue run their defers before they
                 // supply the transfer for the next iteration.
-                auto &effects = sc.backedge.links.suffixeffects;
+                auto &effects = sc.backedge.links.counts;
                 effects.ForgetBindings(expired);
                 if (!step) step = effects;
                 else step->Combine(*this, effects, [](const auto &a, const auto &b) {
@@ -2530,7 +2530,7 @@ inline TypeCheck::DeferEffects TypeCheck::CheckDeferredBody(Defer *d) {
     effects.statement = d;
     {
         Saved collecting(cur.deferring, &effects);
-        Saved<const SuffixEffects *> prefix(cur.iterationprefix, nullptr);
+        Saved<const ArrayCountEffects *> prefix(cur.iterationprefix, nullptr);
         Saved<Rebuild *> active(cur.rebuild, nullptr); // Checked now, executed on scope exit.
         cur.links = {};
         cur.links.borrowedindices = saved.links.borrowedindices;
@@ -2601,7 +2601,7 @@ inline TypeCheck::LinkEffects TypeCheck::CurrentLinkEffects() {
     LinkEffects effects;
     for (auto &k : cur.kills) if (k.relative) effects.overwrites.push_back(k);
     effects.writes = cur.links;
-    if (cur.iterationprefix) effects.writes.suffixeffects = BodySuffixes();
+    if (cur.iterationprefix) effects.writes.counts = BodyCounts();
     return effects;
 }
 
@@ -2621,7 +2621,7 @@ inline void TypeCheck::ApplyLinkEffects(const LinkEffects &effects) {
         storeevents.back().indexed = part.indexed;
         cur.links.Add(storeevents.back(), storeevents.size() - 1, write);
     }
-    cur.links.ApplySuffixes(*this, effects.writes.suffixeffects);
+    cur.links.ApplyCounts(*this, effects.writes.counts);
     for (auto &[header, value] : effects.writes.fresh)
         cur.links.fresh[header] = { value.owner, std::max(cur.links.FreshCount(header, value.owner), value.count) };
     cur.links.borrowedindices.insert(effects.writes.borrowedindices.begin(), effects.writes.borrowedindices.end());
@@ -3255,6 +3255,8 @@ inline void TypeCheck::CheckVarDecl(VarDecl *vd, bool global) {
         } else if (v && HoldsPlainRef(t)) {
             NoteHolderBinding(d, *v, init);
         }
+        if (!global && reachable && v && IsArrayKind(t, A_GROW) && HasRelRefT(t) && v->extent.length >= 0)
+            cur.links.counts.length.changes[ast.places.Bound(d)] = { d, {{ v->extent.length, SuffixEffects::discarded }} };
         if (vd->reusable) {
             auto kw = vd->reusable == RU_SLICES ? "reusable[]" : "reusable";
             if (!vd->isvar) Error(vd, cat(kw, " requires var"));

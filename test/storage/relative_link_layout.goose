@@ -575,7 +575,31 @@ fn deferred_clear(i: i64) {
     assert(nodes[0].next == null);
 }
 
+fn resize_three(nodes: Node[>..]&) { nodes.resize(3); }
+
+fn retained_prefix() {
+    var nodes: Node[>..] = [Node {}; 4];
+    nodes[0].next .= nodes[1];
+    nodes.pop();
+    nodes.resize(2);
+    assert(nodes.len == 2 && nodes[0].next .== nodes[1]);
+
+    var appended: Node[>..] = [];
+    appended.append([Node {}; 4]);
+    { let target .= appended[1]; appended[0].next .= target; }
+    pop_node(appended);
+    { defer { appended.pop(); } }
+    assert(appended.len == 2 && appended[0].next .== appended[1]);
+
+    var deferred: Node[>..] = [Node {}; 4];
+    { defer { deferred[0].next .= deferred[1]; } }
+    resize_three(deferred);
+    deferred.pop();
+    assert(deferred.len == 2 && deferred[0].next .== deferred[1]);
+}
+
 fn main() {
+    retained_prefix();
     conditional_rebind(false);
     conditional_rebind(true);
     bound_indices();

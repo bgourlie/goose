@@ -328,8 +328,9 @@ struct TypeCheck {
             auto it = fresh.find(header);
             return it != fresh.end() && it->second.owner == owner ? it->second.count : 0;
         }
-        SuffixEffects suffixeffects;
-        void ApplySuffixes(TypeCheck &tc, const SuffixEffects &effects) {
+        ArrayCountEffects counts;
+        void ApplyCounts(TypeCheck &tc, const ArrayCountEffects &change) {
+            const auto &effects = change.fresh;
             for (auto it = fresh.begin(); it != fresh.end();) {
                 auto &value = it->second;
                 auto paths = effects.PathsFor(tc, it->first, value.owner);
@@ -342,7 +343,7 @@ struct TypeCheck {
                 if (floor > 0)
                     fresh[header] = { change.owner, std::max(FreshCount(header, change.owner), floor) };
             }
-            suffixeffects.Combine(tc, effects, SuffixEffects::Sequence);
+            counts.Combine(tc, change, SuffixEffects::Sequence);
         }
         using LengthKey = ArrayLengthKey;
         using Measurement = ArrayLengthBound;
@@ -437,7 +438,7 @@ struct TypeCheck {
         map<ArrayLit *, FillLinks> fills;
         void ForgetSuffixes(TypeCheck &tc, VarDef *owner, bool exact) {
             owner = tc.SuffixOwner(owner);
-            if (tc.TracksSuffix(owner, exact)) suffixeffects.Forget(tc, owner, exact);
+            if (tc.TracksSuffix(owner, exact)) counts.fresh.Forget(tc, owner, exact);
             erase_if(fresh, [&](const auto &p) {
                 return tc.SuffixOwnersOverlap(p.second.owner, true, owner, exact);
             });
@@ -456,7 +457,7 @@ struct TypeCheck {
         // Once a binding expires, its outstanding writes still belong to
         // the enclosing field. A fresh iteration can bind a different slot.
         template<typename F> void ForgetBindings(F expired) {
-            suffixeffects.ForgetBindings(expired);
+            counts.ForgetBindings(expired);
             erase_if(fresh, [&](const auto &p) { return expired(p.first->base) || expired(p.second.owner); });
             erase_if(lengths, [&](const auto &p) {
                 return expired(p.first.binding) || expired(p.first.header->base) || p.second.owners.Any([&](auto &a) { return expired(a.root); });
@@ -468,6 +469,8 @@ struct TypeCheck {
                 return var && expired(*var);
             });
             for (auto it = live.begin(); it != live.end();) {
+                auto &target = it->second.target;
+                if (target.header && expired(target.header->base)) target = {};
                 auto field = it->first.boundfield;
                 auto forgetfield = field && expired(field->base);
                 auto forgetindex = it->first.indexed.DependsOn(expired);
@@ -483,7 +486,7 @@ struct TypeCheck {
             }
         }
         void Join(TypeCheck &tc, const LinkFlow &other, bool backedge) {
-            suffixeffects.Combine(tc, other.suffixeffects, [&](const auto &a, const auto &b) {
+            counts.Combine(tc, other.counts, [&](const auto &a, const auto &b) {
                 return SuffixEffects::Join(a, b, backedge);
             });
             for (auto it = lengths.begin(); it != lengths.end();) {
@@ -525,7 +528,7 @@ struct TypeCheck {
         }
         // Loop convergence depends on the possible writes, not event numbers.
         bool operator==(const LinkFlow &o) const {
-            return fresh == o.fresh && suffixeffects == o.suffixeffects && lengths == o.lengths &&
+            return fresh == o.fresh && counts == o.counts && lengths == o.lengths &&
                    borrowedindices == o.borrowedindices && prefixes == o.prefixes &&
                    targets == o.targets && fills == o.fills &&
                    RelativeStore::SameSet(resultlinks, o.resultlinks) && live.size() == o.live.size() &&
@@ -3148,7 +3151,7 @@ struct TypeCheck {
     const string *EmbedShader(Call *c, vector<Node *> &args);
     const string *EmbedFile(Call *c, vector<Node *> &args);
     void CheckGrowShrink(Node *at, const BuiltinDef &op, Node *recv, const Val &rv, CountProof preserves,
-                         CountProof empties, const LinkField *popheader, int64_t popped);
+                         CountProof empties, const LinkField *popheader, int64_t popped, ArrayPrefix retained);
     bool RelyOnCountProof(CountProof proof, Node *at, const char *use);
     bool LiveConversionTargets(const ValueLinks &links, CountProof whole, Node *at);
     void GrowOnlyAssignKnown(Assign *a, const Roots &built, bool whole);
@@ -3159,7 +3162,7 @@ struct TypeCheck {
     using GlobalSlots = map<TypeExpr *, CountProof>;
     ValueLinks LiveElementLinks(VarDef *owner, TypeExpr *target = nullptr,
                                TypeExpr *replaced = nullptr, bool callerchecks = false, Node *shrink = nullptr,
-                               GlobalSlots *globalSlots = nullptr, CountProof *requirements = nullptr);
+                               GlobalSlots *globalSlots = nullptr, CountProof *requirements = nullptr, ArrayPrefix retained = {});
     // Whether a shrink whose receiver has these roots knows the arrays it
     // frees: none is static data or a temporary (§5.1).
     static bool ShrinkRootsKnown(const Roots &roots) {
@@ -3226,15 +3229,25 @@ struct TypeCheck {
         if (!exact || !owner) return true;
         return owner->ownerspec != spec && (owner->type ? HasRelRefT(LoadType(owner->type)) : owner->mayholdrel);
     }
-    SuffixEffects BodySuffixes() {
-        if (!cur.iterationprefix) return cur.links.suffixeffects;
+    ArrayCountEffects BodyCounts() {
+        if (!cur.iterationprefix) return cur.links.counts;
         auto result = *cur.iterationprefix;
-        result.Combine(*this, cur.links.suffixeffects, SuffixEffects::Sequence);
+        result.Combine(*this, cur.links.counts, SuffixEffects::Sequence);
         return result;
+    }
+    int64_t RetainedAfterPop(const LinkField *header, VarDef *owner, int64_t count) {
+        if (!header || !owner || count <= 0) return -1;
+        auto paths = cur.links.counts.length.PathsFor(*this, header, owner);
+        if (cur.iterationprefix)
+            paths = SuffixEffects::Sequence(cur.iterationprefix->length.PathsFor(*this, header, owner), paths);
+        return std::max<int64_t>(0, SuffixEffects::Guaranteed(paths, 0) - count);
+    }
+    bool TracksLength(VarDef *owner, bool exact) {
+        return !exact || !owner || (owner->type ? HasRelRefT(LoadType(owner->type)) : owner->mayholdrel);
     }
     const LinkField *CallerSuffixHeader(FnSpec *spec, const vector<Val> &args, const LinkField *header,
                                        VarDef *owner, const Roots &mapped);
-    void ApplyCalleeSuffixes(FnSpec *spec, const vector<Val> &args, const SuffixEffects &exit, const LinkFlow &entry);
+    SuffixEffects CallerCountEffects(FnSpec *spec, const vector<Val> &args, const SuffixEffects &exit);
     // While a callee's shrink is judged at a call: the store events the call
     // replayed from `base` on, each with the index of the callee's class
     // event it came from (-1: none, or no order known), and how many of
@@ -3280,7 +3293,7 @@ struct TypeCheck {
         cur.links.prefixes.Forget([&](VarDef *prefix) { return prefix == v; });
         cur.links.targets.erase(v);
         cur.links.targets.erase(SliceElements { v });
-        if (!cur.links.live.empty() || !cur.links.fresh.empty() || !cur.links.suffixeffects.Empty() || !cur.links.lengths.empty())
+        if (!cur.links.live.empty() || !cur.links.fresh.empty() || !cur.links.counts.Empty() || !cur.links.lengths.empty())
             cur.links.ForgetBindings([&](VarDef *base) { return base == v; });
         if (!v->type || v->isvar || !IsAddressRef(v->type)) return;
         erase_if(cur.kills, [&](const Kill &k) { return k.relative && k.base == v; });
@@ -3288,7 +3301,7 @@ struct TypeCheck {
     void ForgetLocal(VarDef *v) {
         if (cur.links.live.empty() && cur.links.targets.empty() && cur.links.prefixes.arrays.empty() &&
             cur.links.fills.empty() && cur.links.borrowedindices.empty() && cur.links.fresh.empty() &&
-            cur.links.suffixeffects.Empty() && cur.links.lengths.empty() && cur.kills.empty()) return;
+            cur.links.counts.Empty() && cur.links.lengths.empty() && cur.kills.empty()) return;
         ForgetOwner(v);
         for (auto c : v->components) if (c) ForgetLocal(c);
     }
@@ -3315,7 +3328,7 @@ struct TypeCheck {
     void RecordElementLinks(const Dest &dest, TypeExpr *type, const ValueLinks &links, Node *at);
     void StoreElementLink(const Dest &dest, TypeExpr *type, ElementLink link, Node *at,
                           const Roots &borrowed, string_view path = {}, const LinkField &target = {},
-                          LiveTarget liveprefix = {});
+                          LiveTarget liveprefix = {}, ArrayPrefix targetprefix = {});
     void FinishFill(ArrayLit *fill, const Dest &dest);
     void RecordLinkStore(const Roots &owners, TypeExpr *reached, ElementLink link, Node *at,
                          LinkLocation place = {}, const LinkField &field = {}, const LinkField &target = {},
@@ -3449,6 +3462,7 @@ struct TypeCheck {
     using ElementPath = small_vector<ElementPosition, 2>;
     ElementPath InlineElementPath(Node *n, bool destination);
     bool BackwardElementOrder(const ElementPosition &slot, const ElementPosition &target, bool consecutive, bool written);
+    ArrayPrefix GrowArrayTarget(Node *value);
     bool BackwardElementLink(const AssignedElement &element, Node *value, const Val &read);
     // An array a shrink may free (§5.1, §5.2): the one in root's own storage,
     // or, where root cannot hold one, one its storage leads to through the
@@ -3565,9 +3579,9 @@ struct TypeCheck {
     // from the summary. A function value's body is checked in its call's
     // statement and keeps it (CheckFunValCall).
     struct BodyState {
-        // While measuring a bounded loop, suffixeffects starts at the current
+        // While measuring a bounded loop, count effects start at the current
         // iteration. Shrink obligations and function exits need the body's prefix.
-        const SuffixEffects *iterationprefix = nullptr;
+        const ArrayCountEffects *iterationprefix = nullptr;
         // Operand types needed to choose an evaluation order. The chosen
         // call or initializer checks the storage effects in that order.
         // A newly specialized callee still checks and records its own body.

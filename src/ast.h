@@ -2835,12 +2835,20 @@ inline bool CountProof::Committed() const {
 // new elements into the caller's holders before popping them.
 enum ShrinkBalance { SB_BALANCED, SB_UNBALANCED };
 
+// The first length elements of one exact array header.
+struct ArrayPrefix {
+    const LinkField *header = nullptr;
+    int64_t length = 0;
+    bool operator==(const ArrayPrefix &) const = default;
+};
+
 // An emptying operation can discard both ends of an internal link. Keep
 // the part it replaces: clearing a struct's tail leaves its header live.
 struct ShrinkEffect {
     ShrinkBalance balance;
     TypeExpr *replaced;
     TypeExpr *arrayreceiver = nullptr; // A shrink of this array alone preserves its owner's fixed fields.
+    ArrayPrefix retained;          // Slots below this length survive in this header.
     CountProof preserves;          // No slot is removed.
     bool keepslinks = false;       // Removing a fresh suffix preserves every pre-existing link target.
     CountProof replacesif = true;  // A removing operation empties 'replaced' under this condition.
@@ -3253,6 +3261,25 @@ struct SuffixEffects {
     }
 };
 
+// These counts share the same transfer and join rules. A forward-link
+// store can invalidate the fresh suffix without changing the array length.
+struct ArrayCountEffects {
+    SuffixEffects fresh, length;
+    bool Empty() const { return fresh.Empty() && length.Empty(); }
+    template<typename TC, typename F> void Combine(TC &tc, const ArrayCountEffects &other, F combine) {
+        fresh.Combine(tc, other.fresh, combine);
+        length.Combine(tc, other.length, combine);
+    }
+    template<typename F> void ForgetBindings(F expired) {
+        fresh.ForgetBindings(expired);
+        length.ForgetBindings(expired);
+    }
+    template<typename TC> ArrayCountEffects OverRuns(TC &tc, int64_t lo, int64_t hi) const {
+        return { fresh.OverRuns(tc, lo, hi), length.OverRuns(tc, lo, hi) };
+    }
+    bool operator==(const ArrayCountEffects &) const = default;
+};
+
 // The analysis a checked body exposes to its callers. A recursive round
 // moves this record aside and starts a fresh one; specialization identity,
 // parameters, lexical environment and annotated code are never snapshotted.
@@ -3386,7 +3413,11 @@ struct FnRecord {
         LiveTarget liveprefix;             // The target is live in this array or array parameter.
         CountProof cleared;                // A named-zero resize can have removed this slot.
 
+        ArrayPrefix target;                // A prefix containing the target of this store.
+
         void Include(const LinkState &other) {
+            if (target.header != other.target.header) target = {};
+            else target.length = std::max(target.length, other.target.length);
             if (suffix && other.suffix && suffix->path == other.suffix->path)
                 suffix->guard = suffix->guard.Both(other.suffix->guard);
             else suffix.reset();
@@ -3409,12 +3440,12 @@ struct FnRecord {
         vector<CallerKill> overwrites;
         LinkStores stores;
         LimitedPrefixes prefixes; // Whole arrays in caller-visible storage, including captures.
-        SuffixEffects suffixes;
+        ArrayCountEffects counts;
         template<typename TC> void Join(const ExitLinks &other, TC &tc) {
             IntersectKills(overwrites, other.overwrites);
             JoinStores(stores, other.stores);
             prefixes.Join(other.prefixes);
-            suffixes.Combine(tc, other.suffixes, [](const auto &a, const auto &b) { return SuffixEffects::Join(a, b, false); });
+            counts.Combine(tc, other.counts, [](const auto &a, const auto &b) { return SuffixEffects::Join(a, b, false); });
         }
         bool operator==(const ExitLinks &) const = default;
     };

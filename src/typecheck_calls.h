@@ -2133,11 +2133,13 @@ inline void TypeCheck::NoteExit(int tf, Node *at, vector<RetRoot> results,
         auto spec = frames[current].spec;
         FnRecord::ExitLinks exit { CallerKills(spec, true), cur.links.ClassStores(), cur.links.prefixes };
         if (spec && !spec->incycle && !spec->sf->isrec) {
-            exit.suffixes = BodySuffixes();
-            erase_if(exit.suffixes.changes, [&](const auto &p) {
+            exit.counts = BodyCounts();
+            auto local = [&](const auto &p) {
                 auto base = p.first->base;
                 return (base->ownerspec == spec && !base->isparam) || p.second.owner->ownerspec == spec;
-            });
+            };
+            erase_if(exit.counts.fresh.changes, local);
+            erase_if(exit.counts.length.changes, local);
         }
         exit.prefixes.Forget([&](VarDef *v) {
             return v->ownerspec == spec && !(v->isparam && !v->isvar && IsAddressRef(v->type));
@@ -3220,7 +3222,7 @@ inline bool TypeCheck::SameRecord(const FnRecord &a, const FnRecord &b, const Fn
                        p.maybeassigned == q.maybeassigned && sameresults(p.results, q.results);
             })) return why("nonlocal exits");
     auto sameeffect = [&](const ShrinkEffect &p, const ShrinkEffect &q) {
-        return p.balance == q.balance && p.preserves == q.preserves && p.keepslinks == q.keepslinks && p.replacesif == q.replacesif &&
+        return p.balance == q.balance && p.preserves == q.preserves && p.keepslinks == q.keepslinks && p.retained == q.retained && p.replacesif == q.replacesif &&
                sametype(p.replaced, q.replaced) && sametype(p.arrayreceiver, q.arrayreceiver);
     };
     auto sameshrinks = [&](const auto &x, const auto &y) {
