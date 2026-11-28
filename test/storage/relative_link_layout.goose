@@ -189,6 +189,14 @@ fn bound_indices() {
 }
 
 struct InitNode { tag: i64 = 0, next: InitNode&<u32>? }
+
+fn conditional_rebind(flag: bool) {
+    var nodes: InitNode[>..] = [InitNode {}; 3];
+    nodes[1].next .= if flag { nodes[0] } else { nodes[1] };
+    nodes.pop();
+    if flag { assert(nodes[1].next .== nodes[0]); }
+    else { assert(nodes[1].next .== nodes[1]); }
+}
 struct FirstLink { selected: i64&<u32>?, value: i64 = 7 }
 
 fn assign_first_field(nodes: FirstLink[>..]&, index: i64&) {
@@ -563,6 +571,8 @@ fn deferred_clear(i: i64) {
 }
 
 fn main() {
+    conditional_rebind(false);
+    conditional_rebind(true);
     bound_indices();
     assign_whole_elements(1);
     pop_resized_slots();

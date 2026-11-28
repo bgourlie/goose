@@ -3697,10 +3697,11 @@ inline void TypeCheck::CheckRebind(Assign *a, LVal &lv) {
         // explicit & is not redundant here as it is at a binding destination.
         SlotScope ss(*this, true);
         Saved binding(cur.bindingread, a->rhs);
+        // Each returning arm fits its reference at this same destination.
+        if (IsSelfRelRef(target)) curdst.element = { a, a->rhs };
         v = CheckV(a->rhs, target);
         if (BindsRef(v, target)) a->rhs = AutoRef(a->rhs, v, !target->cq);
         wasplain = IsPlainRef(v.type);
-        if (IsSelfRelRef(target)) curdst.element = { a, a->rhs };
         MustFit(v, a->rhs, target);
     }
     a->rhs->exprtype = v.type;
