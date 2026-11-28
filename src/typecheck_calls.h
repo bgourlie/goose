@@ -2140,6 +2140,7 @@ inline void TypeCheck::NoteExit(int tf, Node *at, vector<RetRoot> results,
             };
             erase_if(exit.counts.fresh.changes, local);
             erase_if(exit.counts.length.changes, local);
+            erase_if(exit.counts.headroom.changes, local);
         }
         exit.prefixes.Forget([&](VarDef *v) {
             return v->ownerspec == spec && !(v->isparam && !v->isvar && IsAddressRef(v->type));

@@ -469,6 +469,8 @@ struct TypeCheck {
                 return var && expired(*var);
             });
             for (auto it = live.begin(); it != live.end();) {
+                auto &source = it->second.source;
+                if (source.header && expired(source.header->base)) source = {};
                 auto &target = it->second.target;
                 if (target.header && expired(target.header->base)) target = {};
                 auto field = it->first.boundfield;
@@ -3153,7 +3155,7 @@ struct TypeCheck {
     const string *EmbedShader(Call *c, vector<Node *> &args);
     const string *EmbedFile(Call *c, vector<Node *> &args);
     void CheckGrowShrink(Node *at, const BuiltinDef &op, Node *recv, const Val &rv, CountProof preserves,
-                         CountProof empties, const LinkField *popheader, int64_t popped, ArrayPrefix retained);
+                         CountProof empties, const LinkField *popheader, int64_t popped, const RetainedLength &retained);
     bool RelyOnCountProof(CountProof proof, Node *at, const char *use);
     bool LiveConversionTargets(const ValueLinks &links, CountProof whole, Node *at);
     void GrowOnlyAssignKnown(Assign *a, const Roots &built, bool whole);
@@ -3164,7 +3166,7 @@ struct TypeCheck {
     using GlobalSlots = map<TypeExpr *, CountProof>;
     ValueLinks LiveElementLinks(VarDef *owner, TypeExpr *target = nullptr,
                                TypeExpr *replaced = nullptr, bool callerchecks = false, Node *shrink = nullptr,
-                               GlobalSlots *globalSlots = nullptr, CountProof *requirements = nullptr, ArrayPrefix retained = {});
+                               GlobalSlots *globalSlots = nullptr, CountProof *requirements = nullptr, RetainedSlots retained = {});
     // Whether a shrink whose receiver has these roots knows the arrays it
     // frees: none is static data or a temporary (§5.1).
     static bool ShrinkRootsKnown(const Roots &roots) {
@@ -3236,13 +3238,6 @@ struct TypeCheck {
         auto result = *cur.iterationprefix;
         result.Combine(*this, cur.links.counts, SuffixEffects::Sequence);
         return result;
-    }
-    int64_t RetainedAfterPop(const LinkField *header, VarDef *owner, int64_t count) {
-        if (!header || !owner || count <= 0) return -1;
-        auto paths = cur.links.counts.length.PathsFor(*this, header, owner);
-        if (cur.iterationprefix)
-            paths = SuffixEffects::Sequence(cur.iterationprefix->length.PathsFor(*this, header, owner), paths);
-        return std::max<int64_t>(0, SuffixEffects::Guaranteed(paths, 0) - count);
     }
     void RecordConstructedLength(const Dest &dest, TypeExpr *type, const ArrayExtent &extent);
     bool TracksLength(VarDef *owner, bool exact) {
@@ -3331,7 +3326,7 @@ struct TypeCheck {
     void RecordElementLinks(const Dest &dest, TypeExpr *type, const ValueLinks &links, Node *at);
     void StoreElementLink(const Dest &dest, TypeExpr *type, ElementLink link, Node *at,
                           const Roots &borrowed, string_view path = {}, const LinkField &target = {},
-                          LiveTarget liveprefix = {}, ArrayPrefix targetprefix = {});
+                          LiveTarget liveprefix = {}, ArrayPosition targetpos = {});
     void FinishFill(ArrayLit *fill, const Dest &dest);
     void RecordLinkStore(const Roots &owners, TypeExpr *reached, ElementLink link, Node *at,
                          LinkLocation place = {}, const LinkField &field = {}, const LinkField &target = {},
@@ -3465,7 +3460,7 @@ struct TypeCheck {
     using ElementPath = small_vector<ElementPosition, 2>;
     ElementPath InlineElementPath(Node *n, bool destination);
     bool BackwardElementOrder(const ElementPosition &slot, const ElementPosition &target, bool consecutive, bool written);
-    ArrayPrefix GrowArrayTarget(Node *value);
+    ArrayPosition GrowArrayPosition(Node *value, bool destination);
     bool BackwardElementLink(const AssignedElement &element, Node *value, const Val &read);
     // An array a shrink may free (§5.1, §5.2): the one in root's own storage,
     // or, where root cannot hold one, one its storage leads to through the
@@ -3487,7 +3482,7 @@ struct TypeCheck {
     // what part of the caller's holders a callee's kills empty (Kill); null
     // for an argument that is no expression of the call's.
     void ApplyCalleeShrinks(Node *at, FnSpec *spec, vector<Val> &argvals, string_view name,
-                            const vector<Node *> &argnodes, bool applyexits = false);
+                            const vector<Node *> &argnodes, bool applyexits, const SuffixEffects &entryheadroom);
     // A shrink's scan sees the views of the activation only, and takes a
     // parameter's class for an array of its own: whether an argument was a
     // view of the shrunk array, or the shrunk array one the activation's
@@ -3721,8 +3716,11 @@ struct TypeCheck {
         if (cur.probingtypes) return;
         if (hasdefers && reachable) ApplyCalleeReads(spec, args);
         // A nonlocal exit can unwind a caller's defer inside shrink replay.
+        // The unordered growth log must forget upper bounds. An ordered shrink
+        // or exit transfer can instead start at the actual call-entry length.
+        auto entryheadroom = cur.links.counts.headroom;
         ApplyCalleeGrows(at, spec, args, name);
-        ApplyCalleeShrinks(at, spec, args, name, argnodes, applyexits);
+        ApplyCalleeShrinks(at, spec, args, name, argnodes, applyexits, entryheadroom);
     }
     // Whether an element pushed into, or allocated in, an array of `elem`
     // is built in place at its slot, as codegen builds it (ElemValue): a

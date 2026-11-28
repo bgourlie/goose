@@ -35,7 +35,9 @@ inline void TypeCheck::RecordConstructedLength(const Dest &dest, TypeExpr *type,
     if (!header || (header->base->isvar && header->base->type && IsRefOrSlice(header->base->type))) return;
     auto array = FieldPathType(header->base, header->path);
     if (!array || !IsArrayKind(array, A_GROW)) return;
-    cur.links.counts.length.changes[CanonicalSuffixHeader(header)] = { owner, {{ extent.length, SuffixEffects::discarded }} };
+    header = CanonicalSuffixHeader(header);
+    cur.links.counts.length.changes[header] = { owner, {{ extent.length, SuffixEffects::discarded }} };
+    cur.links.counts.headroom.changes[header] = { owner, {{ INT64_MAX - extent.length, SuffixEffects::discarded }} };
 }
 
 inline const LinkField *TypeCheck::CanonicalSuffixHeader(const LinkField *header) {
@@ -978,10 +980,6 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
             default: assert(false);
         }
     }
-    // An appended result can occupy the receiving stack while under
-    // construction even when its final live element count is zero.
-    if (push && reachable) grow();
-    if (countedgrowth && d.kind == B_APPEND) grow(!reachable || added == 0);
     if (reachable && (d.kind == B_PUSH || (d.kind == B_APPEND && added != 0) ||
                       (d.kind == B_RESIZE && args.size() == 3)))
         NoteLimitedReplacement(c, rv, elem, rv.ElementPlace(ast.places));
@@ -1018,14 +1016,23 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
     if (header && TracksSuffix(suffixowner, true)) before = cur.links.counts.fresh.PathsFor(*this, header, suffixowner);
     SuffixEffects::Paths beforelength;
     if (header && TracksLength(suffixowner, true)) beforelength = cur.links.counts.length.PathsFor(*this, header, suffixowner);
+    SuffixEffects::Paths beforeheadroom;
+    if (!beforelength.empty()) beforeheadroom = cur.links.counts.headroom.PathsFor(*this, header, suffixowner);
+    // The growth log invalidates potentially aliased upper bounds. Use the
+    // count before that invalidation for the exact, normally completing append.
+    if (push && reachable) grow();
+    if (countedgrowth && d.kind == B_APPEND) grow(!reachable || added == 0);
     if (ak == A_GROW && shrink) {
-        auto retained = resized >= 0 ? resized : RetainedAfterPop(header, suffixowner, popped);
-        CheckGrowShrink(c, d, args[0], rv, preserves, empties, header, popped,
-                        header && retained > 0 ? ArrayPrefix{header, retained} : ArrayPrefix{});
+        auto retained = RetainedLength::After(header, resized, popped);
+        CheckGrowShrink(c, d, args[0], rv, preserves, empties, header, popped, retained);
         if (!beforelength.empty()) {
-            if (resized >= 0)
-                cur.links.counts.length.changes[header] = { suffixowner, {{ resized, SuffixEffects::discarded }} };
-            else if (popped > 0) cur.links.counts.length.Shift(header, suffixowner, beforelength, -popped);
+            if (resized >= 0) {
+                cur.links.counts.length.changes[header] = { suffixowner, retained.length };
+                cur.links.counts.headroom.changes[header] = { suffixowner, retained.headroom };
+            } else if (popped > 0) {
+                cur.links.counts.length.Shift(header, suffixowner, beforelength, -popped);
+                cur.links.counts.headroom.Shift(header, suffixowner, beforeheadroom, popped);
+            }
         }
         if (popped > 0 && popped < fresh) cur.links.fresh[header] = { suffixowner, fresh - popped };
         if (!before.empty() && popped > 0)
@@ -1037,6 +1044,8 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
     if (header && added > 0) {
         if (!beforelength.empty() && resized < 0)
             cur.links.counts.length.Shift(header, suffixowner, beforelength, added);
+        if (!beforeheadroom.empty() && (push || d.kind == B_APPEND))
+            cur.links.counts.headroom.Shift(header, suffixowner, beforeheadroom, -added);
         // A link installed during construction could already target the new slot.
         auto intoarray = [&](const StoreEvent &e) {
             return e.elementlink.direction == EL_ANY && MayAliasRoots(rv.Root(), true, e.container, !e.bound) != AL_NO;
@@ -1720,7 +1729,7 @@ inline const string *TypeCheck::EmbedShader(Call *c, vector<Node *> &args) {
 // the storage the struct lies in, as a reference to the field would.
 inline void TypeCheck::CheckGrowShrink(Node *at, const BuiltinDef &op, Node *recv, const Val &rv,
                                        CountProof preserves, CountProof empties,
-                                       const LinkField *popheader, int64_t popped, ArrayPrefix retained) {
+                                       const LinkField *popheader, int64_t popped, const RetainedLength &retained) {
     auto at_type = IsPlainRef(rv.type) ? rv.type->ref->sub : rv.type;
     assert(at_type->kind == TY_ARRAY);
     auto roots = rv.AsRoots();
@@ -1772,7 +1781,7 @@ inline bool TypeCheck::RetainsRelativeSlot(TypeExpr *part, TypeExpr *array, Type
 // also carry links into a body from its caller, until a proven overwrite.
 inline ValueLinks TypeCheck::LiveElementLinks(VarDef *owner, TypeExpr *target, TypeExpr *replaced,
                                               bool callerchecks, Node *shrink, GlobalSlots *globalSlots,
-                                              CountProof *requirements, ArrayPrefix retained) {
+                                              CountProof *requirements, RetainedSlots retained) {
     if (!owner->elementlinks) return {};
     auto storage = OwnerType(owner);
     auto t = storage ? LoadType(storage) : target;
@@ -1822,8 +1831,7 @@ inline ValueLinks TypeCheck::LiveElementLinks(VarDef *owner, TypeExpr *target, T
     for (auto &[part, write] : cur.links.live) {
         if (part.owner != owner) continue;
         if (storage && cleared && write.at < since) continue;
-        if (retained.header && retained.header == write.target.header && write.target.length <= retained.length)
-            continue;
+        if (retained.Keeps(write.target) || retained.Drops(write.source)) continue;
         retain(part.link, part.field, part.target, write.suffix,
                write.liveprefix.array == owner ? write.liveprefix.proof : CountProof(), write.cleared);
     }
@@ -2697,20 +2705,29 @@ inline void TypeCheck::CheckLinkShrink(LinkShrink s) {
     if (!reachable || cur.probingtypes) return;
     if (s.popheader && s.popped > 0 && s.popped <= cur.links.FreshCount(s.popheader, SuffixOwner(s.owner)))
         s.effect.keepslinks = true;
-    if (!s.effect.retained.header) {
-        auto length = RetainedAfterPop(s.popheader, SuffixOwner(s.owner), s.popped);
-        if (length > 0) s.effect.retained = { s.popheader, length };
-    }
     if (cur.deferring) {
         cur.deferring->shrinks.emplace_back(s, CurrentLinkEffects());
         return;
     }
+    auto &retained = s.effect.retained;
+    if (retained.header) {
+        auto owner = SuffixOwner(s.owner);
+        auto prepend = [&](auto member, SuffixEffects::Paths after) {
+            auto before = (cur.links.counts.*member).PathsFor(*this, retained.header, owner);
+            if (cur.iterationprefix)
+                before = SuffixEffects::Sequence((cur.iterationprefix->*member).PathsFor(*this, retained.header, owner), before);
+            return SuffixEffects::Sequence(before, after);
+        };
+        retained.length = prepend(&ArrayCountEffects::length, std::move(retained.length));
+        retained.headroom = prepend(&ArrayCountEffects::headroom, std::move(retained.headroom));
+    }
+    auto bounds = retained.Bounds();
     GlobalSlots slots;
     const auto &effect = s.effect;
     if (!effect.keepslinks && !effect.preserves.Committed()) {
         auto safe = [&](TypeExpr *replaced, CountProof proof, GlobalSlots &views) {
             auto links = LiveElementLinks(s.owner, s.array, replaced, !s.viaclass, s.at,
-                                          s.owner->isglobal && !s.viaclass ? &views : nullptr, &proof, effect.retained);
+                                          s.owner->isglobal && !s.viaclass ? &views : nullptr, &proof, bounds);
             return links.MayPointForward() ? CountProof(false) : proof;
         };
         auto proof = safe(effect.replacesif.Committed() ? effect.replaced : nullptr, true, slots);
@@ -2729,6 +2746,9 @@ inline void TypeCheck::CheckLinkShrink(LinkShrink s) {
         if (!proof.Unconditional())
             erase_if(cur.links.live, [](const auto &entry) { return entry.second.cleared.Committed(); });
     }
+    // A slot removed on this path no longer contains a link if the array grows again.
+    if (bounds.header)
+        erase_if(cur.links.live, [&](const auto &p) { return p.first.owner == s.owner && bounds.Drops(p.second.source); });
     if (s.viaclass) return;
     if (s.owner->isglobal) NoteGlobalShrink(s, std::move(slots));
     NoteShrink(s.owner, s.bound, effect);
@@ -2996,7 +3016,7 @@ inline void TypeCheck::RecordElementLinks(const Dest &dest, TypeExpr *type, cons
 
 inline void TypeCheck::StoreElementLink(const Dest &dest, TypeExpr *type, ElementLink link, Node *at,
                                        const Roots &borrowed, string_view path, const LinkField &target,
-                                       LiveTarget liveprefix, ArrayPrefix targetprefix) {
+                                       LiveTarget liveprefix, ArrayPosition targetpos) {
     if (!reachable || dest.discarded || dest.roots.None()) return;
     auto reached = dest.reached ? dest.reached : type;
     std::optional<FnRecord::LimitedSuffix> suffix;
@@ -3018,8 +3038,11 @@ inline void TypeCheck::StoreElementLink(const Dest &dest, TypeExpr *type, Elemen
     auto bound = dest.boundsteps ? ast.places.Project(dest.boundfield, path) : dest.boundfield;
     auto indexed = dest.indexed;
     indexed.element = ast.places.Project(indexed.element, path);
+    ArrayPosition source;
+    if (link.direction == EL_ANY && dest.element.assignment)
+        source = GrowArrayPosition(dest.element.assignment->lval, true);
     RecordLinkStore(dest.roots, reached, link, at, dest.place, field, target, bound,
-                    { suffix, liveprefix, cleared, targetprefix }, indexed);
+                    { suffix, liveprefix, cleared, targetpos, source }, indexed);
 }
 
 inline void TypeCheck::FinishFill(ArrayLit *fill, const Dest &dest) {
@@ -3070,6 +3093,7 @@ inline void TypeCheck::RecordLinkStore(const Roots &owners, TypeExpr *reached,
         if (d.bound || !owners.Exact() || d.root != owners.Root()) {
             write.liveprefix = nullptr;
             write.target = {};
+            write.source = {};
         }
         cur.links.Store(*this, storeevents.back(), index, write);
     }
@@ -4298,8 +4322,7 @@ inline void TypeCheck::NoteRootEvent(VarDef *root, P param, X external) {
 // it is.
 inline void TypeCheck::NoteShrink(VarDef *root, TypeExpr *bound, ShrinkEffect effect) {
     auto merge = [&](ShrinkEffect &prior) {
-        if (prior.retained.header != effect.retained.header) prior.retained = {};
-        else prior.retained.length = std::min(prior.retained.length, effect.retained.length);
+        prior.retained.Join(effect.retained);
         prior.balance = std::max(prior.balance, effect.balance);
         if (!prior.arrayreceiver || !effect.arrayreceiver ||
             !TopConstEq(prior.arrayreceiver, effect.arrayreceiver)) prior.arrayreceiver = nullptr;
@@ -4631,19 +4654,19 @@ inline bool TypeCheck::BackwardElementOrder(const ElementPosition &slot, const E
 
 // Only an address into the growable array establishes an absolute element
 // position. Reading a reference stored at that position loads a different target.
-inline ArrayPrefix TypeCheck::GrowArrayTarget(Node *value) {
-    auto path = AddressedPath(value);
-    if (path == value && !Is<Ident>(path)) return {};
-    for (auto &position : InlineElementPath(path, false)) {
+inline ArrayPosition TypeCheck::GrowArrayPosition(Node *value, bool destination) {
+    auto path = destination ? value : AddressedPath(value);
+    if (!destination && path == value && !Is<Ident>(path)) return {};
+    for (auto &position : InlineElementPath(path, destination)) {
         auto ix = Is<Index>(position.base);
         auto id = Is<Ident>(position.base);
         auto origin = id && id->vdef ? id->vdef->elementorigin : nullptr;
         if (origin && !InScope(origin, origin->elementdecl)) origin = nullptr;
         auto header = ix ? ix->arrayheader : origin ? origin->elementarray : nullptr;
         auto index = ix ? ix->constantindex : origin ? origin->elementindex : -1;
-        if (!header || index < 0 || index == INT64_MAX) continue;
-        if (IsArrayKind(FieldPathType(header->base, header->path), A_GROW))
-            return { CanonicalSuffixHeader(header), index + 1 };
+        if (!header || index < 0) continue;
+        auto array = FieldPathType(header->base, header->path);
+        if (array && IsArrayKind(array, A_GROW)) return { CanonicalSuffixHeader(header), index };
     }
     return {};
 }
@@ -5372,7 +5395,8 @@ inline void TypeCheck::ApplyCalleeLiveShrinks(Node *at, FnSpec *spec, vector<Val
 // back edge applies the shrinks of the round before (RecordOf), and none
 // in the cycle's first round.
 inline void TypeCheck::ApplyCalleeShrinks(Node *at, FnSpec *spec, vector<Val> &argvals,
-                                          string_view name, const vector<Node *> &argnodes, bool applyexits) {
+                                          string_view name, const vector<Node *> &argnodes, bool applyexits,
+                                        const SuffixEffects &entryheadroom) {
     // The callee may store into what the caller emptied in ways no event
     // shows (a store of its own unrecorded, one of a nested function's
     // re-applied in place), so a kill of the caller's outlasts a call only
@@ -5463,12 +5487,14 @@ inline void TypeCheck::ApplyCalleeShrinks(Node *at, FnSpec *spec, vector<Val> &a
                 state.cleared = it->second.cleared;
                 auto &from = spec->record.classevents[origins[i]];
                 if (!e.bound) {
-                    auto prefix = it->second.target;
-                    if (prefix.header) {
+                    auto project = [&](ArrayPosition p) -> ArrayPosition {
+                        if (!p.header) return {};
                         auto mapped = MapClass(spec, from.container, argvals);
-                        if (auto header = CallerSuffixHeader(spec, argvals, prefix.header, from.container, mapped))
-                            state.target = { header, prefix.length };
-                    }
+                        auto header = CallerSuffixHeader(spec, argvals, p.header, from.container, mapped);
+                        return header ? ArrayPosition { header, p.index } : ArrayPosition {};
+                    };
+                    state.target = project(it->second.target);
+                    state.source = project(it->second.source);
                     auto fields = PlacePaths::Of(ast.places.PathOf(from.linktarget), ast.places);
                     state.liveprefix = CallerLiveTarget(it->second.liveprefix, fields,
                                                         e.container, spec, argvals, survivingargs);
@@ -5531,7 +5557,12 @@ inline void TypeCheck::ApplyCalleeShrinks(Node *at, FnSpec *spec, vector<Val> &a
                     auto mapped = MapClass(spec, owner, argvals);
                     if (mapped.Root() == h.root) {
                         auto header = CallerSuffixHeader(spec, argvals, h.effect.retained.header, owner, mapped);
-                        if (header) effect.retained = { header, h.effect.retained.length };
+                        if (header) {
+                            effect.retained = h.effect.retained;
+                            effect.retained.header = header;
+                            auto owner = SuffixOwner(h.root);
+                            cur.links.counts.headroom.changes[header] = { owner, entryheadroom.PathsFor(*this, header, owner) };
+                        }
                         popheader = CallerSuffixHeader(spec, argvals, h.order->popheader, owner, mapped);
                     }
                 }
@@ -5753,7 +5784,11 @@ inline void TypeCheck::ApplyCalleeShrinks(Node *at, FnSpec *spec, vector<Val> &a
                 else cur.links.fresh.erase(header);
                 cur.links.counts.fresh.changes[header] = { owner, entrylinks.counts.fresh.PathsFor(*this, header, owner) };
             }
-            cur.links.ApplyCounts(*this, { std::move(suffix), CallerCountEffects(spec, argvals, exit.counts.length) });
+            auto headroom = CallerCountEffects(spec, argvals, exit.counts.headroom);
+            for (auto &[header, change] : headroom.changes)
+                cur.links.counts.headroom.changes[header] = { change.owner, entryheadroom.PathsFor(*this, header, change.owner) };
+            cur.links.ApplyCounts(*this, { std::move(suffix), CallerCountEffects(spec, argvals, exit.counts.length),
+                                           std::move(headroom) });
         }
         if (!spec->inprogress) ApplyCalleePrefixes(exit.prefixes, spec, argvals);
     };
@@ -5932,10 +5967,27 @@ inline void TypeCheck::RecordGrowth(Node *at, const Roots &roots, const string &
                                     GrowthEffect effect, const LinkField *field) {
     if (cur.probingtypes) return;
     bool changeslength = effect != GrowthEffect::StorageOnly && (!arr || IsArrayKind(arr, A_GROW) || IsArrayKind(arr, A_LIMITED));
-    if (changeslength && roots.unknown) InvalidateLengths(nullptr, false, arr, field);
+    // An arbitrary growth invalidates upper bounds. A counted operation can
+    // then install its precise transfer for the exact header it changed.
+    auto forgetceiling = [&](VarDef *owner, bool exact) {
+        if (!reachable || (arr && !IsArrayKind(arr, A_GROW)) || !TracksLength(owner, exact)) return;
+        auto &upper = cur.links.counts.headroom;
+        if (owner) upper.Forget(*this, SuffixOwner(owner), exact);
+        else {
+            upper.changes.clear();
+            upper.invaliddepth = INT_MAX;
+        }
+    };
+    if (changeslength && roots.unknown) {
+        InvalidateLengths(nullptr, false, arr, field);
+        forgetceiling(nullptr, false);
+    }
     for (auto &a : roots.alts) {
         auto root = a.root;
-        if (changeslength && (root || !a.exact)) InvalidateLengths(root, a.exact, arr, field);
+        if (changeslength && (root || !a.exact)) {
+            InvalidateLengths(root, a.exact, arr, field);
+            if (!IsTemp(root)) forgetceiling(root, a.exact);
+        }
         if (!root || IsTemp(root)) continue;
         cur.growlog.push_back({ at, root, a.exact, what, false, arr, effect, field });
         auto note = [&](vector<FnRecord::Growth> &growths) {

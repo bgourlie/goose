@@ -1817,7 +1817,7 @@ inline bool TypeCheck::FitsAt(Val &v, TypeExpr *dt, bool delivered, Node *conver
                     auto prefix = LivePrefixTarget(fitnode);
                     if (prefix.array && (PrefixOwner(prefix.array) != have || have != want)) prefix = {};
                     StoreElementLink(curdst, dt, link, fitnode, links, {}, target, prefix,
-                                     backward ? ArrayPrefix{} : GrowArrayTarget(fitnode));
+                                     backward ? ArrayPosition{} : GrowArrayPosition(fitnode, false));
                 }
                 v.type = dt;
                 return true;

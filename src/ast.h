@@ -2851,36 +2851,6 @@ inline bool CountProof::Committed() const {
 // new elements into the caller's holders before popping them.
 enum ShrinkBalance { SB_BALANCED, SB_UNBALANCED };
 
-// The first length elements of one exact array header.
-struct ArrayPrefix {
-    const LinkField *header = nullptr;
-    int64_t length = 0;
-    bool operator==(const ArrayPrefix &) const = default;
-};
-
-// An emptying operation can discard both ends of an internal link. Keep
-// the part it replaces: clearing a struct's tail leaves its header live.
-struct ShrinkEffect {
-    ShrinkBalance balance;
-    TypeExpr *replaced;
-    TypeExpr *arrayreceiver = nullptr; // A shrink of this array alone preserves its owner's fixed fields.
-    ArrayPrefix retained;          // Slots below this length survive in this header.
-    CountProof preserves;          // No slot is removed.
-    bool keepslinks = false;       // Removing a fresh suffix preserves every pre-existing link target.
-    CountProof replacesif = true;  // A removing operation empties 'replaced' under this condition.
-    ShrinkEffect(ShrinkBalance b = SB_UNBALANCED, TypeExpr *r = nullptr)
-        : balance(b), replaced(r) {}
-};
-
-// A shrink a body records against what one of its parameters' or outside
-// roots' storage only leads to, through the references it holds: an array
-// of the given type (TypeCheck::ShrinkTargets).
-template<typename K> struct BoundShrink {
-    K key;
-    TypeExpr *type = nullptr;
-    ShrinkEffect effect;
-};
-
 // Each pair of relative overwrites guarantees its common storage: the
 // narrower field if one contains the other. Ordinary holder overwrites
 // describe exact paths. Several pairs can prove the same field.
@@ -3280,20 +3250,86 @@ struct SuffixEffects {
 // These counts share the same transfer and join rules. A forward-link
 // store can invalidate the fresh suffix without changing the array length.
 struct ArrayCountEffects {
-    SuffixEffects fresh, length;
-    bool Empty() const { return fresh.Empty() && length.Empty(); }
+    SuffixEffects fresh, length, headroom;
+    bool Empty() const { return fresh.Empty() && length.Empty() && headroom.Empty(); }
     template<typename TC, typename F> void Combine(TC &tc, const ArrayCountEffects &other, F combine) {
         fresh.Combine(tc, other.fresh, combine);
         length.Combine(tc, other.length, combine);
+        headroom.Combine(tc, other.headroom, combine);
     }
     template<typename F> void ForgetBindings(F expired) {
         fresh.ForgetBindings(expired);
         length.ForgetBindings(expired);
+        headroom.ForgetBindings(expired);
     }
     template<typename TC> ArrayCountEffects OverRuns(TC &tc, int64_t lo, int64_t hi) const {
-        return { fresh.OverRuns(tc, lo, hi), length.OverRuns(tc, lo, hi) };
+        return { fresh.OverRuns(tc, lo, hi), length.OverRuns(tc, lo, hi), headroom.OverRuns(tc, lo, hi) };
     }
     bool operator==(const ArrayCountEffects &) const = default;
+};
+
+// Absolute indices in a particular grow-only array, including its inline fields.
+struct ArrayPosition {
+    const LinkField *header = nullptr;
+    int64_t index = 0;
+    bool operator==(const ArrayPosition &) const = default;
+};
+
+struct RetainedSlots {
+    const LinkField *header = nullptr;
+    int64_t min = 0, max = INT64_MAX;
+    bool Drops(ArrayPosition source) const { return header && source.header == header && source.index >= max; }
+    bool Keeps(ArrayPosition target) const { return header && target.header == header && target.index < min; }
+};
+
+// Both ends are lower-bound transfers: headroom is INT64_MAX minus length.
+// Keeping the transfer until a call or defer is applied lets each shrink use
+// the length at that operation, including preceding changes in the body.
+struct RetainedLength {
+    const LinkField *header = nullptr;
+    SuffixEffects::Paths length, headroom;
+    bool operator==(const RetainedLength &) const = default;
+
+    static RetainedLength After(const LinkField *header, int64_t resized, int64_t popped) {
+        if (!header) return {};
+        if (resized >= 0)
+            return { header, {{ resized, SuffixEffects::discarded }}, {{ INT64_MAX - resized, SuffixEffects::discarded }} };
+        if (popped > 0) return { header, {{ 0, -popped }}, {{ popped, popped }} };
+        return {};
+    }
+    void Join(const RetainedLength &other) {
+        if (header != other.header) { *this = {}; return; }
+        if (!header) return;
+        length = SuffixEffects::Join(std::move(length), other.length, false);
+        headroom = SuffixEffects::Join(std::move(headroom), other.headroom, false);
+    }
+    RetainedSlots Bounds() const {
+        if (!header) return {};
+        return { header, SuffixEffects::Guaranteed(length, 0), INT64_MAX - SuffixEffects::Guaranteed(headroom, 0) };
+    }
+};
+
+// An emptying operation can discard both ends of an internal link. Keep
+// the part it replaces: clearing a struct's tail leaves its header live.
+struct ShrinkEffect {
+    ShrinkBalance balance;
+    TypeExpr *replaced;
+    TypeExpr *arrayreceiver = nullptr; // A shrink of this array alone preserves its owner's fixed fields.
+    RetainedLength retained;       // Length after this removal relative to the incoming length.
+    CountProof preserves;          // No slot is removed.
+    bool keepslinks = false;       // Removing a fresh suffix preserves every pre-existing link target.
+    CountProof replacesif = true;  // A removing operation empties 'replaced' under this condition.
+    ShrinkEffect(ShrinkBalance b = SB_UNBALANCED, TypeExpr *r = nullptr)
+        : balance(b), replaced(r) {}
+};
+
+// A shrink a body records against what one of its parameters' or outside
+// roots' storage only leads to, through the references it holds: an array
+// of the given type (TypeCheck::ShrinkTargets).
+template<typename K> struct BoundShrink {
+    K key;
+    TypeExpr *type = nullptr;
+    ShrinkEffect effect;
 };
 
 // The analysis a checked body exposes to its callers. A recursive round
@@ -3429,11 +3465,13 @@ struct FnRecord {
         LiveTarget liveprefix;             // The target is live in this array or array parameter.
         CountProof cleared;                // A named-zero resize can have removed this slot.
 
-        ArrayPrefix target;                // A prefix containing the target of this store.
+        ArrayPosition target, source;      // Maximum target and minimum source indices over possible stores.
 
         void Include(const LinkState &other) {
             if (target.header != other.target.header) target = {};
-            else target.length = std::max(target.length, other.target.length);
+            else target.index = std::max(target.index, other.target.index);
+            if (source.header != other.source.header) source = {};
+            else source.index = std::min(source.index, other.source.index);
             if (suffix && other.suffix && suffix->path == other.suffix->path)
                 suffix->guard = suffix->guard.Both(other.suffix->guard);
             else suffix.reset();
