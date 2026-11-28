@@ -3450,12 +3450,17 @@ inline Val TypeCheck::CheckAssignedValue(Assign *a, TypeExpr *target, TypeExpr *
     // result starts writing early only if it needs its destination's address.
     // A runtime-capacity limited array copies the completed source (§4.4).
     Construction construction { true };
+    // A final reference field or reference slot names a pointee outside
+    // the containing element. A reference binding can identify the element itself.
+    if (IsAggregate(target) && HasRelRefT(target) &&
+        (!IsRefOrSlice(a->lval->exprtype) || Is<Ident>(a->lval)))
+        dest.element = { a, a->rhs, true };
     NoteLimitedReplacement(a, built, target, built.place);
     if (IsArrayKind(target, A_LIMITED) && FixedPlacedResult(target))
         NoteStorageWrite(built, target, built.place, reachable, StorageWrite::PrefixOnly);
-    if (hasdefers && IsAggregate(target)) {
-        if (ClassOf(target) == SC_RESIZABLE) NoteStorageWrite(built, target, built.place);
-        else if (FixedPlacedResult(target)) dest.construction = &construction;
+    if ((hasdefers || dest.element.assignment) && IsAggregate(target)) {
+        if (FixedPlacedResult(target)) dest.construction = &construction;
+        else if (hasdefers && ClassOf(target) == SC_RESIZABLE) NoteStorageWrite(built, target, built.place);
     }
     if (arr) {
         // The shrink excludes the value being replaced. Publish its
@@ -3692,14 +3697,9 @@ inline void TypeCheck::CheckRebind(Assign *a, LVal &lv) {
         SlotScope ss(*this, true);
         Saved binding(cur.bindingread, a->rhs);
         v = CheckV(a->rhs, target);
-        if (BindsRef(v, target)) {
-            a->rhs->exprtype = v.type;
-            a->rhs = AutoRef(a->rhs, v, !target->cq);
-        }
+        if (BindsRef(v, target)) a->rhs = AutoRef(a->rhs, v, !target->cq);
         wasplain = IsPlainRef(v.type);
-        if (IsSelfRelRef(target)) {
-            curdst.backwardlink = BackwardElementRebind(a->lval, a->rhs, v);
-        }
+        if (IsSelfRelRef(target)) curdst.element = { a, a->rhs };
         MustFit(v, a->rhs, target);
     }
     a->rhs->exprtype = v.type;

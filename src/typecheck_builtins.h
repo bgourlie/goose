@@ -4465,7 +4465,7 @@ inline bool TypeCheck::ResizesToMark(Node *recv, Node *len) {
 
 // Two completed evaluations of this integer expression give the same index
 // when nothing writes between them. Every operand must itself be a pure read.
-inline bool TypeCheck::SameIndexValue(Node *a, Node *b) {
+inline bool TypeCheck::SameIndexValue(Node *a, Node *b, bool scalarbindings) {
     if (!a->exprtype || !b->exprtype || !TopConstEq(a->exprtype, b->exprtype)) return false;
     if (auto x = Is<IntLit>(a)) {
         auto y = Is<IntLit>(b);
@@ -4474,17 +4474,21 @@ inline bool TypeCheck::SameIndexValue(Node *a, Node *b) {
     if (auto x = Is<Binary>(a)) {
         auto y = Is<Binary>(b);
         return y && IsIntT(a->exprtype) && x->op == y->op &&
-               SameIndexValue(x->left, y->left) && SameIndexValue(x->right, y->right);
+               SameIndexValue(x->left, y->left, scalarbindings) && SameIndexValue(x->right, y->right, scalarbindings);
     }
     if (auto x = Is<Unary>(a)) {
         auto y = Is<Unary>(b);
         return y && (x->op == T_MINUS || x->op == T_BITNOT) && x->op == y->op &&
-               SameIndexValue(x->child, y->child);
+               SameIndexValue(x->child, y->child, scalarbindings);
     }
     if (auto x = Is<AsCast>(a)) {
         auto y = Is<AsCast>(b);
         return y && x->totype && y->totype && IsIntT(x->totype) && x->unchecked == y->unchecked &&
-               TopConstEq(x->totype, y->totype) && SameIndexValue(x->child, y->child);
+               TopConstEq(x->totype, y->totype) && SameIndexValue(x->child, y->child, scalarbindings);
+    }
+    if (scalarbindings) {
+        auto id = Is<Ident>(a);
+        if (!id || !id->vdef || !IsIntT(id->vdef->type)) return false;
     }
     return SamePath(a, b, PathInterval::ConsecutiveReads);
 }
@@ -4539,7 +4543,8 @@ inline TypeCheck::ElementPath TypeCheck::InlineElementPath(Node *n, bool destina
 }
 
 // A suffix removal preserves the target of a retained link to the same or an earlier element.
-inline bool TypeCheck::BackwardElementOrder(const ElementPosition &slot, const ElementPosition &target) {
+inline bool TypeCheck::BackwardElementOrder(const ElementPosition &slot, const ElementPosition &target,
+                                            bool consecutive, bool written) {
     auto source = Is<Ident>(slot.base), targetref = Is<Ident>(target.base);
     auto binding = targetref ? targetref->vdef : nullptr;
     if (binding && source && source->vdef == binding && !binding->isvar && IsAddressRef(binding->type)) {
@@ -4560,29 +4565,47 @@ inline bool TypeCheck::BackwardElementOrder(const ElementPosition &slot, const E
     }
     auto a = Is<Index>(slot.base), b = Is<Index>(target.base);
     if (!b) return false;
-    if (a && slot.consecutive && SamePath(a, b, PathInterval::ConsecutiveReads)) return true;
+    consecutive &= slot.consecutive;
+    if (a && consecutive && !written && SamePath(a, b, PathInterval::ConsecutiveReads)) return true;
     auto array = a ? a->arrayheader : origin ? origin->elementarray : appended;
-    if (!array || array != b->arrayheader) return false;
+    if (!array || array != b->arrayheader) {
+        // A slice has no absolute array header. Reads of the same slice
+        // variable still share its start; writing its elements leaves the
+        // variable's own header alone.
+        auto left = a ? Is<Ident>(a->obj) : nullptr, right = Is<Ident>(b->obj);
+        if (!consecutive || !left || !right || !left->vdef || left->vdef != right->vdef ||
+            left->vdef->type->kind != TY_SLICE || !EvalMeets(a->idx, EvalRequirement::ReadOnly)) return false;
+    }
     if (b->constantindex == 0) return true; // Every valid source index is at least zero.
     if (!a) return false;
     if (a->constantindex >= 0 && b->constantindex >= 0) return b->constantindex <= a->constantindex;
     // The right-hand base runs between the two subscript evaluations. It
     // can return the same array while changing a variable the index reads.
-    return slot.consecutive && SameIndexValue(a->idx, b->idx) && EvalMeets(b->obj, EvalRequirement::ReadOnly);
+    // Even read-only field expressions can be separated by writes to the
+    // aggregate under construction. An index read through that storage can
+    // change; a by-value scalar binding is separate from the aggregate.
+    if (consecutive && SameIndexValue(a->idx, b->idx, written) &&
+        EvalMeets(b->obj, EvalRequirement::ReadOnly)) return true;
+    auto i = Is<Ident>(a->idx), j = Is<Ident>(b->idx);
+    return i && j && i->vdef && i->vdef == j->vdef && !i->vdef->isvar && IsIntT(i->vdef->type) &&
+           SameIndexedElement(i->vdef).Committed();
 }
 
-inline bool TypeCheck::BackwardElementRebind(Node *slot, Node *value, const Val &read) {
+inline bool TypeCheck::BackwardElementLink(const AssignedElement &element, Node *value, const Val &read) {
+    if (!element.assignment || !value) return false;
+    bool consecutive = element.next == value;
     Node *target = Is<Ident>(value);
     if (read.backwardslot && (Is<Dot>(value) || Is<Index>(value))) target = value;
     if (auto u = Is<Unary>(value); u && u->op == T_BITAND) {
         auto path = AddressedPath(u);
         target = path == u ? Is<Ident>(u->child) : path;
+        consecutive |= element.next == u->child;
     }
     if (!target) return false;
     auto targets = InlineElementPath(target, false);
-    for (auto &field : InlineElementPath(slot, true))
+    for (auto &field : InlineElementPath(element.assignment->lval, true))
         for (auto &to : targets)
-            if (BackwardElementOrder(field, to)) return true;
+            if (BackwardElementOrder(field, to, consecutive, element.written)) return true;
     return false;
 }
 

@@ -173,6 +173,51 @@ fn backward_link() {
     assert(nodes.len == 1);
 }
 
+struct InitNode { tag: i64 = 0, next: InitNode&<u32>? }
+struct FirstLink { selected: i64&<u32>?, value: i64 = 7 }
+
+fn assign_first_field(nodes: FirstLink[>..]&, index: i64&) {
+    nodes[index] = FirstLink { selected: nodes[index].value };
+    nodes.pop();
+}
+
+fn assign_fixed_fill(rows: FirstLink[2][>..]&, index: i64&) {
+    rows[index] = [FirstLink { selected: rows[index][0].value }; 2];
+    rows.pop();
+}
+
+fn assign_whole_elements(var i: i64) {
+    var first: FirstLink[>..] = [FirstLink {}; 3];
+    assign_first_field(first, i);
+    assert(first[i].selected .== first[i].value);
+    var filled: FirstLink[2][>..] = [[FirstLink {}; 2]; 3];
+    assign_fixed_fill(filled, i);
+    assert(filled[i][1].selected .== filled[i][0].value);
+    var nodes: InitNode[>..] = [InitNode {}; 3];
+    nodes[1] = InitNode { next: nodes[0] };
+    nodes[2] = InitNode { next: nodes[1].next };
+    {
+        let added .= nodes.push(InitNode {});
+        added = InitNode { next: nodes[0] };
+    }
+    nodes.pop();
+    assert(nodes[2].next .== nodes[0]);
+    nodes[i] = InitNode { next: nodes[i] };
+    nodes.pop();
+    assert(nodes[i].next .== nodes[i]);
+    {
+        let view = nodes[0..2];
+        view[0] = InitNode { next: view[0] };
+        view[1] = InitNode { next: view[0] };
+    }
+    nodes.pop();
+    assert(nodes[0].next .== nodes[0]);
+    var rows: Row[>..] = [Row {}; 3];
+    rows[i] = Row { cells: [RowCell {}, RowCell { link: rows[i].cells[0].value }] };
+    rows.pop();
+    assert(rows[i].cells[1].link .== rows[i].cells[0].value);
+}
+
 fn appended_link(i: i64) {
     var nodes: Node[>..] = [Node {}, Node {}];
     let previous .= nodes[i];
@@ -503,6 +548,7 @@ fn deferred_clear(i: i64) {
 }
 
 fn main() {
+    assign_whole_elements(1);
     pop_resized_slots();
     deferred_clear(0);
     clear_link(0);

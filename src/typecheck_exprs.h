@@ -1105,6 +1105,7 @@ inline Node *TypeCheck::AutoRef(Node *n, Val &v, bool writes) {
     if (!Referenceable(n, v)) NoResizableRef(n);
     if (auto id = Is<Ident>(n); id && id->vdef && writes && v.writable)
         NoteWritableRef(id->vdef, n);
+    n->exprtype = v.type; // Keep the checked path type beneath the synthesized address.
     auto u = ast.New<Unary>(n->line, T_BITAND, n);
     u->synth = true;
     SlotRoots(v);
@@ -1309,7 +1310,9 @@ inline Val TypeCheck::WholeSlice(Node *&n, const Val &array) {
 inline Val TypeCheck::CheckValue(Node *&n, TypeExpr *expected, bool callsite, bool branchcopy,
                                  bool inferred) {
     auto orig = n;
+    Saved binding(cur.bindingread, curdst.element.assignment && expected && IsSelfRelRef(expected) ? n : cur.bindingread);
     auto construction = curdst.construction;
+    FlagScope priorwrite(curdst.element.written, construction ? construction->started : curdst.element.written);
     auto run = construction && construction->run == n;
     // Control constructs pass the destination to the selected value. A
     // call can start writing it once its arguments have been evaluated.
@@ -1809,7 +1812,8 @@ inline bool TypeCheck::FitsAt(Val &v, TypeExpr *dt, bool delivered, Node *conver
                     return false;
                 }
                 if (recordingrelative && !dt->ref->pool && !curdst.result) {
-                    ElementLink link { pointee, curdst.appended || curdst.backwardlink ? EL_BACKWARD : EL_ANY };
+                    auto backward = curdst.appended || BackwardElementLink(curdst.element, fitnode, v);
+                    ElementLink link { pointee, backward ? EL_BACKWARD : EL_ANY };
                     auto prefix = LivePrefixTarget(fitnode);
                     if (prefix.array && (PrefixOwner(prefix.array) != have || have != want)) prefix = {};
                     StoreElementLink(curdst, dt, link, fitnode, links, {}, target, prefix);
@@ -3610,12 +3614,14 @@ inline TypeCheck::LitDeep TypeCheck::CheckInits(StructLit *sl, vector<Field> &fi
             });
     }
     Saved fieldcounts(curdst.countdest, ArrayCountDest::Storage);
+    bool consecutive = curdst.element.next == sl;
     for (size_t k = 0; k < sl->inits.size(); k++) {
         auto &fi = sl->inits[k];
         auto ft = ftypes[sl->fieldindices[k]];
         auto component = selft->kind == TY_STRUCT && selft->struc->st->isroot
                              ? RootComponent(rootowner, selft, sl->fieldindices[k]) : nullptr;
         DestScope ds(*this, component ? Dest(component) : curdst);
+        curdst.element.next = consecutive ? fi.val : nullptr;
         if (selft->kind == TY_STRUCT) curdst.indexed.element = ast.places.Project(curdst.indexed.element, fi.name, ".");
         else curdst.indexed = {};
         curdst.fieldsteps &= selft->kind == TY_STRUCT;
@@ -3637,6 +3643,7 @@ inline TypeCheck::LitDeep TypeCheck::CheckInits(StructLit *sl, vector<Field> &fi
             NoteLitElem(deep, fi.val, fv, ft, selft->kind == TY_STRUCT ? fi.name : string_view {});
             if (component && HoldsPlainRef(ft)) NoteHolderBinding(component, fv, fi.val);
         }
+        if (consecutive && k + 1 < sl->inits.size()) consecutive = EvalMeets(fi.val, EvalRequirement::ReadOnly);
     }
     // Check every inverted pair, not just expressions whose numeric position
     // changed: a mutation in the middle can stay put while a read crosses it.

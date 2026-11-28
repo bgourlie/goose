@@ -573,6 +573,11 @@ struct TypeCheck {
             if (dest == ArrayCountDest::Result) wrotecount = true;
         }
     };
+    struct AssignedElement {
+        Assign *assignment = nullptr; // Its location is evaluated before the right-hand side.
+        Node *next = nullptr; // Operand whose evaluation still immediately follows that selection.
+        bool written = false; // Construction had already written when this operand began.
+    };
     // The destination of the value under construction (for reference stores):
     // where the storage the value lands in may be (an lvalue's roots).
     struct Dest {
@@ -603,7 +608,7 @@ struct TypeCheck {
         // A resize's fill value: built once and copied into each slot the
         // resize adds, so no position in the array is its own (§3.9).
         bool fill = false;
-        bool backwardlink = false;    // The link targets its own element or an earlier one in the same array.
+        AssignedElement element;
         bool appended = false;       // New elements at the end of a grow-only array.
         Construction *construction = nullptr;
         ArrayCountDest countdest = ArrayCountDest::Storage;
@@ -3422,7 +3427,7 @@ struct TypeCheck {
     bool ResizesToMark(Node *recv, Node *len);
     enum class PathInterval { ConsecutiveReads, AcrossStatements };
     bool SamePath(Node *a, Node *b, PathInterval interval);
-    bool SameIndexValue(Node *a, Node *b);
+    bool SameIndexValue(Node *a, Node *b, bool scalarbindings = false);
     bool ReadBackwardSlot(const LVal &slot);
     struct ElementPosition {
         Node *base;
@@ -3431,8 +3436,8 @@ struct TypeCheck {
     };
     using ElementPath = small_vector<ElementPosition, 2>;
     ElementPath InlineElementPath(Node *n, bool destination);
-    bool BackwardElementOrder(const ElementPosition &slot, const ElementPosition &target);
-    bool BackwardElementRebind(Node *slot, Node *value, const Val &read);
+    bool BackwardElementOrder(const ElementPosition &slot, const ElementPosition &target, bool consecutive, bool written);
+    bool BackwardElementLink(const AssignedElement &element, Node *value, const Val &read);
     // An array a shrink may free (§5.1, §5.2): the one in root's own storage,
     // or, where root cannot hold one, one its storage leads to through the
     // references it holds (`bound`: root only bounds that array's lifetime).

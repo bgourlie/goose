@@ -253,6 +253,11 @@ inline Val ArrayLit::Check(TypeCheck &tc, TypeExpr *expected) {
     TypeCheck::FlagScope nofieldsteps(tc.curdst.fieldsteps, false);
     TypeCheck::FlagScope noboundsteps(tc.curdst.boundsteps, false);
     TypeCheck::Saved<IndexedSlot> noindex(tc.curdst.indexed, {});
+    // Fixed arrays share the enclosing element. A resizable array's
+    // elements have a separate order for subsequent suffix removals.
+    auto inlinearray = expected && IsArrayKind(expected, A_FIXED);
+    TypeCheck::Saved placed(tc.curdst.element, inlinearray ? tc.curdst.element : TypeCheck::AssignedElement {});
+    bool consecutive = tc.curdst.element.next == this;
     // A fixed array and an appended run write their elements in order.
     // Other array representations write their length before the elements.
     if (starts && expected && expected->kind == TY_ARRAY && !IsArrayKind(expected, A_FIXED)) {
@@ -271,6 +276,7 @@ inline Val ArrayLit::Check(TypeCheck &tc, TypeExpr *expected) {
         TypeCheck::SlotScope ss(tc, true);
         auto dest = tc.curdst;
         dest.discarded |= cnt == 0;
+        dest.element.next = consecutive ? fillval : nullptr;
         // FreezeFill evaluates the operand once, including every field of
         // a relative literal, before writing the first repeated element.
         dest.construction = nullptr;
@@ -311,7 +317,9 @@ inline Val ArrayLit::Check(TypeCheck &tc, TypeExpr *expected) {
     tc.CheckArrayCount(this, expected, (int64_t)elems.size());
     for (auto &e : elems) {
         TypeCheck::SlotScope ss(tc, true);   // An element is a slot (§9.5).
+        tc.curdst.element.next = consecutive ? e : nullptr;
         auto ev = tc.CheckValue(e, elem);
+        if (consecutive && &e != &elems.back()) consecutive = tc.EvalMeets(e, TypeCheck::EvalRequirement::ReadOnly);
         if (!elem) {
             tc.NoUntypedEmptyArray(ev, e, "the array literal around it");
             elem = ev.type;
