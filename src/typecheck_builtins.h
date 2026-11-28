@@ -70,17 +70,18 @@ inline TypeCheck::SlotRemoval TypeCheck::CountedRemoval(BuiltinKind op, const ve
         proof = proof.Both(fillpreserves);
         if (proof.Available()) return preserves(proof);
     }
-    int64_t lo, hi;
-    if (!IntConsts(count, lo, hi) || lo != hi || lo < 0) return SlotRemoval::Possible;
-    auto binding = ConstantBindings(count);
-    if (op == B_RESIZE && IsArrayKind(array, A_LIMITED) && binding == ConstantBinding::Immutable) {
-        auto whole = receiver.Exact() ? LimitedPrefix(receiver.Root(), receiver.refplace, array) : nullptr;
-        if (lo == LimitedCapacity(array, whole)) return SlotRemoval::ToCapacity;
-    }
-    if (lo != 0) return SlotRemoval::Possible;
     auto zero = op == B_POP_N ? SlotRemoval::None : SlotRemoval::All;
-    if (binding == ConstantBinding::Aliased) return SlotRemoval::Possible;
-    if (binding == ConstantBinding::Immutable) return zero;
+    auto known = KnownIndex(args[1], count);
+    if (known >= 0) {
+        if (op == B_RESIZE && IsArrayKind(array, A_LIMITED)) {
+            auto whole = receiver.Exact() ? LimitedPrefix(receiver.Root(), receiver.refplace, array) : nullptr;
+            if (known == LimitedCapacity(array, whole)) return SlotRemoval::ToCapacity;
+        }
+        return known == 0 ? zero : SlotRemoval::Possible;
+    }
+    int64_t lo, hi;
+    if (!IntConsts(count, lo, hi) || lo != 0 || hi != 0 || ConstantBindings(count) != ConstantBinding::Let)
+        return SlotRemoval::Possible;
     // A helper may not know whether its caller retains a link. Keep the
     // zero count conditional until a shrink or conversion needs it.
     condition = CountProof::IfUnchanged(ast.countconditions, count.constfrom);

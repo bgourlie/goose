@@ -5,6 +5,7 @@ struct Point { coords: i64[2] = [0; 2] }
 struct Points { cursor: Point&<u32>?, values: Point[>..] }
 const ZERO = 0;
 const ALSO_ZERO = ZERO + 0;
+const TYPED_ZERO: i64 = 0;
 let zero_count = 0;
 let other_zero = 0;
 let unused_zero = 0;
@@ -180,6 +181,17 @@ fn empty(nodes: Node[>..]&) {
     keep(nodes);
 }
 
+fn empty_with_known_count() {
+    const local: i64 = TYPED_ZERO;
+    var nodes: Node[>..] = [Node {}, Node {}];
+    nodes[0].next .= nodes[1];
+    nodes.pop_n(local);
+    nodes.pop_n(TYPED_ZERO);
+    assert(nodes.len == 2 && nodes[0].next .== nodes[1]);
+    nodes.resize(local);
+    assert(nodes.len == 0);
+}
+
 fn through_mutable_ref() {
     var nodes: Node[>..] = [Node {}, Node {}];
     nodes[0].next .= nodes[1];
@@ -203,6 +215,7 @@ export fn keep_shared() { shared.resize(shared.len); }
 export fn pop_shared() { shared.pop_n(zero_count); }
 
 fn main() {
+    empty_with_known_count();
     var points = Points { values: [Point { coords: [4, 2] }] };
     points.cursor .= points.values[0];
     points.values.resize(points.values.len, Point { coords: [7, 8] });
