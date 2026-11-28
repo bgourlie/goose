@@ -658,6 +658,7 @@ struct TypeCheck {
         vector<pair<VarDef *, RefPlace>> bindings; // Captures rebound on normal completion.
         set<VarDef *> reboundtargets; // A rebind can change the element even at the same field path.
         vector<pair<LinkShrink, LinkEffects>> shrinks;
+        FnRecord::ResizeRequirements resizeheadroom;
         LinkEffects exit;
         bool completes = true;
         shared_ptr<DeferEnv> env;
@@ -3245,6 +3246,9 @@ struct TypeCheck {
         return result;
     }
     void RecordConstructedLength(const Dest &dest, TypeExpr *type, const ArrayExtent &extent);
+    SuffixEffects::Paths CountPrefix(ArrayCountTarget target, SuffixEffects ArrayCountEffects::*member);
+    bool RequireEntryHeadroom(ArrayCountTarget target, int64_t required);
+    void CheckResizeHeadroom(Node *at, ArrayCountTarget target, int64_t required);
     bool TracksLength(VarDef *owner, bool exact) {
         return !exact || !owner || (owner->type ? HasRelRefT(LoadType(owner->type)) : owner->mayholdrel);
     }
@@ -3722,6 +3726,15 @@ struct TypeCheck {
     void ApplyCalleeStorage(Node *at, FnSpec *spec, vector<Val> &args, string_view name,
                             const vector<Node *> &argnodes, bool applyexits) {
         if (!cur.RecordsEffects()) return;
+        // The helper's own link may need an entry bound even if shrink
+        // replay cannot identify that link in the caller. Check it before growth.
+        if (auto rec = RecordOf(spec); reachable && rec) {
+            for (auto &[target, required] : rec->resizeheadroom) {
+                auto owners = MapClass(spec, target.owner, args);
+                auto header = CallerSuffixHeader(spec, args, target.header, target.owner, owners);
+                CheckResizeHeadroom(at, { owners.Root(), header }, required);
+            }
+        }
         if (hasdefers && reachable) ApplyCalleeReads(spec, args);
         // A nonlocal exit can unwind a caller's defer inside shrink replay.
         // The unordered growth log must forget upper bounds. An ordered shrink

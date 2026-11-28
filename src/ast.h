@@ -3282,6 +3282,13 @@ struct RetainedSlots {
     bool Keeps(ArrayPosition target) const { return header && target.header == header && target.index < min; }
 };
 
+// The exact array header whose count is measured and the storage that owns it.
+struct ArrayCountTarget {
+    VarDef *owner;
+    const LinkField *header;
+    auto operator<=>(const ArrayCountTarget &) const = default;
+};
+
 // Both ends are lower-bound transfers: headroom is INT64_MAX minus length.
 // Keeping the transfer until a call or defer is applied lets each shrink use
 // the length at that operation, including preceding changes in the body.
@@ -3345,6 +3352,10 @@ template<typename K> struct BoundShrink {
 // is replay metadata, not a fact compared for convergence.
 struct FnRecord {
     vector<RelativeStore> relativestores;
+    // Minimum headroom each resize relies on at function entry. Every caller
+    // must meet these bounds, even when it cannot see the link the body wrote.
+    using ResizeRequirements = map<ArrayCountTarget, int64_t>;
+    ResizeRequirements resizeheadroom;
     // Storage a write through a parameter or capture may change (§6.6).
     // An indirect write follows a stored reference out of the argument.
     struct StorageWrite {

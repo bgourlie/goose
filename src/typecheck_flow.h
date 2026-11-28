@@ -2653,6 +2653,8 @@ inline void TypeCheck::RunExitDefers(int first, ScopeExit exit, span<const FnRec
     for (auto i = (int)scopes.size(); i-- > first;) {
         for (auto it = scopes[i].defers.rbegin(); it != scopes[i].defers.rend(); ++it) {
             RefreshDeferredBody(*it);
+            for (auto &[target, required] : it->resizeheadroom)
+                CheckResizeHeadroom(it->statement, target, required);
             for (auto [owner, exact, array, field] : it->growths)
                 InvalidateLengths(owner, exact, array, field, &it->exit.writes);
             // A nonlocal return can unwind a frame using the same result stack.

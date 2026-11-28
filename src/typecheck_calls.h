@@ -3201,6 +3201,7 @@ inline bool TypeCheck::SameRecord(const FnRecord &a, const FnRecord &b, const Fn
             [&](const auto &p, const auto &q) {
                 return SameStorageWrite(p, q);
             })) return why("storage writes");
+    if (a.resizeheadroom != b.resizeheadroom) return why("resize entry lengths");
     if (!RelativeStore::SameSet(a.relativestores, b.relativestores, Roots::Compare::Cycle))
         return why("relative destinations");
     if (a.mayreturn != b.mayreturn) return why("normal completion");

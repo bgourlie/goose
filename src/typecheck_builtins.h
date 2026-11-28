@@ -2707,6 +2707,46 @@ inline bool TypeCheck::RelyOnCountProof(CountProof proof, Node *at, const char *
     return true;
 }
 
+// Counts at the operation, including any iterations before the current pass.
+inline SuffixEffects::Paths TypeCheck::CountPrefix(ArrayCountTarget target,
+                                                   SuffixEffects ArrayCountEffects::*member) {
+    auto owner = SuffixOwner(target.owner);
+    auto before = (cur.links.counts.*member).PathsFor(*this, target.header, owner);
+    if (cur.iterationprefix)
+        before = SuffixEffects::Sequence((cur.iterationprefix->*member).PathsFor(*this, target.header, owner), before);
+    return before;
+}
+
+// A positive residual is an obligation on entry, after accounting for this
+// body's own length changes. A defer's entry is the point where it runs.
+inline bool TypeCheck::RequireEntryHeadroom(ArrayCountTarget target, int64_t required) {
+    if (required == 0) return true;
+    if (required < 0 || !target.header || !target.owner) return false;
+    auto &frame = CurRealFrame();
+    auto spec = frame.spec;
+    if (!cur.deferring) {
+        // Only a Goose call can supply an entry bound, and only for a
+        // header that still identifies caller storage outside this activation.
+        if (!frame.call || !spec || spec->incycle || spec->sf->isrec || spec->sf->isexport ||
+            spec->isfunval || target.owner->ownerspec == spec || IsTemp(target.owner)) return false;
+        auto base = target.header->base;
+        if (base->ownerspec == spec && !(base->isparam && !base->isvar && IsAddressRef(base->type))) return false;
+    }
+    auto &bounds = cur.deferring ? cur.deferring->resizeheadroom : spec->record.resizeheadroom;
+    auto &needed = bounds[target];
+    needed = std::max(needed, required);
+    return true;
+}
+
+inline void TypeCheck::CheckResizeHeadroom(Node *at, ArrayCountTarget target, int64_t required) {
+    if (target.header) {
+        auto prefix = CountPrefix(target, &ArrayCountEffects::headroom);
+        if (RequireEntryHeadroom(target, SuffixEffects::Required(prefix, required))) return;
+    }
+    Error(at, cat("array resize: retained storage may have a self-relative link to a removed element (§5.1); ",
+                  "cannot prove the array has at most ", INT64_MAX - required, " elements on entry"));
+}
+
 // A deferred shrink observes both the writes in its own body up to this
 // point and the storage as it stands when the enclosing block exits.
 inline void TypeCheck::CheckLinkShrink(LinkShrink s) {
@@ -2718,20 +2758,14 @@ inline void TypeCheck::CheckLinkShrink(LinkShrink s) {
         return;
     }
     auto &retained = s.effect.retained;
+    ArrayCountTarget target { s.owner, retained.header };
     if (retained.header) {
-        auto owner = SuffixOwner(s.owner);
-        auto prefix = [&](auto member) {
-            auto before = (cur.links.counts.*member).PathsFor(*this, retained.header, owner);
-            if (cur.iterationprefix)
-                before = SuffixEffects::Sequence((cur.iterationprefix->*member).PathsFor(*this, retained.header, owner), before);
-            return before;
-        };
-        auto headroom = prefix(&ArrayCountEffects::headroom);
+        auto headroom = CountPrefix(target, &ArrayCountEffects::headroom);
         if (retained.requiredheadroom >= 0) {
             retained.requiredheadroom = SuffixEffects::Required(headroom, retained.requiredheadroom);
             if (!retained.requiredheadroom) s.effect.keepslinks = true;
         }
-        retained.length = SuffixEffects::Sequence(prefix(&ArrayCountEffects::length), retained.length);
+        retained.length = SuffixEffects::Sequence(CountPrefix(target, &ArrayCountEffects::length), retained.length);
         retained.headroom = SuffixEffects::Sequence(headroom, retained.headroom);
     }
     auto bounds = retained.Bounds();
@@ -2753,7 +2787,8 @@ inline void TypeCheck::CheckLinkShrink(LinkShrink s) {
                 absent = absent.Prefer(emptied);
             }
         }
-        if (!RelyOnCountProof(proof.Prefer(effect.preserves), s.at, "array shrink"))
+        if (!RelyOnCountProof(proof.Prefer(effect.preserves), s.at, "array shrink") &&
+            (s.bound || s.viaclass || !RequireEntryHeadroom(target, retained.requiredheadroom)))
             Error(s.at, cat(s.operation, ": retained storage may have a self-relative link "
                             "to a removed element (§5.1)"));
         if (!proof.Unconditional())
