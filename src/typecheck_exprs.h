@@ -3641,6 +3641,13 @@ inline TypeCheck::LitDeep TypeCheck::CheckInits(StructLit *sl, vector<Field> &fi
             auto fv = fi.fromdefault
                           ? CheckDefaultInit(fi.val, ft, selft, sl, fields[sl->fieldindices[k]])
                           : CheckValue(fi.val, ft);
+            if (selft->kind == TY_STRUCT && fv.extent.length >= 0 && ClassOf(ft) == SC_RESIZABLE) {
+                if (component) RecordConstructedLength(Dest(component), ft, fv.extent);
+                else {
+                    deep.tail = fv.extent;
+                    deep.tail.path = ast.Intern(cat(".", fi.name, fv.extent.path));
+                }
+            }
             NoteLitElem(deep, fi.val, fv, ft, selft->kind == TY_STRUCT ? fi.name : string_view {});
             if (component && HoldsPlainRef(ft)) NoteHolderBinding(component, fv, fi.val);
         }

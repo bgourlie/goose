@@ -95,6 +95,7 @@ inline Val Ident::Check(TypeCheck &tc, TypeExpr *) {
         v.type = tc.LoadType(t);
         if (IsRefOrSlice(t)) {
             v = tc.ReadRefBinding(vd, t);
+            if (t->kind == TY_SLICE) v.extent.length = vd->slicelength;
             v.lvalue = t->kind == TY_SLICE;   // A slice variable is storage; a reference is the pointee's path.
             if (v.lvalue) {
                 v.slot.Set(vd, true);
@@ -446,6 +447,7 @@ inline Val StructLit::Check(TypeCheck &tc, TypeExpr *expected) {
         }
         auto deep = tc.CheckInits(this, st->fields, inst->ftypes, st->name, t);
         Val v;
+        v.extent = deep.tail;
         v.type = t;
         v.Set(tc.TempRoot(), false);
         tc.HolderFromLit(v, deep);

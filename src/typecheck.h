@@ -2127,10 +2127,6 @@ struct TypeCheck {
     TypeExpr *DeclType(TypeExpr *t, TypeExpr *s);
     static bool ImplicitInt(IntStorage from, IntStorage to);
     Val CheckIntAny(Node *n);
-    struct IntegerBounds {
-        int64_t lo, hi;
-        static IntegerBounds Exact(int64_t value) { return { value, value }; }
-    };
     std::optional<IntegerBounds> KnownIntegerBounds(Node *n, const Val &v);
     int64_t KnownIndex(Node *n, const Val &v);
     std::optional<IntegerBounds> FoldIntegerBounds(Node *n);
@@ -2988,6 +2984,7 @@ struct TypeCheck {
 
     // Where one literal's initialized fields and elements point.
     struct LitDeep {
+        ArrayExtent tail;
         Roots roots;
         bool byteview = false;
         ValueLinks elementlinks;
@@ -3247,6 +3244,7 @@ struct TypeCheck {
             paths = SuffixEffects::Sequence(cur.iterationprefix->length.PathsFor(*this, header, owner), paths);
         return std::max<int64_t>(0, SuffixEffects::Guaranteed(paths, 0) - count);
     }
+    void RecordConstructedLength(const Dest &dest, TypeExpr *type, const ArrayExtent &extent);
     bool TracksLength(VarDef *owner, bool exact) {
         return !exact || !owner || (owner->type ? HasRelRefT(LoadType(owner->type)) : owner->mayholdrel);
     }

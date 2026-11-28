@@ -1237,11 +1237,26 @@ struct ValueLinks {
 // literal fit and array sizes. Lives here because every node's Check
 // override returns one.
 enum ConstKind { CK_NONE, CK_INT, CK_FLT };
-// Counts known for an array expression on every path delivering its value.
+struct IntegerBounds {
+    int64_t lo, hi;
+    static IntegerBounds Exact(int64_t value) { return { value, value }; }
+    // An adaptable constant can acquire a different width at each use. Keep
+    // an interval only when its endpoints still bound every converted value.
+    std::optional<IntegerBounds> InStorage(IntStorage s) const {
+        if (lo == hi) return Exact(WrapStorage(lo, s));
+        if (WrapStorage(lo, s) != lo || WrapStorage(hi, s) != hi ||
+            (IsUnsigned(s) ? (uint64_t)lo > (uint64_t)hi : lo > hi)) return {};
+        return *this;
+    }
+};
+
+// Counts known on every path delivering an array or a struct with an array tail.
 struct ArrayExtent {
     int64_t length = -1, capacity = -1;
+    string_view path; // Inline field path to the tail, empty for an array itself.
     ArrayExtent Common(ArrayExtent other) const {
-        return { length == other.length ? length : -1, capacity == other.capacity ? capacity : -1 };
+        if (path != other.path) return {};
+        return { length == other.length ? length : -1, capacity == other.capacity ? capacity : -1, path };
     }
     bool operator==(const ArrayExtent &) const = default;
 };
@@ -2442,7 +2457,8 @@ struct VarDef {
     bool constlit = false;
     bool constuns = false;      // constval's bits are a u64 above i64.max (Val::uns).
     int64_t constval = 0;
-    std::optional<int64_t> fixedint; // Value of an immutable integer binding when known at its storage width.
+    int64_t slicelength = -1; // Length of an immutable slice descriptor.
+    std::optional<IntegerBounds> intbounds; // Runtime bounds at the immutable binding’s storage width.
     bool constnot = false;      // A constlit whose constval is `~c`, c >= 0 (Val::notconst).
     bool constflt = false;      // A float constant, of value constfval.
     double constfval = 0;

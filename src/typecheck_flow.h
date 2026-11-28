@@ -2174,6 +2174,11 @@ inline void TypeCheck::CheckFor(ForLoop *x) {
             end = KnownIntegerBounds(x->iter, nv);
         } else if (t->kind == TY_ARRAY || t->kind == TY_SLICE) {
             bounds = ArrayIterations(t);
+            // A computed slice descriptor is captured before iteration. A location
+            // (including a reference to a slice) is read again on each iteration.
+            if (iv.type->kind == TY_SLICE && iv.extent.length >= 0 &&
+                (!iv.lvalue || (Is<Ident>(x->iter) && Is<Ident>(x->iter)->vdef->slicelength >= 0)))
+                bounds = { iv.extent.length, iv.extent.length };
             if (vartype)
                 Error(x, cat("an array's element binds at its element type; a type on a for "
                              "loop's binder is for an integer range or count"));
@@ -3235,6 +3240,7 @@ inline void TypeCheck::CheckVarDecl(VarDecl *vd, bool global) {
         if (v && !global) BindLiveTarget(d, init, *v, result);
         if (global) CheckVarExtent(d, vd);
         if (v && IsRefOrSlice(t)) {
+            if (t->kind == TY_SLICE && !d->isvar && t->cq) d->slicelength = v->extent.length;
             BindRefProvenance(d, *v);
             NoteRefPlace(d, *v);
             if (!global && !d->isvar && IsAddressRef(t)) {
@@ -3262,8 +3268,7 @@ inline void TypeCheck::CheckVarDecl(VarDecl *vd, bool global) {
         } else if (v && HoldsPlainRef(t)) {
             NoteHolderBinding(d, *v, init);
         }
-        if (!global && reachable && v && IsArrayKind(t, A_GROW) && HasRelRefT(t) && v->extent.length >= 0)
-            cur.links.counts.length.changes[ast.places.Bound(d)] = { d, {{ v->extent.length, SuffixEffects::discarded }} };
+        if (!global && v) RecordConstructedLength(Dest(d), t, v->extent);
         if (vd->reusable) {
             auto kw = vd->reusable == RU_SLICES ? "reusable[]" : "reusable";
             if (!vd->isvar) Error(vd, cat(kw, " requires var"));
@@ -3428,9 +3433,9 @@ inline void TypeCheck::CheckVarDecl(VarDecl *vd, bool global) {
         d->constfrom = d->constlit ? v.constfrom : nullptr;
         Finish(d, ann ? ann : v.type, &v, vd->inits[i]);
         if (!d->isvar && d->type->cq && IsIntT(d->type)) {
-            auto bounds = KnownIntegerBounds(vd->inits[i], v);
-            if (bounds && bounds->lo == bounds->hi)
-                d->fixedint = WrapStorage(bounds->lo, d->type->intstorage);
+            // The initializer has already fitted the binding's storage type.
+            if (auto bounds = KnownIntegerBounds(vd->inits[i], v))
+                d->intbounds = bounds->InStorage(d->type->intstorage);
         }
         auto len = Is<Dot>(vd->inits[i]);
         if (!vd->isvar && !global && len && len->member == B_LEN &&
@@ -3585,6 +3590,7 @@ inline Val TypeCheck::CheckAssignedValue(Assign *a, TypeExpr *target, TypeExpr *
         full = v.extent.length == capacity;
         if (full) RestoreLimitedPrefix(built, built.place, target);
     }
+    RecordConstructedLength(dest, target, v.extent);
     NoteStorageWrite(built, target, built.place, reachable || construction.started,
                      full ? StorageWrite::Storage : StorageWrite::MayDropSlots);
     if (arr && !built.None()) {

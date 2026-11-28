@@ -3828,7 +3828,7 @@ inline void TypeCheck::FinishReturn(int tf, const vector<Val> &vals, Node *at) {
         auto &rr = results[i];
         rr.elementlinks = vals[i].elementlinks;
         if (IsArrayKind(rt, A_LIMITED)) rr.intactprefix = vals[i].intactprefix;
-        if (rt->kind == TY_ARRAY || rt->kind == TY_SLICE) rr.extent = vals[i].extent;
+        if (rt->kind == TY_ARRAY || rt->kind == TY_SLICE || rt->kind == TY_STRUCT) rr.extent = vals[i].extent;
         auto isrs = IsRefOrSlice(rt);
         auto holder = !isrs && HoldsPlainRef(rt);
         if (!isrs && !holder) continue;

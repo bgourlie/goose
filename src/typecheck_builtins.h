@@ -22,6 +22,22 @@ inline const LinkField *TypeCheck::ArrayHeader(const RefPlace &place, TypeExpr *
     return type && TopConstEq(type, array) ? ast.places.Bound(field.base, string(field.Path())) : nullptr;
 }
 
+// A completed construction establishes the length of its own header (or its
+// struct tail). Only an exact destination can install a fact about storage.
+inline void TypeCheck::RecordConstructedLength(const Dest &dest, TypeExpr *type, const ArrayExtent &extent) {
+    if (!reachable || cur.probingtypes || extent.length < 0 || !dest.roots.Exact() ||
+        !(IsArrayKind(type, A_GROW) || (type->kind == TY_STRUCT && !extent.path.empty()))) return;
+    auto owner = SuffixOwner(dest.roots.Root());
+    if (!owner || IsTemp(owner) || !TracksLength(owner, true)) return;
+    auto field = dest.fieldsteps && dest.field.base ? ast.places.Bound(dest.field.base, dest.field.path)
+                                                   : dest.boundsteps ? dest.boundfield : nullptr;
+    auto header = ast.places.Project(field, extent.path);
+    if (!header || (header->base->isvar && header->base->type && IsRefOrSlice(header->base->type))) return;
+    auto array = FieldPathType(header->base, header->path);
+    if (!array || !IsArrayKind(array, A_GROW)) return;
+    cur.links.counts.length.changes[CanonicalSuffixHeader(header)] = { owner, {{ extent.length, SuffixEffects::discarded }} };
+}
+
 inline const LinkField *TypeCheck::CanonicalSuffixHeader(const LinkField *header) {
     if (!header || !header->base->isparam || header->base->isvar) return header;
     auto spec = header->base->ownerspec;
@@ -198,8 +214,9 @@ inline TypeCheck::SlotChange TypeCheck::CountedSlots(BuiltinKind op, const vecto
                 return EvalMeets(k->obj, EvalRequirement::ReadOnly);
             if (auto id = Is<Ident>(offset); id && id->vdef) {
                 auto v = id->vdef;
-                if (v->fixedint.value_or(-1) >= 0 || (IsIntT(v->type) && IsUnsigned(v->type->intstorage) &&
-                                                      IntBits(v->type->intstorage) < 64)) return true;
+                if ((v->intbounds && v->intbounds->lo >= 0 && v->intbounds->hi >= 0) ||
+                    (IsIntT(v->type) && IsUnsigned(v->type->intstorage) && IntBits(v->type->intstorage) < 64))
+                    return true;
                 if (!v->nonneg) return false;
                 CountProof proof = true;
                 for (; v; v = v->nonnegfrom)

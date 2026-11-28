@@ -813,7 +813,7 @@ inline Val TypeCheck::CheckIntAny(Node *n) {
 
 // A checked integer can be one of several branch literals. Typed constants
 // and arithmetic can also have a fixed runtime value without being literals.
-inline std::optional<TypeCheck::IntegerBounds> TypeCheck::KnownIntegerBounds(Node *n, const Val &v) {
+inline std::optional<IntegerBounds> TypeCheck::KnownIntegerBounds(Node *n, const Val &v) {
     IntegerBounds bounds;
     if (ConstantBindings(v) == ConstantBinding::Immutable && IntConsts(v, bounds.lo, bounds.hi))
         return bounds;
@@ -828,11 +828,11 @@ inline int64_t TypeCheck::KnownIndex(Node *n, const Val &v) {
 // Runtime arithmetic can have a fixed value even when a typed constant
 // cannot adapt like a literal. Fold the checked operands at their actual
 // widths and use their resolved bindings (including shadowing locals).
-inline std::optional<TypeCheck::IntegerBounds> TypeCheck::FoldIntegerBounds(Node *n) {
+inline std::optional<IntegerBounds> TypeCheck::FoldIntegerBounds(Node *n) {
     if (!n || !n->exprtype || !IsIntT(n->exprtype)) return {};
     if (auto lit = Is<IntLit>(n)) return IntegerBounds::Exact(lit->val);
-    if (auto id = Is<Ident>(n); id && id->vdef && id->vdef->fixedint)
-        return IntegerBounds::Exact(WrapStorage(*id->vdef->fixedint, n->exprtype->intstorage));
+    if (auto id = Is<Ident>(n); id && id->vdef && id->vdef->intbounds)
+        return id->vdef->intbounds->InStorage(n->exprtype->intstorage);
     if (auto d = Is<Dot>(n); d && (d->member == B_LEN || d->member == B_CAP)) {
         auto t = d->obj->exprtype;
         if (IsPlainRef(t)) t = t->ref->sub;
