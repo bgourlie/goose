@@ -144,7 +144,7 @@ inline void TypeCheck::ForgetReboundTarget(VarDef *binding) {
     if (!binding->isvar || binding->isglobal) return;
     if (!SliceVarOf(binding) && !IsAddressRef(binding->type)) return;
     cur.links.targets.erase(LinkFlow::BindingKey(binding));
-    if (cur.deferring && reachable && !cur.probingtypes) cur.deferring->reboundtargets.insert(binding);
+    if (cur.deferring && reachable && cur.RecordsEffects()) cur.deferring->reboundtargets.insert(binding);
 }
 
 inline void TypeCheck::BindLiveTarget(VarDef *binding, Node *source, const Val &value, size_t result) {

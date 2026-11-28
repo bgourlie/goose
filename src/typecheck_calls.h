@@ -2102,7 +2102,7 @@ inline void TypeCheck::ReplayEnvExits(FnSpec *spec, span<const Val> args) {
 // which records what it had assigned by then for a call reusing it.
 inline void TypeCheck::NoteExit(int tf, Node *at, vector<RetRoot> results,
                                 vector<FnRecord::InterruptedAssign> interrupted, span<Node *const> expressions) {
-    if (cur.probingtypes) return;
+    if (!cur.RecordsEffects()) return;
     auto current = RealFrameIndex();
     interrupted = CheckExitScopes(std::max(frames[tf].scopebase, frames[current].scopebase), at,
                                   current == tf ? ScopeExit::Return : ScopeExit::OuterReturn, std::move(interrupted));
@@ -2260,7 +2260,7 @@ inline void TypeCheck::ApplyCalleeRebinds(FnSpec *spec) {
     auto caller = CurRealFrame().spec;
     for (auto &[v, place] : rec->reboundplaces) {
         if (IsOptional(v->type)) v->narrowed = nullptr;
-        if (caller && v->ownerspec != caller) caller->record.reboundplaces.try_emplace(v);
+        if (!cur.emptyiteration && caller && v->ownerspec != caller) caller->record.reboundplaces.try_emplace(v);
     }
 }
 
@@ -4509,7 +4509,7 @@ inline bool TypeCheck::ResultLayoutFits(TypeExpr *from, TypeExpr *to) {
 // An argument can write into the old receiver. Effects of the body and
 // its result follow this point; an exit before delivery keeps the old links.
 inline void TypeCheck::BeginCallResults() {
-    if (cur.probingtypes) return;
+    if (!cur.RecordsEffects()) return;
     for (auto &d : callresultdsts)
         if (d.replacement) d.replacement->at = storeevents.size();
 }
@@ -4519,7 +4519,7 @@ inline void TypeCheck::BeginCallResults() {
 // without returning. A reference result is loaded after the call.
 inline void TypeCheck::NoteCallConstruction(const vector<TypeExpr *> &results, const FnSpec *callee,
                                             bool dispatch) {
-    if (!reachable || cur.probingtypes) return;
+    if (!reachable || !cur.RecordsEffects()) return;
     for (size_t i = 0; i < results.size(); i++) {
         auto dest = CallResultDest(i);
         auto t = results[i];
@@ -4547,7 +4547,7 @@ inline void TypeCheck::NoteCallConstruction(const vector<TypeExpr *> &results, c
 // specialized the body. Concrete local roots must agree here.
 inline bool TypeCheck::RelativeDestination(const Roots &source, Dest dest, TypeExpr *pointee,
                                           Node *at, bool record, LinkField targetfield, bool forwarding) {
-    record = record && !cur.probingtypes;
+    record = record && cur.RecordsEffects();
     if (source.None() || dest.unknown) return true;
     if (!source.Exact() || (!dest.result && !dest.roots.Exact())) return false;
     auto roots = source;
@@ -4605,7 +4605,7 @@ inline bool TypeCheck::RelativeDestination(const Roots &source, Dest dest, TypeE
 }
 
 inline void TypeCheck::CheckCalleeRelative(Call *call, FnSpec *spec, vector<Val> &args, span<Node *const> argnodes) {
-    if (cur.probingtypes) return;
+    if (!cur.RecordsEffects()) return;
     if (!reachable) return;
     auto rec = RecordOf(spec);
     if (!rec) return;

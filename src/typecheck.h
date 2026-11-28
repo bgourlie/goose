@@ -911,10 +911,11 @@ struct TypeCheck {
         d.resultindex = index;
         // The expression may start writing before its result type is inferred.
         // Keep that evidence if the resolved result needs its caller's location.
-        if (hasdefers && spec &&
+        if (hasdefers && spec && !cur.emptyiteration &&
             ((size_t)index >= spec->rets.size() || BuiltInPlace(spec->rets[index]))) {
             // A nonlocal return constructs through the target's result channel.
             auto &body = spec == CurRealFrame().spec ? cur : StateOf(FrameOfSpec(spec));
+            if (body.emptyiteration) return d;
             auto &writing = body.resultconstruction[index];
             writing.literal = true;
             writing.stack = (size_t)index < spec->rets.size() && ClassOf(spec->rets[index]) != SC_FIXED;
@@ -2747,10 +2748,15 @@ struct TypeCheck {
     Val CheckEarlyBlock(EarlyBlock *x, TypeExpr *expected, bool wantvalue);
     void CheckLoopBody(Block *body);
     struct IterationBounds { int64_t min, max; }; // A negative maximum is unknown.
-    IterationBounds ArrayIterations(TypeExpr *t) {
+    IterationBounds ArrayIterations(TypeExpr *t, Node *expr, const Val &value) {
+        // A computed descriptor is captured; a mutable descriptor may be reread.
+        if (expr && value.type->kind == TY_SLICE && value.extent.length >= 0 &&
+            (!value.lvalue || (Is<Ident>(expr) && Is<Ident>(expr)->vdef->slicelength >= 0)))
+            return { value.extent.length, value.extent.length };
         auto max = HasStaticArrayCapacity(t) ? ArraySize(t->arr) : -1;
         return { IsArrayKind(t, A_FIXED) ? max : 0, max };
     }
+    void CheckEmptyIteration(const FlowState &entry, const function<void()> &check);
     Scope CheckLoopPasses(Node *x, FlowState &head, const function<void()> &pass,
                           IterationBounds bounds = { 0, -1 });
     void CheckElementRuns(Node *at, IterationBounds bounds, const function<void()> &element);
@@ -3141,7 +3147,6 @@ struct TypeCheck {
     // themselves through references.
     struct RenderSeen {
         vector<TypeExpr *> path, recurring;
-        bool executes = true;  // A fixed empty array still needs its element's rendering code.
         TypeExpr *direct = nullptr;  // Receiver being rendered into, when no temporary intervenes.
     };
     TypeExpr *OverloadedPart(Call *c, TypeExpr *t, vector<TypeExpr *> &seen);
@@ -3584,6 +3589,9 @@ struct TypeCheck {
         // call or initializer checks the storage effects in that order.
         // A newly specialized callee still checks and records its own body.
         std::optional<int> probingtypes; // Last scope serial before the innermost probe.
+        // An empty iteration still checks its source body or resolves its formatting hooks.
+        bool emptyiteration = false;
+        bool RecordsEffects() const { return !probingtypes && !emptyiteration; }
         map<int, Construction> resultconstruction;
         size_t delivering = 0; // Result operands evaluated or being evaluated, in source order.
         Rebuild *rebuild = nullptr;
@@ -3713,7 +3721,7 @@ struct TypeCheck {
     void ApplyCalleeGrows(Node *at, FnSpec *spec, vector<Val> &argvals, string_view name);
     void ApplyCalleeStorage(Node *at, FnSpec *spec, vector<Val> &args, string_view name,
                             const vector<Node *> &argnodes, bool applyexits) {
-        if (cur.probingtypes) return;
+        if (!cur.RecordsEffects()) return;
         if (hasdefers && reachable) ApplyCalleeReads(spec, args);
         // A nonlocal exit can unwind a caller's defer inside shrink replay.
         // The unordered growth log must forget upper bounds. An ordered shrink

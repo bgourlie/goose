@@ -1914,6 +1914,15 @@ inline void TypeCheck::CheckLoopBody(Block *body) {
     if (body->tail) CheckStmtExpr(body->tail);
 }
 
+// Keep the checked syntax and any specialized bodies. Only the incoming
+// flow can reach the continuation; callees still record their own summaries.
+inline void TypeCheck::CheckEmptyIteration(const FlowState &entry, const function<void()> &check) {
+    Saved checking(cur.emptyiteration, true);
+    Saved<Construction *> writing(curdst.construction, nullptr);
+    check();
+    RestoreFlow(entry);
+}
+
 // A loop, whatever its header, checked to a fixpoint of what its body
 // feeds back to its head (LoopPass): `pass` checks one iteration in the
 // loop's scope, from the state `head`, which starts as the entry state and
@@ -1929,6 +1938,14 @@ inline void TypeCheck::CheckLoopBody(Block *body) {
 inline TypeCheck::Scope TypeCheck::CheckLoopPasses(Node *x, FlowState &head,
                                                    const function<void()> &pass,
                                                    IterationBounds bounds) {
+    if (bounds.max == 0) {
+        CheckEmptyIteration(head, [&] {
+            PushScope(SK_LOOP, x);
+            pass();
+            PopScope();
+        });
+        return {}; // Neither a backedge nor a break can reach the continuation.
+    }
     auto entry = head;
     auto firstbase = storeevents.size();
     auto warnbase = cur.pendingwarnings.size();
@@ -2173,12 +2190,7 @@ inline void TypeCheck::CheckFor(ForLoop *x) {
             }
             end = KnownIntegerBounds(x->iter, nv);
         } else if (t->kind == TY_ARRAY || t->kind == TY_SLICE) {
-            bounds = ArrayIterations(t);
-            // A computed slice descriptor is captured before iteration. A location
-            // (including a reference to a slice) is read again on each iteration.
-            if (iv.type->kind == TY_SLICE && iv.extent.length >= 0 &&
-                (!iv.lvalue || (Is<Ident>(x->iter) && Is<Ident>(x->iter)->vdef->slicelength >= 0)))
-                bounds = { iv.extent.length, iv.extent.length };
+            bounds = ArrayIterations(t, x->iter, iv);
             if (vartype)
                 Error(x, cat("an array's element binds at its element type; a type on a for "
                              "loop's binder is for an integer range or count"));
@@ -2248,10 +2260,6 @@ inline void TypeCheck::CheckFor(ForLoop *x) {
     auto readback = IsRefOrSlice(bindtype) && elemtype && (!byref || elemtype->kind == TY_REF);
     auto path = AddressedPath(x->iter);
     auto head = SaveFlow();
-    // An ordinary for body undergoes full static checking even when its
-    // header is empty. Keep its existing conservative flow until checking
-    // the source body can be separated from publishing its effects.
-    if (bounds.max == 0) bounds = { 0, -1 };
     auto sc = CheckLoopPasses(x, head, [&] {
         // GenLoc follows a sequence's field and element path at each loop
         // head. Read it in the joined state, before introducing the binders.
@@ -2754,7 +2762,7 @@ inline Roots TypeCheck::OwnersAtPlace(const Roots &storage, const RefPlace &plac
 // Property reads stop at the value they inspect, and a stored reference
 // ends the inline path: its slot and what the slot holds are separate.
 inline void TypeCheck::NoteStorageRead(Node *n) {
-    if (!reachable || cur.probingtypes) return;
+    if (!reachable || !cur.RecordsEffects()) return;
     auto property = Is<Dot>(n);
     bool header = property && (property->member == B_LEN || property->member == B_CAP);
     bool bounds = false;
@@ -2961,7 +2969,7 @@ inline void TypeCheck::ApplyCalleeReads(FnSpec *spec, const vector<Val> &args) {
 // Collect a deferred write while checking the body. Publish it when that
 // defer runs, either to an enclosing defer or to the executing function.
 inline void TypeCheck::RecordStorageWrite(FnRecord::StorageWrite write, Defer *executing, size_t channels) {
-    if (cur.probingtypes) return;
+    if (!cur.RecordsEffects()) return;
     auto spec = CurRealFrame().spec;
     if (!spec || !write.root || write.root->isglobal || IsTemp(write.root)) return;
     if (write.effect != StorageWrite::Storage) {

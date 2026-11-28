@@ -25,7 +25,7 @@ inline const LinkField *TypeCheck::ArrayHeader(const RefPlace &place, TypeExpr *
 // A completed construction establishes the length of its own header (or its
 // struct tail). Only an exact destination can install a fact about storage.
 inline void TypeCheck::RecordConstructedLength(const Dest &dest, TypeExpr *type, const ArrayExtent &extent) {
-    if (!reachable || cur.probingtypes || extent.length < 0 || !dest.roots.Exact() ||
+    if (!reachable || !cur.RecordsEffects() || extent.length < 0 || !dest.roots.Exact() ||
         !(IsArrayKind(type, A_GROW) || (type->kind == TY_STRUCT && !extent.path.empty()))) return;
     auto owner = SuffixOwner(dest.roots.Root());
     if (!owner || IsTemp(owner) || !TracksLength(owner, true)) return;
@@ -1011,7 +1011,7 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
     // it (§5.1); pop, pop_n and resize also need an element the shrink can
     // find, which a sequential array has not got.
     auto shrink = (d.flags & BF_SHRINKS) != 0;
-    auto header = ak == A_GROW && rv.Exact() && (added > 0 || popped > 0 || resizebounds) && reachable && !cur.probingtypes
+    auto header = ak == A_GROW && rv.Exact() && (added > 0 || popped > 0 || resizebounds) && reachable && cur.RecordsEffects()
                       ? CanonicalSuffixHeader(ArrayHeader(rv, recvarr)) : nullptr;
     auto suffixowner = header ? SuffixOwner(rv.Root()) : nullptr;
     auto fresh = cur.links.FreshCount(header, suffixowner);
@@ -1400,7 +1400,7 @@ inline void TypeCheck::CheckRenderable(Call *c, const char *what, TypeExpr *t, N
     vector<Val> hookargs;
     if (auto sp = UserFormat(c, t, value, out, arg, hookargs)) {
         c->fmtspecs.push_back({ t, sp });
-        if (seen.executes) {
+        if (!cur.emptyiteration) {
             ApplyCalleeStorage(c, sp, hookargs, "format", { nullptr, arg }, true);
             CalleesReturn({ sp }, reachable);
         }
@@ -1408,7 +1408,7 @@ inline void TypeCheck::CheckRenderable(Call *c, const char *what, TypeExpr *t, N
     }
     // Direct rendering writes a scalar or an aggregate prefix here. A
     // non-null reference forwards to its pointee, and a hook records its own writes.
-    if (seen.direct && seen.executes && (t->kind != TY_REF || t->ref->optional))
+    if (seen.direct && !cur.emptyiteration && (t->kind != TY_REF || t->ref->optional))
         NoteStorageWrite(out, seen.direct, out.refplace);
     // The argument itself, unless an overload takes it whole, is read where
     // it lies, around the overloads its parts run, so that storage stays in
@@ -1459,15 +1459,15 @@ inline void TypeCheck::CheckRenderable(Call *c, const char *what, TypeExpr *t, N
         case TY_ARRAY: case TY_SLICE: {
             auto elem = t->kind == TY_ARRAY ? t->arr->sub : t->sub;
             if (IsU8(elem)) return;  // RenderLoc emits the entire byte string.
-            auto bounds = ArrayIterations(t);
-            Saved executing(seen.executes, seen.executes && bounds.max != 0);
+            auto bounds = ArrayIterations(t, arg, value);
             auto base = c->fmtspecs.size();
             auto element = [&] {
                 c->fmtspecs.resize(base);  // Keep overloads from the settled pass.
                 child(elem, IsRefOrSlice(elem));
             };
-            if (seen.executes) CheckElementRuns(at, bounds, element);
-            else element();  // Resolve the element's format overloads for codegen.
+            if (cur.emptyiteration) element();
+            else if (bounds.max == 0) CheckEmptyIteration(SaveFlow(), element);
+            else CheckElementRuns(at, bounds, element);
             return;
         }
         case TY_REF: {
@@ -2584,6 +2584,7 @@ inline void TypeCheck::GrowOnlyShrinkAt(Node *c, const string &op, VarDef *vd,
                          ": an index type names ", ia->name, ", so its length never goes "
                          "down (§3.11)"));
     }
+    if (cur.emptyiteration) return;
     // The elements freed: of the array itself, or for a bound, of an array
     // of its type. A parameter class's storage is not known here.
     auto arrtype = ShrunkType(vd, bound);
@@ -2695,7 +2696,7 @@ inline bool TypeCheck::LiveConversionTargets(const ValueLinks &links, CountProof
 inline bool TypeCheck::RelyOnCountProof(CountProof proof, Node *at, const char *reason) {
     if (!proof.Available()) return false;
     // Overload matching checks whether the conversion fits without committing to it.
-    if (!at || unifytrial || cur.probingtypes || proof.Committed()) return true;
+    if (!at || unifytrial || !cur.RecordsEffects() || proof.Committed()) return true;
     for (const auto &pair : proof.condition->distinct)
         growconflicts.push_back({ at, pair.spec, pair.first, pair.second,
             cat("the ", reason, " relies on growth leaving the measured array's length unchanged") });
@@ -2709,7 +2710,7 @@ inline bool TypeCheck::RelyOnCountProof(CountProof proof, Node *at, const char *
 // A deferred shrink observes both the writes in its own body up to this
 // point and the storage as it stands when the enclosing block exits.
 inline void TypeCheck::CheckLinkShrink(LinkShrink s) {
-    if (!reachable || cur.probingtypes) return;
+    if (!reachable || !cur.RecordsEffects()) return;
     if (s.popheader && s.popped > 0 && s.popped <= cur.links.FreshCount(s.popheader, SuffixOwner(s.owner)))
         s.effect.keepslinks = true;
     if (cur.deferring) {
@@ -2880,7 +2881,7 @@ inline void TypeCheck::NoteRefPlace(VarDef *vd, const Val &v) {
     // A mutable reference's current binding is flow state. Its lifetime
     // commitment still includes every binding at the committed depth.
     auto spec = CurRealFrame().spec;
-    if (spec && vd->ownerspec != spec && (!vd->isglobal || IsOptional(vd->type)))
+    if (!cur.emptyiteration && spec && vd->ownerspec != spec && (!vd->isglobal || IsOptional(vd->type)))
         spec->record.reboundplaces.try_emplace(vd);
     if (vd->isvar && vd->isglobal) return;
     RefPlace place;
@@ -3078,7 +3079,7 @@ inline void TypeCheck::RecordLinkStore(const Roots &owners, TypeExpr *reached,
                                       ElementLink link, Node *at, LinkLocation place, const LinkField &field,
                                       const LinkField &target, const LinkField *boundfield,
                                       FnRecord::LinkState state, IndexedSlot indexed) {
-    if (!reachable || cur.probingtypes || owners.None()) return;
+    if (!reachable || !cur.RecordsEffects() || owners.None()) return;
     link.intail |= place.intail;
     for (auto &d : ShrinkTargets(owners, reached, false)) {
         if (IsTemp(d.root)) continue;
@@ -3181,7 +3182,7 @@ inline void TypeCheck::RecordHolderTransfer(VarDef *container, TypeExpr *reached
 inline void TypeCheck::RecordStore(VarDef *container, const Roots &roots, bool byteview,
                                    VarDef *src, TypeExpr *value, const Dest *dest, TypeExpr *reached,
                                    bool bound) {
-    if (!container) return;
+    if (!container || cur.emptyiteration) return;
     // Putting a container's own read-back contents back into it adds no
     // incoming lifetime. Keep this distinction before discarding src. It
     // may put them into a part a kill emptied, though, as may a store of a
@@ -4306,7 +4307,11 @@ inline void TypeCheck::NoteRootEvent(VarDef *root, P param, X external) {
         if (root->isglobal || root->ownerspec != current) external(current, root);
         return;
     }
+    // A nested helper keeps its own summary even when first checked inside
+    // an empty loop. No activation outside that call can observe the event.
+    bool executes = true;
     for (auto fi = (int)frames.size() - 1; fi >= 0; fi--) {
+        executes = executes && !StateOf(fi).emptyiteration;
         auto spec = frames[fi].spec;
         if (!spec) continue;
         auto found = false;
@@ -4314,11 +4319,11 @@ inline void TypeCheck::NoteRootEvent(VarDef *root, P param, X external) {
         // or slice slot itself, even though one parameter reaches both.
         for (size_t i = 0; i < spec->params.size(); i++) {
             if (RefRootOf(spec->params[i]) == root) {
-                param(spec, (int)i);
+                if (executes) param(spec, (int)i);
                 found = true;
             }
             if (ViewClassOf(spec, i) == root) {
-                param(spec, (int)(spec->params.size() + i));
+                if (executes) param(spec, (int)(spec->params.size() + i));
                 found = true;
             }
         }
@@ -4508,7 +4513,7 @@ inline void TypeCheck::NoteShrinkOrder(const LinkShrink &shrink) {
 inline void TypeCheck::ShrinkGrowShrink(Node *at, const string &op, VarDef *root,
                                         const string &what, TypeExpr *bound,
                                         ShrinkBalance balance) {
-    if (!root) return;
+    if (!root || cur.emptyiteration) return;
     CheckShrinkHolders(at, op, root, what, bound);
     NoteLiveViews(at, cat("cannot ", op), root, what, false, bound);
     NoteShrink(root, bound, balance);
@@ -5921,7 +5926,7 @@ inline const LinkField *TypeCheck::GrowthField(const RefPlace &place) {
 // when the containing value is fixed-size. Calls and defers replay these
 // events through the same growth log as an array member operation.
 inline void TypeCheck::NoteLimitedReplacement(Node *at, const Roots &storage, TypeExpr *type, const RefPlace &place) {
-    if (!reachable || cur.probingtypes || !IsAggregate(type)) return;
+    if (!reachable || !cur.RecordsEffects() || !IsAggregate(type)) return;
     set<TypeExpr *> visited;
     auto headers = [&](auto &&walk, TypeExpr *t) -> void {
         if (!IsAggregate(t) || !visited.insert(t).second) return;
@@ -5977,7 +5982,7 @@ inline void TypeCheck::InvalidateLengths(VarDef *owner, bool exact, TypeExpr *ar
 
 inline void TypeCheck::RecordGrowth(Node *at, const Roots &roots, const string &what, TypeExpr *arr,
                                     GrowthEffect effect, const LinkField *field) {
-    if (cur.probingtypes) return;
+    if (!cur.RecordsEffects()) return;
     bool changeslength = effect != GrowthEffect::StorageOnly && (!arr || IsArrayKind(arr, A_GROW) || IsArrayKind(arr, A_LIMITED));
     // An arbitrary growth invalidates upper bounds. A counted operation can
     // then install its precise transfer for the exact header it changed.
@@ -6024,7 +6029,7 @@ inline void TypeCheck::RecordGrowth(Node *at, const Roots &roots, const string &
 // would be freed under it (CheckGrowsSince).
 inline void TypeCheck::NoteShrinkEvent(Node *at, VarDef *root, TypeExpr *bound,
                                        const string &what, TypeExpr *t) {
-    if (cur.probingtypes || !root || IsTemp(root)) return;
+    if (!cur.RecordsEffects() || !root || IsTemp(root)) return;
     cur.growlog.push_back({ at, root, !bound, what, true, SoleResizableIn(t) });
 }
 
