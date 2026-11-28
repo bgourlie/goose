@@ -1,0 +1,14 @@
+// error: retained storage may have a self-relative link to a removed element
+struct Node { next: Node&<u32>? }
+
+fn maybe_push(nodes: Node[>..]&, skip: bool) {
+    if skip { return; }
+    nodes.push(Node {});
+}
+
+fn main() {
+    var nodes: Node[>..] = [Node {}, Node {}];
+    nodes[0].next .= nodes[1];
+    maybe_push(nodes, true);
+    nodes.pop();
+}

@@ -2455,6 +2455,7 @@ struct VarDef {
     // so references in a pool class are rooted outside the cycle and exempt
     // from the cycle store rule.
     VarDef *classfrom = nullptr;
+    bool mayholdrel = true;   // Whether this class's owner can contain a self-relative link.
     bool poolclass = false;
     // The global pool, or owner of named pool components, every call site's
     // argument for this class is rooted in (§3.9); usually null.
@@ -2693,6 +2694,12 @@ struct RootArg {
     ValueLinks elementlinks;  // Contents of a by-value argument at entry.
     int ownerparam = -1;
     int ownerfield = -1;
+    int suffixparam = -1;         // Parameter naming this grow-only storage or a containing part.
+    const LinkField *suffixouter = nullptr; // Or a location already named in the lexical environment.
+    const string *suffixpath = nullptr;     // Path from suffixparam's pointee.
+    VarDef *suffixowner = nullptr;          // An owner already named in the lexical environment.
+    vector<int> apartowners;                // Earlier parameters with provably disjoint owners.
+    bool mayholdrel = true;
     bool writable = true;
     int reusable = 0;
     // The argument may point into a grow-shrink array (§5.2): some root of
@@ -2784,6 +2791,8 @@ struct RootArg {
     bool operator==(const RootArg &o) const {
         return cls == o.cls && elementlinks == o.elementlinks &&
                ownerparam == o.ownerparam && ownerfield == o.ownerfield &&
+               suffixparam == o.suffixparam && suffixpath == o.suffixpath && suffixouter == o.suffixouter &&
+               suffixowner == o.suffixowner && apartowners == o.apartowners && mayholdrel == o.mayholdrel &&
                writable == o.writable && reusable == o.reusable &&
                growshrink == o.growshrink && gsvia == o.gsvia && slotread == o.slotread &&
                byteview == o.byteview && pool == o.pool && heldexact == o.heldexact &&
@@ -3070,6 +3079,110 @@ struct EnvRead {
     RefPlace refplace;
 };
 
+// A body starts without knowing its caller's suffix. At each exit
+// it guarantees the larger of its own fresh count and the incoming
+// count adjusted by delta. A forward link or an unknown shrink
+// discards the incoming count for every possibly overlapping owner.
+struct SuffixEffects {
+    static constexpr int64_t discarded = INT64_MIN;
+    struct Path {
+        int64_t floor, delta;
+        auto operator<=>(const Path &) const = default;
+        int64_t Apply(int64_t incoming) const { return std::max(floor, Add(incoming, delta)); }
+        Path Then(Path next) const { return { next.Apply(floor), Add(delta, next.delta) }; }
+    };
+    using Paths = vector<Path>;
+    struct Change {
+        VarDef *owner;
+        Paths paths;
+        bool operator==(const Change &) const = default;
+    };
+    map<const LinkField *, Change> changes;
+    set<pair<VarDef *, bool>> invalidated;
+    int invaliddepth = -1; // Storage an expired inexact owner could reach (§9.2).
+    bool operator==(const SuffixEffects &) const = default;
+    bool Empty() const { return changes.empty() && invalidated.empty() && invaliddepth < 0; }
+    static int64_t Add(int64_t a, int64_t b) {
+        if (a == discarded || b == discarded || (b < 0 && a < INT64_MIN - b)) return discarded;
+        return b > 0 && a > INT64_MAX - b ? INT64_MAX : a + b;
+    }
+    template<typename TC> Paths PathsFor(TC &tc, const LinkField *header, VarDef *owner) const {
+        if (auto it = changes.find(header); it != changes.end())
+            return it->second.owner == owner ? it->second.paths : Paths {{ 0, discarded }};
+        if (invaliddepth >= 0 && (RootDepth(owner) <= invaliddepth || tc.IsClassRoot(owner)))
+            return {{ 0, discarded }};
+        for (auto [v, exact] : invalidated)
+            if (tc.SuffixOwnersOverlap(owner, true, v, exact)) return {{ 0, discarded }};
+        return {{ 0, 0 }};
+    }
+    // The minimum over all paths is guaranteed. A path with both a
+    // higher floor and a higher offset cannot lower that minimum.
+    static Paths Normalize(Paths paths) {
+        sort(paths.begin(), paths.end());
+        Paths result;
+        for (auto p : paths)
+            if (result.empty() || p.delta < result.back().delta) result.push_back(p);
+        return result;
+    }
+    static Paths Sequence(const Paths &first, const Paths &next) {
+        Paths result;
+        for (auto p : first) for (auto q : next) result.push_back(p.Then(q));
+        return Normalize(std::move(result));
+    }
+    // Incoming slots needed to cover a pop on every path. A discarded
+    // incoming suffix cannot discharge a larger pop than the local floor.
+    static int64_t Required(const Paths &paths, int64_t pop) {
+        int64_t needed = 0;
+        for (auto p : paths) {
+            if (p.Apply(0) >= pop) continue;
+            if (p.delta == discarded || (p.delta < 0 && pop > INT64_MAX + p.delta)) return -1;
+            needed = std::max(needed, pop - p.delta);
+        }
+        return needed;
+    }
+    static int64_t Guaranteed(const Paths &paths, int64_t incoming) {
+        int64_t count = INT64_MAX;
+        for (auto p : paths) count = std::min(count, p.Apply(incoming));
+        return count;
+    }
+    static Paths Join(Paths first, const Paths &other, bool backedge) {
+        for (auto p : other) {
+            // A decreasing offset on a backedge may consume the
+            // whole incoming run. A computed constant remains a bound.
+            if (backedge && none_of(first.begin(), first.end(), [&](Path q) {
+                    return q.delta <= p.delta && q.floor <= p.floor;
+                })) {
+                if (any_of(first.begin(), first.end(), [&](Path q) {
+                        return q.delta >= p.delta && q.floor > p.floor;
+                    })) p.floor = 0;
+                p.delta = discarded;
+            }
+            first.push_back(p);
+        }
+        return Normalize(std::move(first));
+    }
+    void Shift(const LinkField *header, VarDef *owner, const Paths &before, int64_t delta) {
+        changes[header] = { owner, Sequence(before, {{ std::max<int64_t>(delta, 0), delta }}) };
+    }
+    template<typename TC> void Forget(TC &tc, VarDef *owner, bool exact) {
+        invalidated.emplace(owner, exact);
+        erase_if(changes, [&](const auto &p) {
+            return tc.SuffixOwnersOverlap(p.second.owner, true, owner, exact);
+        });
+    }
+    // The same keys compose in sequence and join across alternatives.
+    template<typename TC, typename F> void Combine(TC &tc, const SuffixEffects &other, F combine) {
+        if (Empty() && other.Empty()) return;
+        auto keys = changes;
+        keys.insert(other.changes.begin(), other.changes.end());
+        for (auto &[header, value] : keys)
+            value.paths = combine(PathsFor(tc, header, value.owner), other.PathsFor(tc, header, value.owner));
+        changes = std::move(keys);
+        invalidated.insert(other.invalidated.begin(), other.invalidated.end());
+        invaliddepth = std::max(invaliddepth, other.invaliddepth);
+    }
+};
+
 // The analysis a checked body exposes to its callers. A recursive round
 // moves this record aside and starts a fresh one; specialization identity,
 // parameters, lexical environment and annotated code are never snapshotted.
@@ -3224,10 +3337,12 @@ struct FnRecord {
         vector<CallerKill> overwrites;
         LinkStores stores;
         LimitedPrefixes prefixes; // Whole arrays in caller-visible storage, including captures.
-        void Join(const ExitLinks &other) {
+        SuffixEffects suffixes;
+        template<typename TC> void Join(const ExitLinks &other, TC &tc) {
             IntersectKills(overwrites, other.overwrites);
             JoinStores(stores, other.stores);
             prefixes.Join(other.prefixes);
+            suffixes.Combine(tc, other.suffixes, [](const auto &a, const auto &b) { return SuffixEffects::Join(a, b, false); });
         }
         bool operator==(const ExitLinks &) const = default;
     };
@@ -3238,6 +3353,9 @@ struct FnRecord {
         size_t before = 0;
         vector<CallerKill> kills; // Ordinary holder overwrites at all shrink operations.
         std::optional<ExitLinks> atremoval; // Relative links only at operations that may remove slots.
+        const LinkField *popheader = nullptr;
+        int64_t required = 0; // Incoming fresh slots sufficient for all pops, or -1 if unknown.
+        ShrinkEffect effect;
     };
     vector<ShrinkOrder> shrinkorders;
     ExitLinks exitlinks;  // Ordinary returns to the immediate caller.

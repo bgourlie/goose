@@ -1583,7 +1583,9 @@ inline FnSpec *TypeCheck::GetOrCreateSpec(MatchInfo &mi, vector<Val> &argvals, N
     vector<VarDef *> distinct;
     // The entries given a class so far, each with the root it was given for.
     vector<pair<RootArg *, VarDef *>> members;
-    auto classify = [&](RootArg &ra, VarDef *r) {
+    auto classify = [&](RootArg &ra, VarDef *r, bool suffixstorage) {
+        if (r && ra.exact && suffixstorage && !sf->isrec)
+            ra.mayholdrel = r->type ? HasRelRefT(LoadType(r->type)) : r->mayholdrel;
         if (!r) {
             ra.cls = 0;
             return;
@@ -1673,8 +1675,11 @@ inline FnSpec *TypeCheck::GetOrCreateSpec(MatchInfo &mi, vector<Val> &argvals, N
                                   a.root->ref.byteview;
                        }));
         if (ra.exact) ra.pool = PoolOf(r);
-        classify(ra, r);
+        // Only a reference that reaches the array itself or a self-relative
+        // field can use its owner's suffix facts. Other classes need no key.
+        classify(ra, r, isrs && ((IsAddressRef(pt) && GrowOnlyTail(pt->ref->sub)) || HasRelRefT(PointeeOf(pt))));
     }
+    if (!sf->isrec && !sf->isextern) ClassifySuffixArgs(roots, mi, argvals);
     // Preserve an owner's relationship to a separately supplied component.
     // This is a storage path, not a uniqueness assumption about the owner type.
     for (size_t i = 0; i < roots.size(); i++) {
@@ -1719,7 +1724,7 @@ inline FnSpec *TypeCheck::GetOrCreateSpec(MatchInfo &mi, vector<Val> &argvals, N
         va.slotread = (gsroot || gspointee) && hp.AllSlotRead();
         va.byteview = hp.byteview;
         if (va.exact) va.pool = PoolOf(hr);
-        classify(va, hr);
+        classify(va, hr, true);
     }
     // The element types a class's parameters reach arrays of that its storage
     // holds only as one array's elements (RootArg::onearray); a class passed
@@ -2115,6 +2120,13 @@ inline void TypeCheck::NoteExit(int tf, Node *at, vector<RetRoot> results,
     auto exitlinks = [&] {
         auto spec = frames[current].spec;
         FnRecord::ExitLinks exit { CallerKills(spec, true), cur.links.ClassStores(), cur.links.prefixes };
+        if (spec && !spec->incycle && !spec->sf->isrec) {
+            exit.suffixes = cur.links.suffixeffects;
+            erase_if(exit.suffixes.changes, [&](const auto &p) {
+                auto base = p.first->base;
+                return (base->ownerspec == spec && !base->isparam) || p.second.owner->ownerspec == spec;
+            });
+        }
         exit.prefixes.Forget([&](VarDef *v) {
             return v->ownerspec == spec && !(v->isparam && !v->isvar && IsAddressRef(v->type));
         });
@@ -2150,7 +2162,7 @@ inline void TypeCheck::NoteExit(int tf, Node *at, vector<RetRoot> results,
                 }
             }
             o.maybeassigned.insert(x.maybeassigned.begin(), x.maybeassigned.end());
-            o.links.Join(x.links);
+            o.links.Join(x.links, *this);
             for (auto &a : x.interrupted) a.AddTo(o.interrupted, ast.places);
             for (auto &link : x.partialresults) link.AddTo(o.partialresults);
             merge(o.results);
@@ -2170,7 +2182,7 @@ inline void TypeCheck::NoteExit(int tf, Node *at, vector<RetRoot> results,
         merge(target->record.retroots);
         auto &all = target->record.exitlinks;
         if (!e->reached) all = exitlinks();
-        else all.Join(exitlinks());
+        else all.Join(exitlinks(), *this);
     }
     e->reached = true;
 }
@@ -3396,6 +3408,7 @@ inline void TypeCheck::CheckSpecBodyOnce(FnSpec *spec, vector<Val> *argvals, Lin
                     rv->onearray = ra.onearray;
                     classroots[ra.cls] = rv;
                 }
+                classroots[ra.cls]->mayholdrel &= ra.mayholdrel;
                 ReachedThroughRefs(pt, classroots[ra.cls]->classreach);
                 // Members of one class share a root, so they agree on the
                 // pool; a member that names none settles it for all.
@@ -3450,6 +3463,7 @@ inline void TypeCheck::CheckSpecBodyOnce(FnSpec *spec, vector<Val> *argvals, Lin
                     classroots[ra.cls] = rv;
                 }
                 classroots[ra.cls]->poolclass = false;
+                classroots[ra.cls]->mayholdrel &= ra.mayholdrel;
                 ReachedThroughRefs(pt, classroots[ra.cls]->classreach);
                 exactrefs[ra.cls] = false;
                 cr = classroots[ra.cls];
@@ -3506,6 +3520,7 @@ inline void TypeCheck::CheckSpecBodyOnce(FnSpec *spec, vector<Val> *argvals, Lin
                 rv->gsvia = va.gsvia;
                 rv->gselems = va.gselems;
             }
+            rv->mayholdrel &= va.mayholdrel;
             ReachedThroughRefs(pt->ref->sub, rv->classreach);
             rv->poolclass = false;
             if (!va.pool) rv->classpool = nullptr;

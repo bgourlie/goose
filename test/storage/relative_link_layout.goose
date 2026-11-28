@@ -136,6 +136,80 @@ fn remove_new_slots(nodes: Node[>..]&, flag: bool) {
     nodes.pop_n(2);
 }
 
+fn append_node(nodes: Node[>..]&) { nodes.push(Node {}); }
+fn pop_node(nodes: Node[>..]&) { nodes.pop(); }
+fn pop_pair(nodes: Node[>..]&) { pop_node(nodes); pop_node(nodes); }
+
+struct NodeList { nodes: Node[>..] }
+fn append_pair(list: NodeList&, early: bool) {
+    defer { append_node(list.nodes); }
+    fn leave() { append_node(list.nodes); return from append_pair; }
+    if early { leave(); }
+    append_node(list.nodes);
+}
+
+fn keep_link_across_calls(early: bool) {
+    var list = NodeList { nodes: [Node {}, Node {}] };
+    let nodes .= list.nodes;
+    nodes[0].next .= nodes[1];
+    append_node(nodes);
+    nodes.pop();
+    nodes.push(Node {});
+    pop_node(nodes);
+    append_pair(list, early);
+    pop_pair(nodes);
+    assert(nodes.len == 2 && nodes[0].next .== nodes[1]);
+}
+
+fn push_both(a: Node[>..]&, b: Node[>..]&) { a.push(Node {}); b.push(Node {}); }
+fn trim_both(a: Node[>..]&, b: Node[>..]&) { a.pop(); b.pop(); }
+fn trim_and_clear(a: Node[>..]&) { a.pop(); a.clear(); }
+fn captured_trim(a: Node[>..]&) {
+    fn trim() { a.pop(); }
+    trim();
+}
+
+fn append_alias(list: NodeList&, nodes: Node[>..]&) {
+    list.nodes.push(Node {});
+    nodes.push(Node {});
+}
+
+fn link_and_trim(a: Node[>..]&, dst: Node&, src: Node&) { dst.next .= src; a.pop(); }
+
+fn trim_one_path(nodes: Node[>..]&, early: bool) {
+    fn leave() { if early { nodes.pop(); return from trim_one_path; } }
+    leave();
+    nodes.pop();
+}
+
+fn caller_suffixes() {
+    var a: Node[>..] = [Node {}, Node {}];
+    var b: Node[>..] = [Node {}, Node {}];
+    a[0].next .= a[1];
+    b[0].next .= b[1];
+    push_both(a, a);
+    trim_both(a, a);
+    push_both(a, b);
+    trim_both(a, b);
+    fn captured_push(nodes: Node[>..]&) { a.push(Node {}); nodes.push(Node {}); }
+    captured_push(a);
+    trim_one_path(a, true);
+    trim_one_path(a, false);
+    var list = NodeList { nodes: [Node {}, Node {}] };
+    list.nodes[0].next .= list.nodes[1];
+    append_alias(list, list.nodes);
+    list.nodes.pop_n(2);
+    a.push(Node {});
+    link_and_trim(a, b[0], b[1]);
+    a.push(Node {});
+    captured_trim(a);
+    assert(a.len == 2 && a[0].next .== a[1] && b.len == 2 && b[0].next .== b[1]);
+    assert(list.nodes.len == 2 && list.nodes[0].next .== list.nodes[1]);
+    a.push(Node {});
+    trim_and_clear(a);
+    assert(a.len == 0);
+}
+
 fn keep_old_link(i: i64) {
     var nodes: Node[>..] = [Node {}, Node {}];
     nodes[0].next .= nodes[i];
@@ -206,9 +280,14 @@ fn fixed_append_source() {
 const TWO = 1 + 1;
 struct NumberList { focus: i64&<u32>?, values: i64[>..] }
 
+fn push_number(list: NumberList&) { list.values.push(33); }
+fn pop_number(list: NumberList&) { list.values.pop(); }
+
 fn extend() {
     var list = NumberList { values: [11, 22] };
     list.focus .= list.values[1];
+    push_number(list);
+    pop_number(list);
     let alias .= list;
     alias.values.resize(list.values.len + 1, 33);
     const extra: i64 = 2;
@@ -297,6 +376,9 @@ fn main() {
     extend();
     appended_link(1);
     pushed_link_to_first();
+    keep_link_across_calls(false);
+    keep_link_across_calls(true);
+    caller_suffixes();
     keep_old_link(1);
     deferred_new_slots(false);
     deferred_new_slots(true);

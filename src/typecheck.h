@@ -328,106 +328,18 @@ struct TypeCheck {
             auto it = fresh.find(header);
             return it != fresh.end() && it->second.owner == owner ? it->second.count : 0;
         }
-        // A defer starts without knowing the caller's suffix. At each exit
-        // it guarantees the larger of its own fresh count and the incoming
-        // count adjusted by delta. A forward link or an unknown shrink
-        // discards the incoming count for every possibly overlapping owner.
-        struct SuffixEffects {
-            static constexpr int64_t discarded = INT64_MIN;
-            struct Path {
-                int64_t floor, delta;
-                auto operator<=>(const Path &) const = default;
-                int64_t Apply(int64_t incoming) const { return std::max(floor, Add(incoming, delta)); }
-                Path Then(Path next) const { return { next.Apply(floor), Add(delta, next.delta) }; }
-            };
-            using Paths = vector<Path>;
-            struct Change {
-                VarDef *owner;
-                Paths paths;
-                bool operator==(const Change &) const = default;
-            };
-            map<const LinkField *, Change> changes;
-            set<pair<VarDef *, bool>> invalidated;
-            int invaliddepth = -1; // Storage an expired inexact owner could reach (§9.2).
-            bool operator==(const SuffixEffects &) const = default;
-            bool Empty() const { return changes.empty() && invalidated.empty() && invaliddepth < 0; }
-            static int64_t Add(int64_t a, int64_t b) {
-                if (a == discarded || b == discarded || (b < 0 && a < INT64_MIN - b)) return discarded;
-                return b > 0 && a > INT64_MAX - b ? INT64_MAX : a + b;
-            }
-            Paths PathsFor(TypeCheck &tc, const LinkField *header, VarDef *owner) const {
-                if (auto it = changes.find(header); it != changes.end())
-                    return it->second.owner == owner ? it->second.paths : Paths {{ 0, discarded }};
-                if (invaliddepth >= 0 && (Depth(owner) <= invaliddepth || tc.IsClassRoot(owner)))
-                    return {{ 0, discarded }};
-                for (auto [v, exact] : invalidated)
-                    if (tc.MayAliasRoots(owner, true, v, exact) != AL_NO) return {{ 0, discarded }};
-                return {{ 0, 0 }};
-            }
-            // The minimum over all paths is guaranteed. A path with both a
-            // higher floor and a higher offset cannot lower that minimum.
-            static Paths Normalize(Paths paths) {
-                sort(paths.begin(), paths.end());
-                Paths result;
-                for (auto p : paths)
-                    if (result.empty() || p.delta < result.back().delta) result.push_back(p);
-                return result;
-            }
-            static Paths Sequence(const Paths &first, const Paths &next) {
-                Paths result;
-                for (auto p : first) for (auto q : next) result.push_back(p.Then(q));
-                return Normalize(std::move(result));
-            }
-            static Paths Join(Paths first, const Paths &other, bool backedge) {
-                for (auto p : other) {
-                    // A decreasing offset on a backedge may consume the
-                    // whole incoming run. A computed constant remains a bound.
-                    if (backedge && none_of(first.begin(), first.end(), [&](Path q) {
-                            return q.delta <= p.delta && q.floor <= p.floor;
-                        })) {
-                        if (any_of(first.begin(), first.end(), [&](Path q) {
-                                return q.delta >= p.delta && q.floor > p.floor;
-                            })) p.floor = 0;
-                        p.delta = discarded;
-                    }
-                    first.push_back(p);
-                }
-                return Normalize(std::move(first));
-            }
-            void Shift(const LinkField *header, VarDef *owner, const Paths &before, int64_t delta) {
-                changes[header] = { owner, Sequence(before, {{ std::max<int64_t>(delta, 0), delta }}) };
-            }
-            void Forget(TypeCheck &tc, VarDef *owner, bool exact) {
-                invalidated.emplace(owner, exact);
-                erase_if(changes, [&](const auto &p) {
-                    return tc.MayAliasRoots(p.second.owner, true, owner, exact) != AL_NO;
-                });
-            }
-            // The same keys compose in sequence and join across alternatives.
-            template<typename F> void Combine(TypeCheck &tc, const SuffixEffects &other, F combine) {
-                if (Empty() && other.Empty()) return;
-                auto keys = changes;
-                keys.insert(other.changes.begin(), other.changes.end());
-                for (auto &[header, value] : keys)
-                    value.paths = combine(PathsFor(tc, header, value.owner), other.PathsFor(tc, header, value.owner));
-                changes = std::move(keys);
-                invalidated.insert(other.invalidated.begin(), other.invalidated.end());
-                invaliddepth = std::max(invaliddepth, other.invaliddepth);
-            }
-        } suffixeffects;
+        SuffixEffects suffixeffects;
         void ApplySuffixes(TypeCheck &tc, const LinkFlow &body) {
             for (auto it = fresh.begin(); it != fresh.end();) {
                 auto &value = it->second;
                 auto paths = body.suffixeffects.PathsFor(tc, it->first, value.owner);
-                auto count = INT64_MAX;
-                for (auto p : paths) count = std::min(count, p.Apply(value.count));
-                value.count = count;
+                value.count = SuffixEffects::Guaranteed(paths, value.count);
                 if (value.count <= 0) it = fresh.erase(it);
                 else ++it;
             }
             for (auto &[header, value] : body.fresh)
                 fresh[header] = { value.owner, std::max(FreshCount(header, value.owner), value.count) };
-            if (tc.cur.deferring) suffixeffects.Combine(tc, body.suffixeffects, SuffixEffects::Sequence);
+            suffixeffects.Combine(tc, body.suffixeffects, SuffixEffects::Sequence);
         }
         struct LengthKey {
             VarDef *binding;
@@ -521,9 +433,10 @@ struct TypeCheck {
         };
         map<ArrayLit *, FillLinks> fills;
         void ForgetSuffixes(TypeCheck &tc, VarDef *owner, bool exact) {
-            if (tc.cur.deferring) suffixeffects.Forget(tc, owner, exact);
+            owner = tc.SuffixOwner(owner);
+            if (tc.TracksSuffix(owner, exact)) suffixeffects.Forget(tc, owner, exact);
             erase_if(fresh, [&](const auto &p) {
-                return tc.MayAliasRoots(p.second.owner, true, owner, exact) != AL_NO;
+                return tc.SuffixOwnersOverlap(p.second.owner, true, owner, exact);
             });
         }
         void Add(const StoreEvent &e, size_t index, FnRecord::LinkState state) {
@@ -3275,7 +3188,21 @@ struct TypeCheck {
     }
     bool CallMayWrite(FnSpec *spec, const vector<Val> &argvals, const Kill &k);
     vector<FnRecord::CallerKill> CallerKills(FnSpec *spec, bool relative);
-    void NoteShrinkOrder(VarDef *root, TypeExpr *bound, bool mayremove);
+    void NoteShrinkOrder(const LinkShrink &shrink);
+    bool SuffixOwnersOverlap(VarDef *a, bool aexact, VarDef *b, bool bexact);
+    VarDef *SuffixOwner(VarDef *owner);
+    const LinkField *CanonicalSuffixHeader(const LinkField *header);
+    void ClassifySuffixArgs(vector<RootArg> &roots, const MatchInfo &mi, const vector<Val> &args);
+    bool TracksSuffix(VarDef *owner, bool exact) {
+        if (cur.deferring) return true;
+        auto spec = CurRealFrame().spec;
+        if (!spec || spec->isfunval || spec->sf->isrec || spec->incycle) return false;
+        if (!exact || !owner) return true;
+        return owner->ownerspec != spec && (owner->type ? HasRelRefT(LoadType(owner->type)) : owner->mayholdrel);
+    }
+    const LinkField *CallerSuffixHeader(FnSpec *spec, const vector<Val> &args, const LinkField *header,
+                                       VarDef *owner, const Roots &mapped);
+    void ApplyCalleeSuffixes(FnSpec *spec, const vector<Val> &args, const SuffixEffects &exit, const LinkFlow &entry);
     // While a callee's shrink is judged at a call: the store events the call
     // replayed from `base` on, each with the index of the callee's class
     // event it came from (-1: none, or no order known), and how many of
