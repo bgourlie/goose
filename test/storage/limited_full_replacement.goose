@@ -1,6 +1,6 @@
 struct Node { next: Node&<u32>? }
 const TWO = 2;
-const CAP = TWO;
+const CAP: u32 = TWO;
 
 fn pair(shrink: bool) -> Node[..] {
     var nodes: Node[..] = [Node {}, Node {}];
