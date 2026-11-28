@@ -3698,7 +3698,7 @@ inline void TypeCheck::CheckRebind(Assign *a, LVal &lv) {
         }
         wasplain = IsPlainRef(v.type);
         if (IsSelfRelRef(target)) {
-            curdst.backwardlink = BackwardElementRebind(a->lval, a->rhs);
+            curdst.backwardlink = BackwardElementRebind(a->lval, a->rhs, v);
         }
         MustFit(v, a->rhs, target);
     }

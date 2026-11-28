@@ -64,6 +64,34 @@ fn same_element(i: i64) {
     else { assert(nodes[0].owner == null); }
 }
 
+fn copy_backward(nodes: Node[>..]&) {
+    nodes[1].next .= nodes[0];
+    nodes[1].next .= nodes[1].next;
+    nodes[2].next .= nodes[1].next;
+    nodes[3].next .= nodes[2].next;
+    nodes.pop_n(1);
+}
+
+struct LinkedPair { next: LinkedPair&<u32>?, alt: LinkedPair&<u32>? }
+
+fn copy_indexed(nodes: LinkedPair[>..]&, i: i64) {
+    nodes[i].next .= nodes[0];
+    nodes[i].alt .= nodes[i].next;
+    nodes.pop();
+}
+
+fn copied_links() {
+    var pair: LinkedPair[>..] = [LinkedPair {}; 3];
+    copy_indexed(pair, 1);
+    assert(pair.len == 2 && pair[1].alt .== pair[0]);
+    var nodes: Node[>..] = [Node {}; 4];
+    copy_backward(nodes);
+    assert(nodes.len == 3 && nodes[2].next .== nodes[0]);
+    nodes[2].next .= nodes[1].next;
+    nodes.pop_n(1);
+    assert(nodes.len == 2 && nodes[1].next .== nodes[0]);
+}
+
 fn same_constant_element() {
     var nodes: Bucket[>..] = [Bucket {}, Bucket {}];
     var calls = 0;
@@ -456,6 +484,7 @@ fn main() {
     same_element(0);
     same_element(1);
     same_constant_element();
+    copied_links();
     let converted: Node[] = as_limited();
     assert(converted.len == 2 && converted[0].next .== converted[1]);
     let pair: Node[] = forward_pair();

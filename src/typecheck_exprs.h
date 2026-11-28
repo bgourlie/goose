@@ -506,6 +506,7 @@ inline bool TypeCheck::SlotLoadWritable(TypeExpr *t, bool path) {
 // reference or slice is a read-back (ReadBackLVal).
 inline Val TypeCheck::ContainerRead(LVal lv) {
     Val v;
+    if (cur.bindingread && IsSelfRelRef(lv.type)) v.backwardslot = ReadBackwardSlot(lv);
     if (lv.type->kind != TY_REF) v.refplace = lv.place;
     if (lv.type->kind == TY_SLICE) {
         v.slot = lv;

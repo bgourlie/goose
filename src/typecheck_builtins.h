@@ -4487,9 +4487,35 @@ inline bool TypeCheck::SameIndexValue(Node *a, Node *b) {
     return SamePath(a, b, PathInterval::ConsecutiveReads);
 }
 
+// Read the direction before loading the reference loses its slot's location.
+inline bool TypeCheck::ReadBackwardSlot(const LVal &slot) {
+    if (!slot.Exact() || slot.unknown || !slot.Root() || slot.intemp) return false;
+    auto owner = slot.Root();
+    auto field = slot.place.fields.Cover();
+    auto known = !cur.deferring && !owner->isglobal && !owner->isparam && owner->type &&
+                 owner->ownerspec == CurRealFrame().spec;
+    if (!known) {
+        // A caller or an earlier execution of a defer can supply contents
+        // missing from this body's writes. A covering overwrite supersedes them.
+        auto exact = OverwrittenPart(nullptr, slot, slot.type, storeevents.size(), &slot.place);
+        known = any_of(cur.kills.begin(), cur.kills.end(), [&](const Kill &k) {
+            if (!k.relative || k.prefixonly || !k.guard.Committed() || k.container != owner) return false;
+            return (field.base == k.base && FieldPathWithin(field.Path(), k.path)) ||
+                   (exact && exact->guard.Committed() && exact->base == k.base && FieldPathWithin(exact->path, k.path));
+        });
+    }
+    if (!known) return false;
+    for (auto &[part, write] : cur.links.live) {
+        if (part.link.direction != EL_ANY || write.cleared.Committed() ||
+            part.field.ApartFrom(field.base, field.Path())) continue;
+        if (MayAliasRoots(part.owner, !storeevents[write.at].bound, owner, true) != AL_NO) return false;
+    }
+    return true;
+}
+
 // A suffix removal preserves the target of a retained link to the same or
 // an earlier element. Only inline fields stay within the indexed element.
-inline bool TypeCheck::BackwardElementRebind(Node *slot, Node *value) {
+inline bool TypeCheck::BackwardElementRebind(Node *slot, Node *value, const Val &read) {
     auto u = Is<Unary>(value);
     // A binding or push result can name the element by reference. Loading a
     // reference out of one of its fields or slots leaves that element.
@@ -4504,6 +4530,8 @@ inline bool TypeCheck::BackwardElementRebind(Node *slot, Node *value) {
     };
     auto field = element(slot);
     Node *targetbase = Is<Ident>(value);
+    auto copied = read.backwardslot && (Is<Dot>(value) || Is<Index>(value));
+    if (copied) targetbase = element(value);
     if (u && u->op == T_BITAND) {
         auto path = AddressedPath(u);
         targetbase = path == u ? Is<Ident>(u->child) : element(path);
@@ -4523,7 +4551,7 @@ inline bool TypeCheck::BackwardElementRebind(Node *slot, Node *value) {
         if (origin && origin->appended && prior->elementarray == origin->elementarray &&
             prior->elementdecl < origin->elementdecl) return true;
     }
-    if (!u || u->op != T_BITAND) return false;
+    if (!copied && (!u || u->op != T_BITAND)) return false;
     auto a = Is<Index>(field), b = Is<Index>(targetbase);
     if (!b) return false;
     if (a && SamePath(a, b, PathInterval::ConsecutiveReads)) return true;

@@ -3423,7 +3423,8 @@ struct TypeCheck {
     enum class PathInterval { ConsecutiveReads, AcrossStatements };
     bool SamePath(Node *a, Node *b, PathInterval interval);
     bool SameIndexValue(Node *a, Node *b);
-    bool BackwardElementRebind(Node *slot, Node *value);
+    bool ReadBackwardSlot(const LVal &slot);
+    bool BackwardElementRebind(Node *slot, Node *value, const Val &read);
     // An array a shrink may free (§5.1, §5.2): the one in root's own storage,
     // or, where root cannot hold one, one its storage leads to through the
     // references it holds (`bound`: root only bounds that array's lifetime).

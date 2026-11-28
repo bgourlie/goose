@@ -1243,6 +1243,7 @@ struct ArrayExtent {
     bool operator==(const ArrayExtent &) const = default;
 };
 struct Val : Prov {
+    bool backwardslot = false; // A directly loaded relative slot can only link to its element or an earlier one.
     // Storage denoted by an lvalue, or by a reference when non-null. A
     // copied value and a reference read back from a slot have no known place.
     RefPlace refplace;
