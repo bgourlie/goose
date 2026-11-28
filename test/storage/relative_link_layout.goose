@@ -74,6 +74,50 @@ fn copy_backward(nodes: Node[>..]&) {
 
 struct LinkedPair { next: LinkedPair&<u32>?, alt: LinkedPair&<u32>? }
 
+struct InlineLink { target: i64&<u32>? }
+struct InlineNode { values: i64[2] = [3, 7], links: InlineLink[2] = [InlineLink {}; 2] }
+struct RowCell { value: i64 = 3, link: i64&<u32>? }
+struct Row { cells: RowCell[2] = [RowCell {}; 2] }
+
+fn point_within(node: InlineNode&) { node.links[1].target .= node.values[1]; }
+fn point_within_row(row: Row&) { row.cells[0].link .= row.cells[1].value; }
+
+fn fixed_array_alias(reverse: bool) {
+    var rows: Row[>..] = [Row {}; 2];
+    point_within_row(rows[0]);
+    {
+        let cells .= rows[0].cells;
+        if reverse { cells[1].link .= rows[0].cells[0].value; }
+        else { rows[0].cells[1].link .= cells[0].value; }
+    }
+    rows.pop();
+    assert(rows[0].cells[0].link .== rows[0].cells[1].value);
+    assert(rows[0].cells[1].link .== rows[0].cells[0].value);
+}
+
+fn fixed_array_elements() {
+    var rows: RowCell[2][>..] = [[RowCell {}; 2]; 2];
+    {
+        let added .= rows.push([RowCell {}; 2]);
+        added[0].link .= rows[0][1].value;
+    }
+    rows.push([RowCell {}; 2])[1].link .= rows[0][0].value;
+    rows.pop_n(1);
+    assert(rows[2][0].link .== rows[0][1].value);
+}
+
+fn inline_array_links(i: i64) {
+    var nodes: InlineNode[>..] = [InlineNode {}; 2];
+    nodes[i].links[0].target .= nodes[i].values[1];
+    point_within(nodes[i]);
+    {
+        let added .= nodes.push(InlineNode {});
+        added.links[1].target .= nodes[0].values[1];
+    }
+    nodes.pop_n(1);
+    assert(nodes[i].links[0].target .== nodes[i].values[1]);
+}
+
 fn copy_indexed(nodes: LinkedPair[>..]&, i: i64) {
     nodes[i].next .= nodes[0];
     nodes[i].alt .= nodes[i].next;
@@ -81,6 +125,11 @@ fn copy_indexed(nodes: LinkedPair[>..]&, i: i64) {
 }
 
 fn copied_links() {
+    fixed_array_elements();
+    fixed_array_alias(false);
+    fixed_array_alias(true);
+    inline_array_links(0);
+    inline_array_links(1);
     var pair: LinkedPair[>..] = [LinkedPair {}; 3];
     copy_indexed(pair, 1);
     assert(pair.len == 2 && pair[1].alt .== pair[0]);

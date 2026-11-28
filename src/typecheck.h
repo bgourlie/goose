@@ -3424,6 +3424,14 @@ struct TypeCheck {
     bool SamePath(Node *a, Node *b, PathInterval interval);
     bool SameIndexValue(Node *a, Node *b);
     bool ReadBackwardSlot(const LVal &slot);
+    struct ElementPosition {
+        Node *base;
+        bool insidefixed; // An inline fixed-array subscript lies between the slot and this base.
+        bool consecutive; // Inner subscripts preserved the values read at this position.
+    };
+    using ElementPath = small_vector<ElementPosition, 2>;
+    ElementPath InlineElementPath(Node *n, bool destination);
+    bool BackwardElementOrder(const ElementPosition &slot, const ElementPosition &target);
     bool BackwardElementRebind(Node *slot, Node *value, const Val &read);
     // An array a shrink may free (§5.1, §5.2): the one in root's own storage,
     // or, where root cannot hold one, one its storage leads to through the

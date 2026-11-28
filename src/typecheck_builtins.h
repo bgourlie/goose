@@ -4515,34 +4515,39 @@ inline bool TypeCheck::ReadBackwardSlot(const LVal &slot) {
     return true;
 }
 
-// A suffix removal preserves the target of a retained link to the same or
-// an earlier element. Only inline fields stay within the indexed element.
-inline bool TypeCheck::BackwardElementRebind(Node *slot, Node *value, const Val &read) {
-    auto u = Is<Unary>(value);
-    // A binding or push result can name the element by reference. Loading a
-    // reference out of one of its fields or slots leaves that element.
-    auto element = [](Node *n) -> Node * {
-        while (auto d = Is<Dot>(n)) {
-            if (d->fieldidx < 0 || !d->obj->exprtype) return nullptr;
-            n = d->obj;
-            if (IsRefOrSlice(n->exprtype))
-                return Is<Ident>(n) || Is<Call>(n) ? n : nullptr;
+// Each inline fixed-array subscript identifies an element at its own level.
+// Keep it as well as the enclosing element: an alias may name either array.
+inline TypeCheck::ElementPath TypeCheck::InlineElementPath(Node *n, bool destination) {
+    ElementPath path;
+    bool insidefixed = false;
+    bool consecutive = true;
+    while (auto obj = PathObject(n)) {
+        auto t = obj->exprtype;
+        if (!t) return path;
+        if (auto ix = Is<Index>(n)) {
+            path.push_back({ ix, insidefixed, consecutive });
+            if (!IsArrayKind(IsPlainRef(t) ? t->ref->sub : t, A_FIXED)) return path;
+            insidefixed = true;
+            // A destination's inner subscript runs between the two outer index reads.
+            if (destination) consecutive &= EvalMeets(ix->idx, EvalRequirement::ReadOnly);
         }
-        return n;
-    };
-    auto field = element(slot);
-    Node *targetbase = Is<Ident>(value);
-    auto copied = read.backwardslot && (Is<Dot>(value) || Is<Index>(value));
-    if (copied) targetbase = element(value);
-    if (u && u->op == T_BITAND) {
-        auto path = AddressedPath(u);
-        targetbase = path == u ? Is<Ident>(u->child) : element(path);
+        n = obj;
+        if (IsRefOrSlice(t)) break; // The pointee has its own storage.
     }
-    auto source = Is<Ident>(field), targetref = Is<Ident>(targetbase);
+    if (Is<Ident>(n) || Is<Call>(n)) path.push_back({ n, insidefixed, consecutive });
+    return path;
+}
+
+// A suffix removal preserves the target of a retained link to the same or an earlier element.
+inline bool TypeCheck::BackwardElementOrder(const ElementPosition &slot, const ElementPosition &target) {
+    auto source = Is<Ident>(slot.base), targetref = Is<Ident>(target.base);
     auto binding = targetref ? targetref->vdef : nullptr;
-    if (binding && source && source->vdef == binding && !binding->isvar && IsAddressRef(binding->type))
-        return true;
-    auto call = Is<Call>(field);
+    if (binding && source && source->vdef == binding && !binding->isvar && IsAddressRef(binding->type)) {
+        // If both endpoints are in this binding's fixed array, its own
+        // element order still matters when the array is used on its own.
+        if (!slot.insidefixed || !target.insidefixed || !IsArrayKind(binding->type->ref->sub, A_FIXED)) return true;
+    }
+    auto call = Is<Call>(slot.base);
     auto appended = call && call->builtin == B_PUSH ? call->appendedarray : nullptr;
     auto origin = source && source->vdef ? source->vdef->elementorigin : nullptr;
     if (origin && !InScope(origin, origin->elementdecl)) origin = nullptr;
@@ -4553,10 +4558,9 @@ inline bool TypeCheck::BackwardElementRebind(Node *slot, Node *value, const Val 
         if (origin && origin->appended && prior->elementarray == origin->elementarray &&
             prior->elementdecl < origin->elementdecl) return true;
     }
-    if (!copied && (!u || u->op != T_BITAND)) return false;
-    auto a = Is<Index>(field), b = Is<Index>(targetbase);
+    auto a = Is<Index>(slot.base), b = Is<Index>(target.base);
     if (!b) return false;
-    if (a && SamePath(a, b, PathInterval::ConsecutiveReads)) return true;
+    if (a && slot.consecutive && SamePath(a, b, PathInterval::ConsecutiveReads)) return true;
     auto array = a ? a->arrayheader : origin ? origin->elementarray : appended;
     if (!array || array != b->arrayheader) return false;
     if (b->constantindex == 0) return true; // Every valid source index is at least zero.
@@ -4564,7 +4568,22 @@ inline bool TypeCheck::BackwardElementRebind(Node *slot, Node *value, const Val 
     if (a->constantindex >= 0 && b->constantindex >= 0) return b->constantindex <= a->constantindex;
     // The right-hand base runs between the two subscript evaluations. It
     // can return the same array while changing a variable the index reads.
-    return SameIndexValue(a->idx, b->idx) && EvalMeets(b->obj, EvalRequirement::ReadOnly);
+    return slot.consecutive && SameIndexValue(a->idx, b->idx) && EvalMeets(b->obj, EvalRequirement::ReadOnly);
+}
+
+inline bool TypeCheck::BackwardElementRebind(Node *slot, Node *value, const Val &read) {
+    Node *target = Is<Ident>(value);
+    if (read.backwardslot && (Is<Dot>(value) || Is<Index>(value))) target = value;
+    if (auto u = Is<Unary>(value); u && u->op == T_BITAND) {
+        auto path = AddressedPath(u);
+        target = path == u ? Is<Ident>(u->child) : path;
+    }
+    if (!target) return false;
+    auto targets = InlineElementPath(target, false);
+    for (auto &field : InlineElementPath(slot, true))
+        for (auto &to : targets)
+            if (BackwardElementOrder(field, to)) return true;
+    return false;
 }
 
 // Consecutive reads can follow the same subscript when evaluating the path
