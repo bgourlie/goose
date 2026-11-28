@@ -2436,10 +2436,11 @@ inline vector<TypeCheck::DeferBinding> TypeCheck::DeferBindings(Defer *d) {
     set<VarDef *> seen;
     vector<DeferBinding> bindings;
     auto visit = [&](auto &&self, VarDef *v) -> void {
-        if (!v || v->isglobal || !seen.insert(v).second) return;
+        if (!v || !seen.insert(v).second) return;
+        if (v->isglobal && (!v->type || v->isvar || !IsIntT(v->type))) return;
         if (v->type && (HoldsPlainRef(v->type) || (!v->isvar && IsIntT(v->type))))
             bindings.push_back({ EnvReadOf(v), cur.links.GetTarget(LinkFlow::BindingKey(v)),
-                                 cur.links.borrowedindices.count(v) != 0, cur.links.Measured(v) });
+                                 cur.links.borrowedindices.count(v) != 0, cur.links.LengthsOf(v) });
         // A captured element reference also depends on the integer that
         // selected its slot, even when the defer never names the index.
         if (v->refplace.indexed.array) {
@@ -2506,7 +2507,7 @@ inline void TypeCheck::RefreshDeferredBody(DeferEffects &effects) {
                    r.slotref != r.var->slotref || r.refplace != r.var->refplace ||
                    binding.target != cur.links.GetTarget(LinkFlow::BindingKey(r.var)) ||
                    binding.borrowedindex != (cur.links.borrowedindices.count(r.var) != 0) ||
-                   binding.length != cur.links.Measured(r.var);
+                   binding.lengths != cur.links.LengthsOf(r.var);
         })) return;
     auto exit = SaveFlow();
     {
@@ -2599,8 +2600,7 @@ inline void TypeCheck::RunExitDefers(int first, ScopeExit exit, span<const FnRec
             // inputs. A completing resize can establish a stronger bound.
             if (it->env) for (auto &binding : it->env->bindings) {
                 auto v = binding.read.var;
-                auto measured = it->exit.writes.Measured(v);
-                if (measured.header) cur.links.lengths[v] = measured;
+                for (auto &[key, bound] : it->exit.writes.LengthsOf(v)) cur.links.lengths[key] = bound;
             }
         }
     }
@@ -3367,7 +3367,7 @@ inline void TypeCheck::CheckVarDecl(VarDecl *vd, bool global) {
             if (len->measuredarray && IsArrayKind(array, A_GROW)) {
                 auto value = nodevals.find(len->obj);
                 if (value && value->Exact() && value->Root() && !IsTemp(value->Root()))
-                    cur.links.lengths[d] = { len->measuredarray, value->Root() };
+                    cur.links.lengths[{ d, len->measuredarray }] = { value->Root() };
             }
         }
     }

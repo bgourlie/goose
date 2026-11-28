@@ -429,17 +429,27 @@ struct TypeCheck {
                 fresh[header] = { value.owner, std::max(FreshCount(header, value.owner), value.count) };
             if (tc.cur.deferring) suffixeffects.Combine(tc, body.suffixeffects, SuffixEffects::Sequence);
         }
+        struct LengthKey {
+            VarDef *binding;
+            const LinkField *header;
+            auto operator<=>(const LengthKey &) const = default;
+            auto operator<=>(VarDef *v) const { return std::compare_three_way {}(binding, v); }
+        };
         struct Measurement {
-            const LinkField *header = nullptr;
             VarDef *owner = nullptr;
             CountProof valid = true; // Possible writers that must name a different array.
             bool operator==(const Measurement &) const = default;
         };
         // A saved length bounds the current length until a possible growth.
-        map<VarDef *, Measurement> lengths;
-        Measurement Measured(VarDef *binding) const {
-            auto it = lengths.find(binding);
+        map<LengthKey, Measurement, std::less<>> lengths;
+        Measurement Measured(LengthKey key) const {
+            auto it = lengths.find(key);
             return it == lengths.end() ? Measurement {} : it->second;
+        }
+        using BindingLengths = vector<pair<LengthKey, Measurement>>;
+        BindingLengths LengthsOf(VarDef *binding) const {
+            auto [first, last] = lengths.equal_range(binding);
+            return { first, last };
         }
         // Integer bindings whose address may already have escaped on this path.
         set<VarDef *> borrowedindices;
@@ -538,7 +548,7 @@ struct TypeCheck {
             });
             erase_if(fresh, [&](const auto &p) { return expired(p.first->base) || expired(p.second.owner); });
             erase_if(lengths, [&](const auto &p) {
-                return expired(p.first) || expired(p.second.header->base) || expired(p.second.owner);
+                return expired(p.first.binding) || expired(p.first.header->base) || expired(p.second.owner);
             });
             erase_if(borrowedindices, expired);
             erase_if(targets, [&](const auto &p) {
@@ -568,7 +578,7 @@ struct TypeCheck {
             for (auto it = lengths.begin(); it != lengths.end();) {
                 auto &m = it->second;
                 auto next = other.Measured(it->first);
-                if (next.header != m.header || next.owner != m.owner) it = lengths.erase(it);
+                if (next.owner != m.owner) it = lengths.erase(it);
                 else { m.valid = m.valid.Both(next.valid); ++it; }
             }
             for (auto it = fresh.begin(); it != fresh.end();) {
@@ -852,7 +862,7 @@ struct TypeCheck {
         EnvRead read;
         LiveTarget target;
         bool borrowedindex;
-        LinkFlow::Measurement length;
+        LinkFlow::BindingLengths lengths;
     };
     // A defer sees its original declarations and the bindings at execution.
     struct DeferEnv {
@@ -3174,7 +3184,7 @@ struct TypeCheck {
     bool MeasuresReceiver(Node *expr, Node *receiver, const Val &value, TypeExpr *array, BuiltinKind member);
     SlotRemoval CountedRemoval(BuiltinKind op, const vector<Node *> &args, const Val &count,
                                TypeExpr *array, const Val &receiver, CountProof &condition,
-                               CountProof fillpreserves = true, CountProof savedlength = false);
+                               CountProof fillpreserves = true);
     void CheckByteOut(Call *c, Node *out, const string &form);
     // Later passes walk only the arguments that can execute. Overload
     // resolution on a subsequent check still needs the call as written.
@@ -3201,7 +3211,7 @@ struct TypeCheck {
     const string *EmbedShader(Call *c, vector<Node *> &args);
     const string *EmbedFile(Call *c, vector<Node *> &args);
     void CheckGrowShrink(Node *at, const char *op, Node *recv, const Val &rv,
-                         SlotRemoval removal, CountProof condition, const LinkField *popheader, int64_t popped);
+                         SlotRemoval removal, CountProof condition, CountProof savedlength, const LinkField *popheader, int64_t popped);
     bool RelyOnCountProof(CountProof proof, Node *at, const char *use);
     bool LiveConversionTargets(const ValueLinks &links, CountProof whole, Node *at);
     void GrowOnlyAssignKnown(Assign *a, const Roots &built, bool whole);

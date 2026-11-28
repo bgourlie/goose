@@ -1058,9 +1058,10 @@ struct CountProof {
                                  condition->names.size() + condition->distinct.size()) return other;
         return *this;
     }
-    static CountProof IfUnchanged(set<CountCondition> &pool, VarDef *name) {
+    static CountProof IfBindingUnchanged(set<CountCondition> &pool, VarDef *name) {
         return CountProof(&*pool.insert({ { name }, {}, &pool }).first);
     }
+    static CountProof IfUnchanged(set<CountCondition> &pool, VarDef *name);
     static CountProof IfDistinct(set<CountCondition> &pool, DistinctArrays arrays) {
         return CountProof(&*pool.insert({ {}, { arrays }, &pool }).first);
     }
@@ -2790,19 +2791,21 @@ struct RootArg {
     }
 };
 
+inline CountProof CountProof::IfUnchanged(set<CountCondition> &pool, VarDef *name) {
+    CountCondition condition { {}, {}, &pool };
+    for (auto d = name; d; d = d->constfrom) condition.names.insert(d);
+    return CountProof(&*pool.insert(std::move(condition)).first);
+}
+
 inline bool CountProof::Available() const {
     if (!condition) return false;
-    for (auto name : condition->names)
-        for (auto d = name; d; d = d->constfrom)
-            if (d->refwrite) return false;
+    for (auto d : condition->names) if (d->refwrite) return false;
     return true;
 }
 
 inline bool CountProof::Committed() const {
     if (!condition || !condition->distinct.empty()) return false;
-    for (auto name : condition->names)
-        for (auto d = name; d; d = d->constfrom)
-            if (!d->type->cq && !d->constuse) return false;
+    for (auto d : condition->names) if (!d->type->cq && !d->constuse) return false;
     return true;
 }
 

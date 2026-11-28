@@ -10,6 +10,8 @@ let zero_count = 0;
 let other_zero = 0;
 let unused_zero = 0;
 let unused_limited_count = 0;
+let size_source = 2;
+let copied_size = size_source;
 
 fn zero() -> i64 { 0 }
 fn plus_one(n: i64) -> i64 { n + 1 }
@@ -67,6 +69,46 @@ fn restore_before_link(nodes: Node[>..]&, scratch: Node[>..]&) {
     { defer { nodes.resize(size); } }
     nodes[0].next .= nodes[1];
     nodes.resize(size);
+}
+
+fn restore_both_counts() {
+    var a: Node[>..] = [Node {}, Node {}];
+    var b: Node[>..] = [Node {}, Node {}, Node {}];
+    const size = a.len;
+    a.push(Node {});
+    { defer { a.resize(size); } }
+    b.resize(size);
+    a[0].next .= a[1];
+    b[0].next .= b[1];
+    a.resize(size);
+    b.resize(size);
+    assert(a.len == 2 && a[0].next .== a[1]);
+    assert(b.len == 2 && b[0].next .== b[1]);
+}
+
+fn keep_copied_size() {
+    var nodes: Node[>..] = [Node {}, Node {}];
+    nodes.resize(copied_size);
+    nodes[0].next .= nodes[1];
+    change(size_source);
+    nodes.resize(copied_size);
+    assert(nodes.len == 2 && nodes[0].next .== nodes[1]);
+}
+
+fn clear_twice(nodes: Node[>..]&, scratch: Node[>..]&) {
+    nodes.resize(ZERO);
+    scratch.push(Node {});
+    scratch.push(Node {});
+    scratch[0].next .= scratch[1];
+    nodes.resize(ZERO);
+}
+
+fn clear_selected(flag: bool) {
+    var nodes: Node[>..] = [];
+    var other: Node[>..] = [];
+    let scratch: Node[>..]& = if flag { nodes } else { other };
+    clear_twice(nodes, scratch);
+    assert(nodes.len == 0);
 }
 
 fn restore_selected(flag: bool) {
@@ -290,6 +332,10 @@ fn main() {
     assert(other_nodes.len == 3 && nodes[0].next .== nodes[1]);
     restore_selected(false);
     restore_selected(true);
+    restore_both_counts();
+    keep_copied_size();
+    clear_selected(false);
+    clear_selected(true);
     keep_on_exit(nodes, scratch);
     assert(scratch.len == 2);
     nodes.pop_n(zero_count);

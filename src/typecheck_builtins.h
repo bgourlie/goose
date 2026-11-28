@@ -31,13 +31,12 @@ inline bool TypeCheck::MeasuresReceiver(Node *expr, Node *receiver, const Val &v
 // The count and, for resize, the fill have already been checked in evaluation order.
 inline TypeCheck::SlotRemoval TypeCheck::CountedRemoval(BuiltinKind op, const vector<Node *> &args,
                                                         const Val &count, TypeExpr *array, const Val &receiver,
-                                                        CountProof &condition, CountProof fillpreserves, CountProof savedlength) {
+                                                        CountProof &condition, CountProof fillpreserves) {
     assert(op == B_POP_N || op == B_RESIZE);
     auto preserves = [&](CountProof proof) {
         condition = proof;
         return proof.Unconditional() ? SlotRemoval::None : SlotRemoval::PreservesIfUnchanged;
     };
-    if (auto proof = savedlength.Both(fillpreserves); proof.Available()) return preserves(proof);
     if (op == B_RESIZE && IsArrayKind(array, A_LIMITED) && MeasuresReceiver(args[1], args[0], receiver, array, B_CAP))
         return SlotRemoval::ToCapacity;
     if (MeasuresReceiver(args[1], args[0], receiver, array, B_LEN)) {
@@ -505,17 +504,6 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
         }
         elem = rt->arr->sub;
     }
-    // Save the measurement before logging this resize's own potential growth.
-    VarDef *sizebinding = nullptr;
-    LinkFlow::Measurement measured;
-    if (d.kind == B_RESIZE && ak == A_GROW && !cur.links.lengths.empty()) {
-        if (auto id = Is<Ident>(args[1])) {
-            sizebinding = LookupVar(id->name, id->ns);
-            measured = cur.links.Measured(sizebinding);
-            if (measured.header != ArrayHeader(rv, recvarr) || !rv.Exact() || rv.Root() != measured.owner)
-                measured = {};
-        }
-    }
     // For counted operations the operands determine whether the receiver
     // can grow. Growth within an operand is logged by the operand itself.
     auto grow = [&](bool stackonly = false) {
@@ -576,10 +564,22 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
     };
     // resize has two forms (§3.3); a target below zero is caught at runtime.
     auto removal = SlotRemoval::None;
-    CountProof countcondition;
+    CountProof countcondition, savedlength;
     if (d.flags & BF_SHRINKS) removal = d.kind == B_CLEAR ? SlotRemoval::All : SlotRemoval::Possible;
     if (d.kind == B_RESIZE) {
         auto length = CheckIntAny(args[1]);
+        LinkFlow::LengthKey key {};
+        LinkFlow::Measurement measured;
+        if (ak == A_GROW && rv.Exact() && rv.Root() && !IsTemp(rv.Root())) {
+            auto id = Is<Ident>(args[1]);
+            if (id && id->vdef && !id->vdef->isvar && IsIntT(id->vdef->type)) {
+                key = { id->vdef, ArrayHeader(rv, recvarr) };
+                if (key.header) {
+                    measured = cur.links.Measured(key);
+                    if (cur.deferring && key.binding->isglobal) NoteDeferMention(key.binding);
+                }
+            }
+        }
         CountProof fillpreserves = true;
         if (args.size() == 3) {
             auto beforefill = cur.growlog.size();
@@ -607,17 +607,16 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
                                    "contains self-relative references, is not supported; push "
                                    "the elements, which constructs each in place"));
         }
-        CountProof savedlength;
-        if (measured.header) {
-            savedlength = measured.valid;
-            if (!sizebinding->type->cq)
-                savedlength = savedlength.Both(CountProof::IfUnchanged(ast.countconditions, sizebinding));
+        if (measured.owner && measured.owner == rv.Root()) {
+            savedlength = measured.valid.Both(fillpreserves);
+            if (!key.binding->type->cq)
+                savedlength = savedlength.Both(CountProof::IfBindingUnchanged(ast.countconditions, key.binding));
         }
-        removal = CountedRemoval(d.kind, args, length, recvarr, rv, countcondition, fillpreserves, savedlength);
+        removal = CountedRemoval(d.kind, args, length, recvarr, rv, countcondition, fillpreserves);
         if (countedgrowth && args.size() == 3 && reachable && KnownIndex(args[1], length) != 0 &&
             !(fillpreserves.Unconditional() && MeasuresReceiver(args[1], args[0], rv, recvarr, B_LEN))) grow();
         // A successful resize installs the evaluated count even when a fill ran.
-        if (measured.header && reachable) cur.links.lengths[sizebinding] = { measured.header, measured.owner };
+        if (key.header && reachable) cur.links.lengths[key] = { rv.Root() };
     }
     // index_of recovers the element index a reference stands for (§3.3).
     // The reference must be an element of this very array, which is what
@@ -845,7 +844,7 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
     LinkFlow::SuffixEffects::Paths before;
     if (header && cur.deferring) before = cur.links.suffixeffects.PathsFor(*this, header, rv.Root());
     if (ak == A_GROW && shrink) {
-        CheckGrowShrink(c, d.name, args[0], rv, removal, countcondition, header, popped);
+        CheckGrowShrink(c, d.name, args[0], rv, removal, countcondition, savedlength, header, popped);
         if (popped > 0 && popped < fresh) cur.links.fresh[header] = { rv.Root(), fresh - popped };
         if (header && popped > 0 && cur.deferring)
             cur.links.suffixeffects.Shift(header, rv.Root(), before, -popped);
@@ -1531,7 +1530,8 @@ inline const string *TypeCheck::EmbedShader(Call *c, vector<Node *> &args) {
 // reference is what shrinks, or it is a struct's tail field, which shrinks
 // the storage the struct lies in, as a reference to the field would.
 inline void TypeCheck::CheckGrowShrink(Node *at, const char *op, Node *recv, const Val &rv,
-                                       SlotRemoval removal, CountProof condition, const LinkField *popheader, int64_t popped) {
+                                       SlotRemoval removal, CountProof condition, CountProof savedlength,
+                                       const LinkField *popheader, int64_t popped) {
     auto at_type = IsPlainRef(rv.type) ? rv.type->ref->sub : rv.type;
     assert(at_type->kind == TY_ARRAY);
     auto roots = rv.AsRoots();
@@ -1544,6 +1544,7 @@ inline void TypeCheck::CheckGrowShrink(Node *at, const char *op, Node *recv, con
         NoteOverwrite(recv, roots, storeevents.size(), at_type, &rv.refplace, nullptr, replacesif);
     ShrinkEffect effect { SB_UNBALANCED, empties ? at_type : nullptr };
     effect.preserves = removal == SlotRemoval::PreservesIfUnchanged ? condition : CountProof(removal == SlotRemoval::None);
+    effect.preserves = effect.preserves.Prefer(savedlength);
     effect.replacesif = replacesif;
     ShrinkThrough(at, op, ExprStr(recv), roots, at_type, effect, popheader, popped);
 }
@@ -2497,7 +2498,7 @@ inline bool TypeCheck::RelyOnCountProof(CountProof proof, Node *at, const char *
             cat("the ", reason, " relies on growth leaving the measured array's length unchanged") });
     for (auto count : proof.condition->names) {
         ConstUse use { at, reason, count };
-        for (auto d = count; d; d = d->constfrom) RelyOnConstant(use, d);
+        RelyOnConstant(use, count);
     }
     return true;
 }
@@ -5483,7 +5484,7 @@ inline void TypeCheck::InvalidateLengths(VarDef *owner, bool exact, TypeExpr *ar
     for (auto it = cur.links.lengths.begin(); it != cur.links.lengths.end();) {
         auto &m = it->second;
         if ((exit && exit->Measured(it->first) == m) ||
-            (array && !TopConstEq(FieldPathType(m.header->base, m.header->path), array))) {
+            (array && !TopConstEq(FieldPathType(it->first.header->base, it->first.header->path), array))) {
             ++it;
             continue;
         }
