@@ -1405,14 +1405,15 @@ inline void TypeCheck::CheckRenderable(Call *c, const char *what, TypeExpr *t, N
         case TY_ARRAY: case TY_SLICE: {
             auto elem = t->kind == TY_ARRAY ? t->arr->sub : t->sub;
             if (IsU8(elem)) return;  // RenderLoc emits the entire byte string.
-            auto count = IsArrayKind(t, A_FIXED) ? ArraySize(t->arr) : -1;
-            Saved executing(seen.executes, seen.executes && count != 0);
+            auto maxcount = HasStaticArrayCapacity(t) ? ArraySize(t->arr) : -1;
+            auto mincount = IsArrayKind(t, A_FIXED) ? maxcount : 0;
+            Saved executing(seen.executes, seen.executes && maxcount != 0);
             auto base = c->fmtspecs.size();
             auto element = [&] {
                 c->fmtspecs.resize(base);  // Keep overloads from the settled pass.
                 child(elem, IsRefOrSlice(elem));
             };
-            if (seen.executes) CheckElementRuns(at, std::max<int64_t>(0, count), count, element);
+            if (seen.executes) CheckElementRuns(at, mincount, maxcount, element);
             else element();  // Resolve the element's format overloads for codegen.
             return;
         }

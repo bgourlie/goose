@@ -12,6 +12,11 @@ struct Label { n: i64 = { let text = str(Mark {}); text.len } }
 
 fn main() {
     nodes[0].next .= nodes[1];
+    let empty: Trim[..0] = [];
+    assert(str(empty) == "[]" && nodes.len == 2);
+    let trims: Trim[..2] = [Trim {}; 2];
+    nodes.append([Node {}; 2]);
+    assert(str(trims) == "[X, X]" && nodes[0].next .== nodes[1]);
     nodes.append([Node {}; 2]);
     assert(str([Trim {}; 2]) == "[X, X]");
     assert(nodes.len == 2 && nodes[0].next .== nodes[1]);
