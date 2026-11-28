@@ -3268,7 +3268,7 @@ inline void TypeCheck::CheckVarDecl(VarDecl *vd, bool global) {
         } else if (v && HoldsPlainRef(t)) {
             NoteHolderBinding(d, *v, init);
         }
-        if (!global && v) RecordConstructedLength(Dest(d), t, v->extent);
+        if (v) RecordConstructedLength(Dest(d), t, v->extent);
         if (vd->reusable) {
             auto kw = vd->reusable == RU_SLICES ? "reusable[]" : "reusable";
             if (!vd->isvar) Error(vd, cat(kw, " requires var"));
