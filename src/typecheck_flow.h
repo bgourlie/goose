@@ -1923,18 +1923,23 @@ inline void TypeCheck::CheckLoopBody(Block *body) {
 // before its binding was checked against the settled facts, so its errors
 // stood and it was the last; one that read such a variable is followed by
 // a settled pass, which reads it as outside a loop would. The loop's
-// scope, with its breaks, is the caller's to read off; the flow is left at
-// the head, where a for exits once its iterations run out, and the caller
-// leaves the loop in the join of the states it exits in, its breaks'
-// among them (JoinBreakFlow).
+// scope carries its breaks back to the caller (JoinBreakFlow). A known
+// positive bound limits which iterations can feed the head and how many
+// complete iterations can contribute to normal fallthrough.
 inline TypeCheck::Scope TypeCheck::CheckLoopPasses(Node *x, FlowState &head,
                                                    const function<void()> &pass,
-                                                   const function<void(FlowState &)> &boundhead) {
+                                                   IterationBounds bounds) {
     auto entry = head;
     auto firstbase = storeevents.size();
     auto warnbase = cur.pendingwarnings.size();
     auto settled = false;
     Scope sc;
+    std::optional<SuffixEffects> step;
+    auto applyruns = [&](FlowState &state, int64_t lo, int64_t hi) {
+        state.links.fresh = entry.links.fresh;
+        state.links.suffixeffects = entry.links.suffixeffects;
+        state.links.ApplySuffixes(*this, step->OverRuns(*this, lo, hi));
+    };
     // What a pass feeds back only grows, so the passes are bounded by the
     // variables in scope and their roots. A pass may move a fact on by just
     // one variable (`a = b; b = c; ...`), so the limit grows with them.
@@ -1946,6 +1951,12 @@ inline TypeCheck::Scope TypeCheck::CheckLoopPasses(Node *x, FlowState &head,
         RestoreFlow(head);
         cur.pendingwarnings.resize(warnbase);
         cur.looppasses.push_back({ (int)scopes.size(), firstbase, storeevents.size(), settled });
+        SuffixEffects prefix;
+        if (bounds.max > 0) {
+            prefix = BodySuffixes();
+            cur.links.suffixeffects = {};
+        }
+        Saved<const SuffixEffects *> recording(cur.iterationprefix, bounds.max > 0 ? &prefix : cur.iterationprefix);
         PushScope(SK_LOOP, x);
         pass();
         if (reachable) RunExitDefers((int)scopes.size() - 1);
@@ -1960,82 +1971,64 @@ inline TypeCheck::Scope TypeCheck::CheckLoopPasses(Node *x, FlowState &head,
         auto lp = cur.looppasses.back();
         cur.looppasses.pop_back();
         auto next = sc.backedges ? JoinFlow(entry, sc.backedge, true) : entry;
-        if (sc.backedges && boundhead) boundhead(next);
+        if (bounds.max > 0) {
+            auto expired = [&](VarDef *v) { return Depth(v) > CurDepth(); };
+            if (sc.breakflows) {
+                // A break only executes the prefix of this iteration that
+                // reached it, after any iterations represented by the head.
+                auto &effects = sc.breakflow.links.suffixeffects;
+                effects.ForgetBindings(expired);
+                auto before = head.links.suffixeffects;
+                before.Combine(*this, effects, SuffixEffects::Sequence);
+                effects = std::move(before);
+            }
+            if (sc.backedges) {
+                // Both fallthrough and continue run their defers before they
+                // supply the transfer for the next iteration.
+                auto &effects = sc.backedge.links.suffixeffects;
+                effects.ForgetBindings(expired);
+                if (!step) step = effects;
+                else step->Combine(*this, effects, [](const auto &a, const auto &b) {
+                    return SuffixEffects::Join(a, b, false);
+                });
+                if (passes + 1 >= bounds.max) next = head; // The last iteration has no successor.
+                applyruns(next, 0, bounds.max - 1);
+            }
+        }
         auto changed = lp.changed || !SameFlow(next, head);
-        head = next;
+        head = std::move(next);
         if (changed) continue;
         if (settled || !(lp.sawunbound || lp.deferred)) break;
         settled = true;
     }
-    RestoreFlow(head);
+    if (bounds.max > 0 && sc.backedges) {
+        auto exit = bounds.min ? sc.backedge : JoinFlow(entry, sc.backedge);
+        applyruns(exit, bounds.min, bounds.max);
+        RestoreFlow(exit);
+    } else if (bounds.min > 0) {
+        if (sc.backedges) RestoreFlow(sc.backedge);
+        else { RestoreFlow(entry); reachable = false; }
+    } else RestoreFlow(head);
     if (!WarningsHeld()) FlushWarnings();
     return sc;
 }
 
-// Effects of an implicit element loop. A negative maximum denotes an unknown
-// bound. Only a loop that can be empty can leave the incoming state untouched.
-inline void TypeCheck::CheckElementRuns(Node *at, int64_t mincount, int64_t maxcount,
+// A zero count skips the implicit operation entirely. A single possible
+// element needs no backedge, and a single required one needs no join.
+inline void TypeCheck::CheckElementRuns(Node *at, IterationBounds bounds,
                                         const function<void()> &element) {
-    if (maxcount == 0) return;
-    if (mincount == 1 && maxcount == 1) {
+    if (!bounds.max) return;
+    if (bounds.min == 1 && bounds.max == 1) {
         element();
         return;
     }
     auto head = SaveFlow();
-    if (maxcount == 1) {
+    if (bounds.max == 1) {
         element();
         MergeFlow(head, SaveFlow());
         return;
     }
-    if (maxcount < 0) {
-        auto loop = CheckLoopPasses(at, head, element);
-        if (mincount > 0) {
-            if (loop.backedges) RestoreFlow(loop.backedge);
-            else reachable = false;
-        }
-        return;
-    }
-    const auto entry = head;
-    const auto depth = CurDepth();
-    std::optional<SuffixEffects> step;
-    auto applyruns = [&](FlowState &state, int64_t lo, int64_t hi) {
-        state.links.fresh = entry.links.fresh;
-        state.links.suffixeffects = entry.links.suffixeffects;
-        state.links.ApplySuffixes(*this, step->OverRuns(*this, lo, hi));
-    };
-    int64_t backedges = 0;
-    auto loop = CheckLoopPasses(at, head, [&] {
-        auto prefix = BodySuffixes();
-        auto before = std::move(cur.links.suffixeffects);
-        cur.links.suffixeffects = {};
-        {
-            Saved<const SuffixEffects *> recording(cur.elementprefix, &prefix);
-            element();
-        }
-        if (reachable) {
-            // A temporary made by this element expires before the next.
-            cur.links.suffixeffects.ForgetBindings([&](VarDef *v) { return Depth(v) > depth; });
-            if (!step) step = cur.links.suffixeffects;
-            else step->Combine(*this, cur.links.suffixeffects, [](const auto &a, const auto &b) {
-                return SuffixEffects::Join(a, b, false);
-            });
-        }
-        before.Combine(*this, cur.links.suffixeffects, SuffixEffects::Sequence);
-        cur.links.suffixeffects = std::move(before);
-    }, [&](FlowState &next) {
-        // The last element has no successor. Only earlier elements can
-        // contribute a new input state to another check of the hook.
-        if (++backedges >= maxcount) next = head;
-        applyruns(next, 0, maxcount - 1);
-    });
-    if (loop.backedges) {
-        auto exit = mincount ? loop.backedge : JoinFlow(entry, loop.backedge);
-        applyruns(exit, mincount, maxcount);
-        RestoreFlow(exit);
-    } else {
-        RestoreFlow(entry);
-        if (mincount) reachable = false;
-    }
+    CheckLoopPasses(at, head, element, bounds);
 }
 
 inline Val TypeCheck::CheckLoop(LoopExpr *x, TypeExpr *expected, bool wantvalue) {
@@ -2083,6 +2076,7 @@ inline void TypeCheck::CheckFor(ForLoop *x) {
     TypeExpr *bindtype = nullptr;
     TypeExpr *elemtype = nullptr;   // The array's element type, where it has one.
     Val sequence;    // A computed sequence is materialized once (§6.5).
+    IterationBounds bounds { 0, -1 };
     // A binder's written integer type (§6.5).
     auto written = [&](TypeExpr *te, const char *what) -> TypeExpr * {
         if (!te) return nullptr;
@@ -2172,6 +2166,7 @@ inline void TypeCheck::CheckFor(ForLoop *x) {
                 bindtype = vartype;
             }
         } else if (t->kind == TY_ARRAY || t->kind == TY_SLICE) {
+            bounds = ArrayIterations(t);
             if (vartype)
                 Error(x, cat("an array's element binds at its element type; a type on a for "
                              "loop's binder is for an integer range or count"));
@@ -2208,9 +2203,7 @@ inline void TypeCheck::CheckFor(ForLoop *x) {
         // else's only the largest length there is (§10.4).
         if (idxtype && (x->iterkind == IK_ARRAY || x->iterkind == IK_SLICE)) {
             auto len = int64_t(1) << 48;
-            if (t->kind == TY_ARRAY &&
-                (t->arr->akind == A_FIXED || (t->arr->akind == A_LIMITED && t->arr->sizeexpr)))
-                len = ArraySize(t->arr);
+            if (bounds.max >= 0) len = bounds.max;
             if (len > 0 && !FitsIntStorage(len - 1, false, idxtype->intstorage))
                 Error(x, cat("an index into ", TypeStr(t), " can reach ",
                              len == int64_t(1) << 48 ? string("2^48 - 1") : cat(len - 1),
@@ -2221,6 +2214,19 @@ inline void TypeCheck::CheckFor(ForLoop *x) {
     if (idxtype && x->iterkind != IK_ARRAY && x->iterkind != IK_SLICE)
         Error(x, "the index of a range or count counts its iterations as an i64; a type on "
                  "the loop's binder gives the values their type");
+    if (x->iterkind == IK_COUNT || x->iterkind == IK_RANGE) {
+        auto r = Is<RangeExpr>(x->iter);
+        auto lo = r ? FixedCountOperand(r->lo) : std::optional<int64_t>(0);
+        auto hi = FixedCountOperand(r ? r->hi : x->iter);
+        if (lo && hi) {
+            // The bounds are evaluated once. Compare at the counter's
+            // signedness, then subtract without overflowing a signed integer.
+            auto uns = IsUnsigned(x->iter->exprtype->intstorage);
+            auto empty = uns ? (uint64_t)*hi <= (uint64_t)*lo : *hi <= *lo;
+            auto count = empty ? uint64_t(0) : (uint64_t)*hi - (uint64_t)*lo;
+            if (count <= INT64_MAX) bounds = { (int64_t)count, (int64_t)count };
+        }
+    }
     // A slice element bound by value, or a reference one however it is
     // bound, was read out of the array: it is as writable as its slot says
     // (§9.5), and where it points follows the read-back rule, not the
@@ -2230,6 +2236,10 @@ inline void TypeCheck::CheckFor(ForLoop *x) {
     auto readback = IsRefOrSlice(bindtype) && elemtype && (!byref || elemtype->kind == TY_REF);
     auto path = AddressedPath(x->iter);
     auto head = SaveFlow();
+    // An ordinary for body undergoes full static checking even when its
+    // header is empty. Keep its existing conservative flow until checking
+    // the source body can be separated from publishing its effects.
+    if (bounds.max == 0) bounds = { 0, -1 };
     auto sc = CheckLoopPasses(x, head, [&] {
         // GenLoc follows a sequence's field and element path at each loop
         // head. Read it in the joined state, before introducing the binders.
@@ -2288,7 +2298,7 @@ inline void TypeCheck::CheckFor(ForLoop *x) {
             x->idxdef = idx;
         }
         CheckLoopBody(x->body);
-    });
+    }, bounds);
     JoinBreakFlow(sc, true);
 }
 
@@ -2520,7 +2530,7 @@ inline TypeCheck::DeferEffects TypeCheck::CheckDeferredBody(Defer *d) {
     effects.statement = d;
     {
         Saved collecting(cur.deferring, &effects);
-        Saved<const SuffixEffects *> prefix(cur.elementprefix, nullptr);
+        Saved<const SuffixEffects *> prefix(cur.iterationprefix, nullptr);
         Saved<Rebuild *> active(cur.rebuild, nullptr); // Checked now, executed on scope exit.
         cur.links = {};
         cur.links.borrowedindices = saved.links.borrowedindices;
@@ -2591,7 +2601,7 @@ inline TypeCheck::LinkEffects TypeCheck::CurrentLinkEffects() {
     LinkEffects effects;
     for (auto &k : cur.kills) if (k.relative) effects.overwrites.push_back(k);
     effects.writes = cur.links;
-    if (cur.elementprefix) effects.writes.suffixeffects = BodySuffixes();
+    if (cur.iterationprefix) effects.writes.suffixeffects = BodySuffixes();
     return effects;
 }
 

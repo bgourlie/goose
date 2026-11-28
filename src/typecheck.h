@@ -2740,9 +2740,14 @@ struct TypeCheck {
     Val CheckMatch(MatchExpr *m, TypeExpr *expected, bool wantvalue);
     Val CheckEarlyBlock(EarlyBlock *x, TypeExpr *expected, bool wantvalue);
     void CheckLoopBody(Block *body);
+    struct IterationBounds { int64_t min, max; }; // A negative maximum is unknown.
+    IterationBounds ArrayIterations(TypeExpr *t) {
+        auto max = HasStaticArrayCapacity(t) ? ArraySize(t->arr) : -1;
+        return { IsArrayKind(t, A_FIXED) ? max : 0, max };
+    }
     Scope CheckLoopPasses(Node *x, FlowState &head, const function<void()> &pass,
-                          const function<void(FlowState &)> &boundhead = {});
-    void CheckElementRuns(Node *at, int64_t mincount, int64_t maxcount, const function<void()> &element);
+                          IterationBounds bounds = { 0, -1 });
+    void CheckElementRuns(Node *at, IterationBounds bounds, const function<void()> &element);
     Val CheckLoop(LoopExpr *x, TypeExpr *expected, bool wantvalue);
     void CheckWhile(While *x);
     void CheckFor(ForLoop *x);
@@ -3213,15 +3218,17 @@ struct TypeCheck {
     const LinkField *CanonicalSuffixHeader(const LinkField *header);
     void ClassifySuffixArgs(vector<RootArg> &roots, const MatchInfo &mi, const vector<Val> &args);
     bool TracksSuffix(VarDef *owner, bool exact) {
-        if (cur.deferring || cur.elementprefix) return true;
+        if (cur.deferring) return true;
+        if (cur.iterationprefix)
+            return !owner || !exact || (owner->type ? HasRelRefT(LoadType(owner->type)) : owner->mayholdrel);
         auto spec = CurRealFrame().spec;
         if (!spec || spec->isfunval || spec->sf->isrec || spec->incycle) return false;
         if (!exact || !owner) return true;
         return owner->ownerspec != spec && (owner->type ? HasRelRefT(LoadType(owner->type)) : owner->mayholdrel);
     }
     SuffixEffects BodySuffixes() {
-        if (!cur.elementprefix) return cur.links.suffixeffects;
-        auto result = *cur.elementprefix;
+        if (!cur.iterationprefix) return cur.links.suffixeffects;
+        auto result = *cur.iterationprefix;
         result.Combine(*this, cur.links.suffixeffects, SuffixEffects::Sequence);
         return result;
     }
@@ -3558,9 +3565,9 @@ struct TypeCheck {
     // from the summary. A function value's body is checked in its call's
     // statement and keeps it (CheckFunValCall).
     struct BodyState {
-        // While measuring one implicit element, suffixeffects starts at that
-        // element. Shrink obligations and function exits need the body's prefix.
-        const SuffixEffects *elementprefix = nullptr;
+        // While measuring a bounded loop, suffixeffects starts at the current
+        // iteration. Shrink obligations and function exits need the body's prefix.
+        const SuffixEffects *iterationprefix = nullptr;
         // Operand types needed to choose an evaluation order. The chosen
         // call or initializer checks the storage effects in that order.
         // A newly specialized callee still checks and records its own body.

@@ -557,7 +557,7 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
                 Val v;
                 if (t->kind == TY_ARRAY) {
                     auto count = ArraySize(t->arr);
-                    CheckElementRuns(c, count, count, [&] { v = CheckValue(c->defaultinit, t->arr->sub); });
+                    CheckElementRuns(c, { count, count }, [&] { v = CheckValue(c->defaultinit, t->arr->sub); });
                 } else v = CheckValue(c->defaultinit, t);
                 v.type = t;
                 // An array is filled with its element's default in a
@@ -844,7 +844,7 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
             // Reallocation only defaults the portion beyond the old length.
             if (d.kind == B_REALLOC_SLICE) lo = 0;
             if (!hi) c->defaultinit = nullptr;
-            CheckElementRuns(c, lo, hi, [&] {
+            CheckElementRuns(c, { lo, hi }, [&] {
                 if (!c->defaultinit) c->defaultinit = DefaultCall(elem, c->line);
                 ElemArg(c->defaultinit, elem, elementdest());
             });
@@ -1405,15 +1405,14 @@ inline void TypeCheck::CheckRenderable(Call *c, const char *what, TypeExpr *t, N
         case TY_ARRAY: case TY_SLICE: {
             auto elem = t->kind == TY_ARRAY ? t->arr->sub : t->sub;
             if (IsU8(elem)) return;  // RenderLoc emits the entire byte string.
-            auto maxcount = HasStaticArrayCapacity(t) ? ArraySize(t->arr) : -1;
-            auto mincount = IsArrayKind(t, A_FIXED) ? maxcount : 0;
-            Saved executing(seen.executes, seen.executes && maxcount != 0);
+            auto bounds = ArrayIterations(t);
+            Saved executing(seen.executes, seen.executes && bounds.max != 0);
             auto base = c->fmtspecs.size();
             auto element = [&] {
                 c->fmtspecs.resize(base);  // Keep overloads from the settled pass.
                 child(elem, IsRefOrSlice(elem));
             };
-            if (seen.executes) CheckElementRuns(at, mincount, maxcount, element);
+            if (seen.executes) CheckElementRuns(at, bounds, element);
             else element();  // Resolve the element's format overloads for codegen.
             return;
         }
@@ -4406,8 +4405,8 @@ inline void TypeCheck::NoteShrinkOrder(const LinkShrink &shrink) {
                 o.required = -1;
                 if (known && shrink.popheader && shrink.popped > 0) {
                     auto paths = cur.links.suffixeffects.PathsFor(*this, shrink.popheader, SuffixOwner(root));
-                    if (cur.elementprefix)
-                        paths = SuffixEffects::Sequence(cur.elementprefix->PathsFor(*this, shrink.popheader, SuffixOwner(root)), paths);
+                    if (cur.iterationprefix)
+                        paths = SuffixEffects::Sequence(cur.iterationprefix->PathsFor(*this, shrink.popheader, SuffixOwner(root)), paths);
                     o.required = SuffixEffects::Required(paths, shrink.popped);
                     if (o.required > 0) o.popheader = shrink.popheader;
                 }
