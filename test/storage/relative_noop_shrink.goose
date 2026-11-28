@@ -42,6 +42,49 @@ fn grow_scratch(nodes: Node[>..]&, scratch: i64[>..]&) {
     nodes.resize(size);
 }
 
+fn keep_after_growth(nodes: Node[>..]&, scratch: Node[>..]&, later: bool) {
+    const size = nodes.len;
+    if later { defer { scratch.push(Node {}); } }
+    if !later { scratch.push(Node {}); }
+    nodes.resize(size);
+}
+
+fn forward_growth(nodes: Node[>..]&, scratch: Node[>..]&) {
+    keep_after_growth(nodes, scratch, true);
+    keep_after_growth(nodes, scratch, false);
+    fn captured() {
+        const size = nodes.len;
+        scratch.push(Node {});
+        nodes.resize(size);
+    }
+    captured();
+}
+
+fn restore_before_link(nodes: Node[>..]&, scratch: Node[>..]&) {
+    const size = nodes.len;
+    scratch.push(Node {});
+    { defer { nodes.resize(size); } }
+    nodes[0].next .= nodes[1];
+    nodes.resize(size);
+}
+
+fn restore_selected(flag: bool) {
+    var first: Node[>..] = [Node {}, Node {}];
+    var second: Node[>..] = [];
+    let scratch: Node[>..]& = if flag { first } else { second };
+    restore_before_link(first, scratch);
+    assert(first.len == 2 && first[0].next .== first[1]);
+}
+
+struct ScratchView { data: i64[>..]& }
+
+fn fill_selected(view: ScratchView&, a: Cells&, b: Cells&, scratch: i64[>..]&, flag: bool) {
+    let selected: Cells& = if flag { a } else { b };
+    fn fill() -> i64 { scratch.push(7); return 0; }
+    selected.data.resize(selected.data.len, fill());
+    assert(view.data.len == scratch.len);
+}
+
 fn leave_with_growth(scratch: i64[>..]&) {
     scratch.push(8);
     return from keep_on_exit;
@@ -179,6 +222,13 @@ fn main() {
     var cells = Cells { data: [1, 2] };
     cells.head .= cells.data[1];
     restore_measurement(cells);
+    var other_cells = Cells { data: [3, 4] };
+    other_cells.head .= other_cells.data[1];
+    var fill_scratch: i64[>..] = [];
+    var view = ScratchView { data: fill_scratch };
+    fill_selected(view, cells, other_cells, fill_scratch, false);
+    fill_selected(view, cells, other_cells, fill_scratch, true);
+    assert(cells.head .== cells.data[1] && other_cells.head .== other_cells.data[1]);
     let cell_alias .= cells;
     cells.data.resize(cell_alias.data.len, 0);
     cell_alias.data.resize(cells.data.len);
@@ -207,6 +257,11 @@ fn main() {
     keep_saved(nodes);
     var scratch: i64[>..] = [];
     grow_scratch(nodes, scratch);
+    var other_nodes: Node[>..] = [];
+    forward_growth(nodes, other_nodes);
+    assert(other_nodes.len == 3 && nodes[0].next .== nodes[1]);
+    restore_selected(false);
+    restore_selected(true);
     keep_on_exit(nodes, scratch);
     assert(scratch.len == 2);
     nodes.pop_n(zero_count);

@@ -591,10 +591,9 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
             } else if (ak == A_LIMITED && !EvalMeets(args[2], EvalRequirement::LoggedGrowth)) {
                 fillpreserves = false;
             } else {
-                AliasingGrowsSince(beforefill, rv, recvarr, [&](const GrowEvent &e, VarDef *root, Alias alias) {
+                AliasingGrowsSince(beforefill, rv, recvarr, [&](const GrowEvent &e, const RootAlt &target, Alias alias) {
                     if (alias == AL_YES) fillpreserves = false;
-                    else fillpreserves = fillpreserves.Both(CountProof::IfDistinct(
-                        ast.countconditions, { CurRealFrame().spec, e.root, root }));
+                    else fillpreserves = fillpreserves.Both(DistinctGrowth(e.root, e.exact && target.exact, target.root));
                 });
             }
             // The fill value is built once and copied into every slot the
@@ -606,11 +605,14 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
                                    "the elements, which constructs each in place"));
         }
         CountProof savedlength;
-        if (measured.header)
-            savedlength = sizebinding->type->cq ? CountProof(true) : CountProof::IfUnchanged(ast.countconditions, sizebinding);
+        if (measured.header) {
+            savedlength = measured.valid;
+            if (!sizebinding->type->cq)
+                savedlength = savedlength.Both(CountProof::IfUnchanged(ast.countconditions, sizebinding));
+        }
         removal = CountedRemoval(d.kind, args, length, recvarr, rv, countcondition, fillpreserves, savedlength);
         // A successful resize installs the evaluated count even when a fill ran.
-        if (measured.header && reachable) cur.links.lengths[sizebinding] = measured;
+        if (measured.header && reachable) cur.links.lengths[sizebinding] = { measured.header, measured.owner };
     }
     // index_of recovers the element index a reference stands for (§3.3).
     // The reference must be an element of this very array, which is what
@@ -2484,7 +2486,7 @@ inline bool TypeCheck::RelyOnCountProof(CountProof proof, Node *at, const char *
     if (!at || unifytrial || cur.probingtypes || proof.Committed()) return true;
     for (const auto &pair : proof.condition->distinct)
         growconflicts.push_back({ at, pair.spec, pair.first, pair.second,
-            cat("the ", reason, " relies on the resize fill leaving the measured array's length unchanged") });
+            cat("the ", reason, " relies on growth leaving the measured array's length unchanged") });
     for (auto count : proof.condition->names) {
         ConstUse use { at, reason, count };
         for (auto d = count; d; d = d->constfrom) RelyOnConstant(use, d);
@@ -5452,30 +5454,58 @@ inline void TypeCheck::NoteGrow(Node *at, const Roots &roots, const string &what
     RecordGrowth(at, roots, what, SoleResizableIn(t));
 }
 
+// Distinct parameter classes identify different arrays only for exact
+// storage. Captured classes belong to their defining activation.
+inline CountProof TypeCheck::DistinctGrowth(VarDef *writer, bool exact, VarDef *measured) {
+    if (!exact) return false;
+    for (auto it = frames.rbegin(); it != frames.rend(); ++it) {
+        if (!it->spec) continue;
+        auto direct = [&](VarDef *root) {
+            return any_of(it->spec->params.begin(), it->spec->params.end(),
+                          [&](VarDef *p) { return ProjectedFrom(root, p->ref.Root()); });
+        };
+        if (direct(writer) && direct(measured))
+            return CountProof::IfDistinct(ast.countconditions, { it->spec, writer, measured });
+    }
+    return false;
+}
+
 inline void TypeCheck::InvalidateLengths(VarDef *owner, bool exact, TypeExpr *array, const LinkFlow *exit) {
     if (cur.deferring) cur.deferring->growths.emplace(owner, exact, array);
-    erase_if(cur.links.lengths, [&](const auto &p) {
-        const auto &m = p.second;
-        if (exit && exit->Measured(p.first) == m) return false;
-        if (owner && MayAliasRoots(m.owner, true, owner, exact) == AL_NO) return false;
-        return !array || TopConstEq(FieldPathType(m.header->base, m.header->path), array);
-    });
+    for (auto it = cur.links.lengths.begin(); it != cur.links.lengths.end();) {
+        auto &m = it->second;
+        if ((exit && exit->Measured(it->first) == m) ||
+            (array && !TopConstEq(FieldPathType(m.header->base, m.header->path), array))) {
+            ++it;
+            continue;
+        }
+        auto alias = owner ? MayAliasRoots(m.owner, true, owner, exact) : AL_YES;
+        if (alias == AL_DEFER) m.valid = m.valid.Both(DistinctGrowth(owner, exact, m.owner));
+        if (alias == AL_YES || !m.valid.Available()) {
+            it = cur.links.lengths.erase(it);
+            continue;
+        }
+        ++it;
+    }
 }
 
 inline void TypeCheck::RecordGrowth(Node *at, const Roots &roots, const string &what, TypeExpr *arr) {
     if (cur.probingtypes) return;
     bool changeslength = !arr || IsArrayKind(arr, A_GROW);
     if (changeslength && roots.unknown) InvalidateLengths(nullptr, false, arr);
-    auto note = [&](vector<TypeExpr *> &types) {
-        for (auto u : types)
-            if (!u == !arr && (!u || TypeEq(u, arr))) return;
-        types.push_back(arr);
-    };
     for (auto &a : roots.alts) {
         auto root = a.root;
         if (changeslength && (root || !a.exact)) InvalidateLengths(root, a.exact, arr);
         if (!root || IsTemp(root)) continue;
         cur.growlog.push_back({ at, root, a.exact, what, false, arr });
+        auto note = [&](vector<FnRecord::Growth> &growths) {
+            for (auto &g : growths)
+                if (!g.array == !arr && (!arr || TypeEq(g.array, arr))) {
+                    g.exact &= a.exact;
+                    return;
+                }
+            growths.push_back({ arr, a.exact });
+        };
         NoteRootEvent(root, [&](FnSpec *s, int i) { note(s->record.growparams[i]); },
                       [&](FnSpec *s, VarDef *r) { note(s->record.growexternals[r]); });
     }
@@ -5500,7 +5530,7 @@ template<typename F> inline void TypeCheck::AliasingGrowsSince(size_t base, cons
         if (array && e.arr && !TopConstEq(array, e.arr)) continue;
         for (auto &b : roots.alts) {
             auto may = MayAliasRoots(e.root, e.exact, b.root, b.exact);
-            if (may != AL_NO) visit(e, b.root, may);
+            if (may != AL_NO) visit(e, b, may);
         }
     }
 }
@@ -5514,12 +5544,12 @@ template<typename F> inline void TypeCheck::AliasingGrowsSince(size_t base, cons
 // other growable array may lie inside it.
 inline void TypeCheck::CheckGrowsSince(size_t base, const Roots &built, const string &what,
                                        TypeExpr *t) {
-    AliasingGrowsSince(base, built, SoleResizableIn(t), [&](const GrowEvent &e, VarDef *root, Alias may) {
+    AliasingGrowsSince(base, built, SoleResizableIn(t), [&](const GrowEvent &e, const RootAlt &target, Alias may) {
         auto msg = cat("cannot ", e.what, ": ", what, " is still under construction, and "
                        "the ", e.shrink ? "shrink would free the storage it is built in"
                                         : "growth would land inside it", " (§1.3)");
         if (may == AL_YES) Error(e.at, msg);
-        growconflicts.push_back({ e.at, CurRealFrame().spec, e.root, root, msg });
+        growconflicts.push_back({ e.at, CurRealFrame().spec, e.root, target.root, msg });
     });
 }
 
@@ -5532,7 +5562,7 @@ inline void TypeCheck::CheckGrowsSince(size_t base, const Roots &built, const st
 inline void TypeCheck::ApplyCalleeGrows(Node *at, FnSpec *spec, vector<Val> &argvals,
                                         string_view name) {
     // A record notes a growth of a parameter's class (ClassArgRoot).
-    auto grows = [&](size_t i, const char *how, TypeExpr *arr) {
+    auto grows = [&](size_t i, const char *how, FnRecord::Growth growth) {
         auto view = i >= spec->params.size();
         if (view) i -= spec->params.size();
         if (i >= argvals.size()) return;
@@ -5540,13 +5570,14 @@ inline void TypeCheck::ApplyCalleeGrows(Node *at, FnSpec *spec, vector<Val> &arg
                           : ClassArgRoots(spec->argtypes[i], argvals[i]);
         auto root = roots.Root();
         if (!root || IsTemp(root)) return;
-        RecordGrowth(at, roots, cat("call ", name, ", which ", how, " ", root->name), arr);
+        if (!growth.exact) roots.Weaken();
+        RecordGrowth(at, roots, cat("call ", name, ", which ", how, " ", root->name), growth.array);
     };
     if (spec->sf->isextern) {
         for (size_t i = 0; i < spec->argtypes.size(); i++) {
             auto pt = spec->argtypes[i];
             if (IsPlainRef(pt) && ClassOf(pt->ref->sub) == SC_RESIZABLE)
-                grows(i, "may grow", SoleResizableIn(pt->ref->sub));
+                grows(i, "may grow", { SoleResizableIn(pt->ref->sub), true });
         }
         return;
     }
@@ -5557,8 +5588,11 @@ inline void TypeCheck::ApplyCalleeGrows(Node *at, FnSpec *spec, vector<Val> &arg
     for (auto &[pi, arrs] : rec->growparams)
         for (auto arr : arrs) grows((size_t)pi, "grows", arr);
     for (auto &[vd, arrs] : rec->growexternals)
-        for (auto arr : arrs)
-            RecordGrowth(at, MapClass(spec, vd, argvals), cat("call ", name, ", which grows ", vd->name), arr);
+        for (auto growth : arrs) {
+            auto roots = MapClass(spec, vd, argvals);
+            if (!growth.exact) roots.Weaken();
+            RecordGrowth(at, roots, cat("call ", name, ", which grows ", vd->name), growth.array);
+        }
 }
 
 // Whether storage of type y can be, or hold, the location `lval` assigned,

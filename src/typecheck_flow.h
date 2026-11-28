@@ -2595,6 +2595,13 @@ inline void TypeCheck::RunExitDefers(int first, ScopeExit exit, span<const FnRec
             }
             for (auto &[v, place] : it->bindings) v->refplace = FlowBinding(v, place);
             ApplyLinkEffects(it->exit);
+            // These measurements were checked against the execution-time
+            // inputs. A completing resize can establish a stronger bound.
+            if (it->env) for (auto &binding : it->env->bindings) {
+                auto v = binding.read.var;
+                auto measured = it->exit.writes.Measured(v);
+                if (measured.header) cur.links.lengths[v] = measured;
+            }
         }
     }
 }

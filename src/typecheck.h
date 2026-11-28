@@ -432,6 +432,7 @@ struct TypeCheck {
         struct Measurement {
             const LinkField *header = nullptr;
             VarDef *owner = nullptr;
+            CountProof valid = true; // Possible writers that must name a different array.
             bool operator==(const Measurement &) const = default;
         };
         // A saved length bounds the current length until a possible growth.
@@ -564,7 +565,12 @@ struct TypeCheck {
             suffixeffects.Combine(tc, other.suffixeffects, [&](const auto &a, const auto &b) {
                 return SuffixEffects::Join(a, b, backedge);
             });
-            erase_if(lengths, [&](const auto &p) { return other.Measured(p.first) != p.second; });
+            for (auto it = lengths.begin(); it != lengths.end();) {
+                auto &m = it->second;
+                auto next = other.Measured(it->first);
+                if (next.header != m.header || next.owner != m.owner) it = lengths.erase(it);
+                else { m.valid = m.valid.Both(next.valid); ++it; }
+            }
             for (auto it = fresh.begin(); it != fresh.end();) {
                 auto found = other.fresh.find(it->first);
                 // A decreasing bound can reach zero after enough iterations.
@@ -3694,6 +3700,7 @@ struct TypeCheck {
     // Each takes the type of the storage grown, shrunk or built in.
     void RecordGrowth(Node *at, const Roots &roots, const string &what, TypeExpr *array);
     void InvalidateLengths(VarDef *owner, bool exact, TypeExpr *array, const LinkFlow *exit = nullptr);
+    CountProof DistinctGrowth(VarDef *writer, bool exact, VarDef *measured);
     void NoteGrow(Node *at, const Roots &roots, const string &what, TypeExpr *t);
     void NoteShrinkEvent(Node *at, VarDef *root, TypeExpr *bound, const string &what,
                          TypeExpr *t);

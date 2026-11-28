@@ -3143,8 +3143,12 @@ struct FnRecord {
     // (§1.3(4)), in the same form, each with the types of the resizable
     // arrays grown, null for one the checker cannot tell
     // (TypeCheck::GrowEvent::arr).
-    map<VarDef *, vector<TypeExpr *>> growexternals;
-    map<int, vector<TypeExpr *>> growparams;
+    struct Growth {
+        TypeExpr *array;
+        bool exact; // False if this owner only bounds the storage that grew.
+    };
+    map<VarDef *, vector<Growth>> growexternals;
+    map<int, vector<Growth>> growparams;
     // Stores into the caller's storage through reference parameters' class
     // roots (§5.1), and relative links written into captures and globals.
     // Calls map parameter stores onto their arguments.
