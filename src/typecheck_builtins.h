@@ -831,14 +831,14 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
     auto shrink = (d.flags & BF_SHRINKS) != 0;
     auto header = ak == A_GROW && rv.Exact() && (added > 0 || popped > 0) && reachable && !cur.probingtypes
                       ? ArrayHeader(rv, recvarr) : nullptr;
-    int64_t fresh = 0;
-    if (header) {
-        auto it = cur.links.fresh.find(header);
-        if (it != cur.links.fresh.end() && it->second.owner == rv.Root()) fresh = it->second.count;
-    }
+    auto fresh = cur.links.FreshCount(header, rv.Root());
+    LinkFlow::SuffixEffects::Paths before;
+    if (header && cur.deferring) before = cur.links.suffixeffects.PathsFor(*this, header, rv.Root());
     if (ak == A_GROW && shrink) {
-        CheckGrowShrink(c, d.name, args[0], rv, removal, countcondition, popped > 0 && popped <= fresh);
+        CheckGrowShrink(c, d.name, args[0], rv, removal, countcondition, header, popped);
         if (popped > 0 && popped < fresh) cur.links.fresh[header] = { rv.Root(), fresh - popped };
+        if (header && popped > 0 && cur.deferring)
+            cur.links.suffixeffects.Shift(header, rv.Root(), before, -popped);
         if (d.kind != B_CLEAR && ClassOf(elem) != SC_FIXED)
             Error(c, cat(".", d.name, " needs fixed-size elements: ", TypeStr(rv.type),
                          " is sequential (§3.3)"));
@@ -848,8 +848,11 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
         auto intoarray = [&](const StoreEvent &e) {
             return e.elementlink.direction == EL_ANY && MayAliasRoots(rv.Root(), true, e.container, !e.bound) != AL_NO;
         };
-        if (none_of(storeevents.begin() + beforestores, storeevents.end(), intoarray))
-            cur.links.fresh[header] = { rv.Root(), std::min(fresh, INT64_MAX - added) + added };
+        if (none_of(storeevents.begin() + beforestores, storeevents.end(), intoarray)) {
+            cur.links.fresh[header] = { rv.Root(), LinkFlow::SuffixEffects::Add(fresh, added) };
+            if (cur.deferring)
+                cur.links.suffixeffects.Shift(header, rv.Root(), before, added);
+        }
     }
     // A grow-shrink array shrinks from anywhere, provided nothing in scope
     // refers into it (§5.2).
@@ -1518,7 +1521,7 @@ inline const string *TypeCheck::EmbedShader(Call *c, vector<Node *> &args) {
 // reference is what shrinks, or it is a struct's tail field, which shrinks
 // the storage the struct lies in, as a reference to the field would.
 inline void TypeCheck::CheckGrowShrink(Node *at, const char *op, Node *recv, const Val &rv,
-                                       SlotRemoval removal, CountProof condition, bool keepslinks) {
+                                       SlotRemoval removal, CountProof condition, const LinkField *popheader, int64_t popped) {
     auto at_type = IsPlainRef(rv.type) ? rv.type->ref->sub : rv.type;
     assert(at_type->kind == TY_ARRAY);
     auto roots = rv.AsRoots();
@@ -1531,9 +1534,8 @@ inline void TypeCheck::CheckGrowShrink(Node *at, const char *op, Node *recv, con
         NoteOverwrite(recv, roots, storeevents.size(), at_type, &rv.refplace, nullptr, replacesif);
     ShrinkEffect effect { SB_UNBALANCED, empties ? at_type : nullptr };
     effect.preserves = removal == SlotRemoval::PreservesIfUnchanged ? condition : CountProof(removal == SlotRemoval::None);
-    effect.keepslinks = keepslinks;
     effect.replacesif = replacesif;
-    ShrinkThrough(at, op, ExprStr(recv), roots, at_type, effect);
+    ShrinkThrough(at, op, ExprStr(recv), roots, at_type, effect, popheader, popped);
 }
 
 // A whole assignment of a grow-only array, or of a value holding one as its
@@ -2339,7 +2341,7 @@ inline bool TypeCheck::CallMayWrite(FnSpec *spec, const vector<Val> &argvals, co
 // check -- where the rest of the caller's statement is in view.
 inline void TypeCheck::GrowOnlyShrinkAt(Node *c, const string &op, VarDef *vd,
                                         const string &what, TypeExpr *bound, TypeExpr *arr,
-                                        bool viaclass, ShrinkEffect effect) {
+                                        bool viaclass, ShrinkEffect effect, const LinkField *popheader, int64_t popped) {
     struct ClassType {
         TypeCheck &tc;
         VarDef *cls;
@@ -2373,7 +2375,7 @@ inline void TypeCheck::GrowOnlyShrinkAt(Node *c, const string &op, VarDef *vd,
     auto arrtype = ShrunkType(vd, bound);
     auto receiver = effect.arrayreceiver ? effect.arrayreceiver : arr;
     CheckLinkShrink({ c, cat("cannot ", op, " ", what), vd, bound, receiver ? receiver : arrtype,
-                      effect, viaclass });
+                      effect, viaclass, popheader, popped });
     CheckHeldShrinks(c, op, vd, what, true, bound, receiver);
     ShrinkScanVars([&](VarDef *v) {
         // The array's own holder is scanned as any other where the fields
@@ -2492,8 +2494,10 @@ inline bool TypeCheck::RelyOnCountProof(CountProof proof, Node *at, const char *
 
 // A deferred shrink observes both the writes in its own body up to this
 // point and the storage as it stands when the enclosing block exits.
-inline void TypeCheck::CheckLinkShrink(const LinkShrink &s) {
+inline void TypeCheck::CheckLinkShrink(LinkShrink s) {
     if (!reachable || cur.probingtypes) return;
+    if (s.popheader && s.popped > 0 && s.popped <= cur.links.FreshCount(s.popheader, s.owner))
+        s.effect.keepslinks = true;
     if (cur.deferring) {
         cur.deferring->shrinks.emplace_back(s, CurrentLinkEffects());
         return;
@@ -2824,7 +2828,7 @@ inline void TypeCheck::RecordLinkStore(const Roots &owners, TypeExpr *reached,
         auto write = state;
         if (!e.storefield.base) write.suffix.reset();
         if (d.bound || !owners.Exact() || d.root != owners.Root()) write.liveprefix = nullptr;
-        cur.links.Add(*this, storeevents.back(), index, write);
+        cur.links.Store(*this, storeevents.back(), index, write);
     }
 }
 
@@ -4396,7 +4400,8 @@ inline string TypeCheck::TargetStr(const ShrinkTarget &t) {
 // diagnostics name the root's array as the receiver does, and any other by
 // its own name and the receiver's.
 inline void TypeCheck::ShrinkThrough(Node *at, const string &verb, const string &recv,
-                                     const Roots &roots, TypeExpr *arr, ShrinkEffect effect) {
+                                     const Roots &roots, TypeExpr *arr, ShrinkEffect effect,
+                                     const LinkField *popheader, int64_t popped) {
     auto root = roots.Root();
     if (arr->kind == TY_ARRAY) effect.arrayreceiver = arr;
     auto growonly = GrowOnlyTail(arr);
@@ -4405,7 +4410,8 @@ inline void TypeCheck::ShrinkThrough(Node *at, const string &verb, const string 
         if (growonly) {
             auto what = t.root == root ? string(t.root->name)
                                        : cat(t.root->name, " (which ", recv, " may point at)");
-            GrowOnlyShrinkAt(at, verb, t.root, what, bound, arr, t.viaclass, effect);
+            GrowOnlyShrinkAt(at, verb, t.root, what, bound, arr, t.viaclass, effect,
+                             t.root == root && !bound ? popheader : nullptr, popped);
             if (!effect.preserves.Committed()) cur.links.ForgetSuffixes(*this, t.root, !bound);
         } else {
             auto what = t.root == root ? recv : cat(t.root->name, ", which ", recv,
@@ -5111,7 +5117,7 @@ inline void TypeCheck::ApplyCalleeShrinks(Node *at, FnSpec *spec, vector<Val> &a
                         state.suffix = { ast.Intern(mapped->path), suffix.guard };
                 }
             }
-            cur.links.Add(*this, e, storesbase + i, state);
+            cur.links.Store(*this, e, storesbase + i, state);
         }
     };
     auto apply = [&](const Hit &h, ShrinkBalance judged) {

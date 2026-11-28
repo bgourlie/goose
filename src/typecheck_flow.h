@@ -1035,7 +1035,7 @@ inline TypeCheck::FlowState TypeCheck::JoinFlow(const FlowState &a, const FlowSt
     else if (!b.reachable) joined.kills = a.kills;
     else joined.kills = IntersectKills(a.kills, b.kills);
     joined.links = a.reachable ? a.links : b.links;
-    if (a.reachable && b.reachable) joined.links.Join(b.links, backedge);
+    if (a.reachable && b.reachable) joined.links.Join(*this, b.links, backedge);
     auto expired = [&](VarDef *v) { return Depth(v) > CurDepth(); };
     erase_if(joined.links.live, [&](const auto &entry) { return expired(entry.first.owner); });
     joined.links.DropPrefixes(expired);
@@ -2559,8 +2559,9 @@ inline void TypeCheck::ApplyLinkEffects(const LinkEffects &effects) {
         storeevents.push_back(storeevents[write.at]);
         storeevents.back().boundfield = part.boundfield;
         storeevents.back().indexed = part.indexed;
-        cur.links.Add(*this, storeevents.back(), storeevents.size() - 1, write);
+        cur.links.Add(storeevents.back(), storeevents.size() - 1, write);
     }
+    cur.links.ApplySuffixes(*this, effects.writes);
     cur.links.borrowedindices.insert(effects.writes.borrowedindices.begin(), effects.writes.borrowedindices.end());
     for (auto &[v, fact] : effects.writes.prefixes.arrays) cur.links.prefixes.Establish(v, fact);
 }
@@ -2579,7 +2580,6 @@ inline void TypeCheck::RunExitDefers(int first, ScopeExit exit, span<const FnRec
             for (auto &a : interrupted) CheckDeferredReads(*it, a);
             for (auto &read : it->reads) RecordStorageRead(read);
             for (auto &[shrink, before] : it->shrinks) {
-                if (!shrink.effect.preserves.Committed()) cur.links.ForgetSuffixes(*this, shrink.owner, !shrink.bound);
                 Saved links(cur.links, cur.links);
                 Saved kills(cur.kills, cur.kills);
                 ApplyLinkEffects(before);

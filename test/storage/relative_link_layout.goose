@@ -146,6 +146,50 @@ fn keep_old_link(i: i64) {
     assert(nodes.len == 2 && nodes[0].next .== nodes[i]);
 }
 
+fn deferred_new_slots(flag: bool) {
+    var nodes: Node[>..] = [Node {}, Node {}];
+    nodes[0].next .= nodes[1];
+    nodes.push(Node {});
+    { defer { nodes.pop(); } }
+    {
+        defer {
+            { defer { nodes.pop_n(2); } }
+            if flag { nodes.push(Node {}); } else { nodes.push(Node {}); }
+        }
+        nodes.append([Node {}, Node {}]);
+    }
+    nodes.pop();
+    {
+        defer { nodes.pop_n(2); }
+        defer { nodes.push(Node {}); }
+        nodes.push(Node {});
+    }
+    nodes.append([Node {}, Node {}]);
+    { defer { if flag { nodes.pop(); } } }
+    nodes.pop();
+    nodes.push(Node {});
+    { defer { if flag { nodes[0].next .= nodes[1]; nodes.push(Node {}); } } }
+    nodes.pop();
+    assert(nodes.len == 3);
+    assert(nodes[0].next .== nodes[1]);
+}
+
+struct Holder { value: i64&? }
+
+fn twice_on_exit<F>() { defer { for i in 2 { F(); } } }
+struct ArrayRef { items: i64[>..]& }
+struct Indirect { view: ArrayRef& }
+fn pop_through_holder(holder: Indirect&) { holder.view.items.pop(); }
+
+fn last_use_before_deferred_pop() {
+    var xs: i64[>..] = [1, 2];
+    var holder = Holder {};
+    defer { xs.pop(); }
+    xs.push(3);
+    holder.value .= xs[0];
+    assert(holder.value .== xs[0]);
+}
+
 fn fixed_append_source() {
     var list = NumberList { values: [11, 22] };
     list.focus .= list.values[1];
@@ -254,6 +298,16 @@ fn main() {
     appended_link(1);
     pushed_link_to_first();
     keep_old_link(1);
+    deferred_new_slots(false);
+    deferred_new_slots(true);
+    last_use_before_deferred_pop();
+    twice_on_exit() {
+        var local: i64[>..] = [1, 2];
+        var view = ArrayRef { items: local };
+        var holder = Indirect { view: view };
+        pop_through_holder(holder);
+        local.pop();
+    };
     fixed_append_source();
     backward_link();
     link_to_first(0);

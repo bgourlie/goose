@@ -324,6 +324,111 @@ struct TypeCheck {
             bool operator==(const FreshSuffix &) const = default;
         };
         map<const LinkField *, FreshSuffix> fresh;
+        int64_t FreshCount(const LinkField *header, VarDef *owner) const {
+            auto it = fresh.find(header);
+            return it != fresh.end() && it->second.owner == owner ? it->second.count : 0;
+        }
+        // A defer starts without knowing the caller's suffix. At each exit
+        // it guarantees the larger of its own fresh count and the incoming
+        // count adjusted by delta. A forward link or an unknown shrink
+        // discards the incoming count for every possibly overlapping owner.
+        struct SuffixEffects {
+            static constexpr int64_t discarded = INT64_MIN;
+            struct Path {
+                int64_t floor, delta;
+                auto operator<=>(const Path &) const = default;
+                int64_t Apply(int64_t incoming) const { return std::max(floor, Add(incoming, delta)); }
+                Path Then(Path next) const { return { next.Apply(floor), Add(delta, next.delta) }; }
+            };
+            using Paths = vector<Path>;
+            struct Change {
+                VarDef *owner;
+                Paths paths;
+                bool operator==(const Change &) const = default;
+            };
+            map<const LinkField *, Change> changes;
+            set<pair<VarDef *, bool>> invalidated;
+            int invaliddepth = -1; // Storage an expired inexact owner could reach (§9.2).
+            bool operator==(const SuffixEffects &) const = default;
+            bool Empty() const { return changes.empty() && invalidated.empty() && invaliddepth < 0; }
+            static int64_t Add(int64_t a, int64_t b) {
+                if (a == discarded || b == discarded || (b < 0 && a < INT64_MIN - b)) return discarded;
+                return b > 0 && a > INT64_MAX - b ? INT64_MAX : a + b;
+            }
+            Paths PathsFor(TypeCheck &tc, const LinkField *header, VarDef *owner) const {
+                if (auto it = changes.find(header); it != changes.end())
+                    return it->second.owner == owner ? it->second.paths : Paths {{ 0, discarded }};
+                if (invaliddepth >= 0 && (Depth(owner) <= invaliddepth || tc.IsClassRoot(owner)))
+                    return {{ 0, discarded }};
+                for (auto [v, exact] : invalidated)
+                    if (tc.MayAliasRoots(owner, true, v, exact) != AL_NO) return {{ 0, discarded }};
+                return {{ 0, 0 }};
+            }
+            // The minimum over all paths is guaranteed. A path with both a
+            // higher floor and a higher offset cannot lower that minimum.
+            static Paths Normalize(Paths paths) {
+                sort(paths.begin(), paths.end());
+                Paths result;
+                for (auto p : paths)
+                    if (result.empty() || p.delta < result.back().delta) result.push_back(p);
+                return result;
+            }
+            static Paths Sequence(const Paths &first, const Paths &next) {
+                Paths result;
+                for (auto p : first) for (auto q : next) result.push_back(p.Then(q));
+                return Normalize(std::move(result));
+            }
+            static Paths Join(Paths first, const Paths &other, bool backedge) {
+                for (auto p : other) {
+                    // A decreasing offset on a backedge may consume the
+                    // whole incoming run. A computed constant remains a bound.
+                    if (backedge && none_of(first.begin(), first.end(), [&](Path q) {
+                            return q.delta <= p.delta && q.floor <= p.floor;
+                        })) {
+                        if (any_of(first.begin(), first.end(), [&](Path q) {
+                                return q.delta >= p.delta && q.floor > p.floor;
+                            })) p.floor = 0;
+                        p.delta = discarded;
+                    }
+                    first.push_back(p);
+                }
+                return Normalize(std::move(first));
+            }
+            void Shift(const LinkField *header, VarDef *owner, const Paths &before, int64_t delta) {
+                changes[header] = { owner, Sequence(before, {{ std::max<int64_t>(delta, 0), delta }}) };
+            }
+            void Forget(TypeCheck &tc, VarDef *owner, bool exact) {
+                invalidated.emplace(owner, exact);
+                erase_if(changes, [&](const auto &p) {
+                    return tc.MayAliasRoots(p.second.owner, true, owner, exact) != AL_NO;
+                });
+            }
+            // The same keys compose in sequence and join across alternatives.
+            template<typename F> void Combine(TypeCheck &tc, const SuffixEffects &other, F combine) {
+                if (Empty() && other.Empty()) return;
+                auto keys = changes;
+                keys.insert(other.changes.begin(), other.changes.end());
+                for (auto &[header, value] : keys)
+                    value.paths = combine(PathsFor(tc, header, value.owner), other.PathsFor(tc, header, value.owner));
+                changes = std::move(keys);
+                invalidated.insert(other.invalidated.begin(), other.invalidated.end());
+                invaliddepth = std::max(invaliddepth, other.invaliddepth);
+            }
+        } suffixeffects;
+        void ApplySuffixes(TypeCheck &tc, const LinkFlow &body) {
+            for (auto it = fresh.begin(); it != fresh.end();) {
+                auto &value = it->second;
+                auto paths = body.suffixeffects.PathsFor(tc, it->first, value.owner);
+                auto count = INT64_MAX;
+                for (auto p : paths) count = std::min(count, p.Apply(value.count));
+                value.count = count;
+                if (value.count <= 0) it = fresh.erase(it);
+                else ++it;
+            }
+            for (auto &[header, value] : body.fresh)
+                fresh[header] = { value.owner, std::max(FreshCount(header, value.owner), value.count) };
+            if (tc.cur.deferring) suffixeffects.Combine(tc, body.suffixeffects, SuffixEffects::Sequence);
+        }
         struct Measurement {
             const LinkField *header = nullptr;
             VarDef *owner = nullptr;
@@ -405,21 +510,31 @@ struct TypeCheck {
         };
         map<ArrayLit *, FillLinks> fills;
         void ForgetSuffixes(TypeCheck &tc, VarDef *owner, bool exact) {
+            if (tc.cur.deferring) suffixeffects.Forget(tc, owner, exact);
             erase_if(fresh, [&](const auto &p) {
                 return tc.MayAliasRoots(p.second.owner, true, owner, exact) != AL_NO;
             });
         }
-        void Add(TypeCheck &tc, const StoreEvent &e, size_t index, FnRecord::LinkState state = {}) {
+        void Add(const StoreEvent &e, size_t index, FnRecord::LinkState state) {
             if (state.cleared.Committed()) return;
-            if (e.elementlink.direction == EL_ANY) ForgetSuffixes(tc, e.container, !e.bound);
             Part part { e.container, e.elementlink, e.storefield, e.linkclass, e.linktarget, e.boundfield, e.indexed };
             Write write { state, index };
             auto [it, added] = live.try_emplace(std::move(part), write);
             if (!added) it->second.Include(write);
         }
+        void Store(TypeCheck &tc, const StoreEvent &e, size_t index, FnRecord::LinkState state) {
+            if (!state.cleared.Committed() && e.elementlink.direction == EL_ANY) ForgetSuffixes(tc, e.container, !e.bound);
+            Add(e, index, state);
+        }
         // Once a binding expires, its outstanding writes still belong to
         // the enclosing field. A fresh iteration can bind a different slot.
         template<typename F> void ForgetBindings(F expired) {
+            erase_if(suffixeffects.changes, [&](const auto &p) { return expired(p.first->base) || expired(p.second.owner); });
+            erase_if(suffixeffects.invalidated, [&](const auto &p) {
+                if (!expired(p.first)) return false;
+                if (!p.second) suffixeffects.invaliddepth = std::max(suffixeffects.invaliddepth, Depth(p.first));
+                return true;
+            });
             erase_if(fresh, [&](const auto &p) { return expired(p.first->base) || expired(p.second.owner); });
             erase_if(lengths, [&](const auto &p) {
                 return expired(p.first) || expired(p.second.header->base) || expired(p.second.owner);
@@ -445,7 +560,10 @@ struct TypeCheck {
                 if (!merged.inserted) merged.position->second.Include(merged.node.mapped());
             }
         }
-        void Join(const LinkFlow &other, bool backedge) {
+        void Join(TypeCheck &tc, const LinkFlow &other, bool backedge) {
+            suffixeffects.Combine(tc, other.suffixeffects, [&](const auto &a, const auto &b) {
+                return SuffixEffects::Join(a, b, backedge);
+            });
             erase_if(lengths, [&](const auto &p) { return other.Measured(p.first) != p.second; });
             for (auto it = fresh.begin(); it != fresh.end();) {
                 auto found = other.fresh.find(it->first);
@@ -480,7 +598,8 @@ struct TypeCheck {
         }
         // Loop convergence depends on the possible writes, not event numbers.
         bool operator==(const LinkFlow &o) const {
-            return fresh == o.fresh && lengths == o.lengths && borrowedindices == o.borrowedindices && prefixes == o.prefixes &&
+            return fresh == o.fresh && suffixeffects == o.suffixeffects && lengths == o.lengths &&
+                   borrowedindices == o.borrowedindices && prefixes == o.prefixes &&
                    targets == o.targets && fills == o.fills &&
                    RelativeStore::SameSet(resultlinks, o.resultlinks) && live.size() == o.live.size() &&
                    equal(live.begin(), live.end(), o.live.begin(),
@@ -590,6 +709,8 @@ struct TypeCheck {
         TypeExpr *bound, *array;
         ShrinkEffect effect;
         bool viaclass;
+        const LinkField *popheader;
+        int64_t popped;
     };
     struct DeferEnv;
     struct DeferEffects {
@@ -2988,7 +3109,7 @@ struct TypeCheck {
     void RefreshDeferredBody(DeferEffects &effects);
     LinkEffects CurrentLinkEffects();
     void ApplyLinkEffects(const LinkEffects &effects);
-    void CheckLinkShrink(const LinkShrink &shrink);
+    void CheckLinkShrink(LinkShrink shrink);
     enum class ScopeExit { Local, Return, OuterReturn };
     void RunExitDefers(int first, ScopeExit exit = ScopeExit::Local, span<const FnRecord::InterruptedAssign> interrupted = {});
     vector<FnRecord::InterruptedAssign> CheckExitScopes(int first, Node *at, ScopeExit exit = ScopeExit::Local,
@@ -3073,7 +3194,7 @@ struct TypeCheck {
     const string *EmbedShader(Call *c, vector<Node *> &args);
     const string *EmbedFile(Call *c, vector<Node *> &args);
     void CheckGrowShrink(Node *at, const char *op, Node *recv, const Val &rv,
-                         SlotRemoval removal, CountProof condition, bool keepslinks);
+                         SlotRemoval removal, CountProof condition, const LinkField *popheader, int64_t popped);
     bool RelyOnCountProof(CountProof proof, Node *at, const char *use);
     bool LiveConversionTargets(const ValueLinks &links, CountProof whole, Node *at);
     void GrowOnlyAssignKnown(Assign *a, const Roots &built, bool whole);
@@ -3097,7 +3218,7 @@ struct TypeCheck {
     // (ShrinkTarget::viaclass).
     void GrowOnlyShrinkAt(Node *c, const string &op, VarDef *vd, const string &what,
                           TypeExpr *bound, TypeExpr *arr,
-                          bool viaclass, ShrinkEffect effect);
+                          bool viaclass, ShrinkEffect effect, const LinkField *popheader = nullptr, int64_t popped = 0);
     // Kills (Kill): the part of a holder a checked location path names, a
     // whole assignment's of a value holding no references, and whether those
     // in force empty every slot of a `t` at `base` in container c that can
@@ -3183,7 +3304,7 @@ struct TypeCheck {
         cur.links.prefixes.Forget([&](VarDef *prefix) { return prefix == v; });
         cur.links.targets.erase(v);
         cur.links.targets.erase(SliceElements { v });
-        if (!cur.links.live.empty() || !cur.links.fresh.empty() || !cur.links.lengths.empty())
+        if (!cur.links.live.empty() || !cur.links.fresh.empty() || !cur.links.suffixeffects.Empty() || !cur.links.lengths.empty())
             cur.links.ForgetBindings([&](VarDef *base) { return base == v; });
         if (!v->type || v->isvar || !IsAddressRef(v->type)) return;
         erase_if(cur.kills, [&](const Kill &k) { return k.relative && k.base == v; });
@@ -3191,7 +3312,7 @@ struct TypeCheck {
     void ForgetLocal(VarDef *v) {
         if (cur.links.live.empty() && cur.links.targets.empty() && cur.links.prefixes.arrays.empty() &&
             cur.links.fills.empty() && cur.links.borrowedindices.empty() && cur.links.fresh.empty() &&
-            cur.links.lengths.empty() && cur.kills.empty()) return;
+            cur.links.suffixeffects.Empty() && cur.links.lengths.empty() && cur.kills.empty()) return;
         ForgetOwner(v);
         for (auto c : v->components) if (c) ForgetLocal(c);
     }
@@ -3359,7 +3480,7 @@ struct TypeCheck {
                                        bool classbound = false);
     string TargetStr(const ShrinkTarget &t);
     void ShrinkThrough(Node *at, const string &verb, const string &recv, const Roots &roots,
-                       TypeExpr *arr, ShrinkEffect effect = {});
+                       TypeExpr *arr, ShrinkEffect effect = {}, const LinkField *popheader = nullptr, int64_t popped = 0);
     // `argnodes`: the argument expressions, aligned with argvals, which say
     // what part of the caller's holders a callee's kills empty (Kill); null
     // for an argument that is no expression of the call's.
