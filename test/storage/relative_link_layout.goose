@@ -283,6 +283,61 @@ struct NumberList { focus: i64&<u32>?, values: i64[>..] }
 fn push_number(list: NumberList&) { list.values.push(33); }
 fn pop_number(list: NumberList&) { list.values.pop(); }
 
+fn add_two(list: NumberList&) {
+    const extra: i64 = 2;
+    list.values.resize(extra + list.values.len, 73);
+}
+
+const STEP: i64 = 1;
+const MASK = ~4;
+var fixed: i64[2] = [3, 4];
+
+fn pop_resized_slots() {
+    var list = NumberList { values: [11, 22] };
+    list.focus .= list.values[1];
+    list.values.resize(list.values.len + 1, 73);
+    list.values.pop();
+    add_two(list);
+    let alias .= list;
+    alias.values.resize(list.values.len + (1 + 2), 81);
+    assert(list.values.len == 7 && list.values[3] == 73 && list.values[6] == 81);
+    list.values.pop_n(5);
+    list.values.resize(list.values.len + (block { break 2; }), 10);
+    list.values.resize(list.values.len + (STEP + 1), 20);
+    list.values.resize(fixed.len + list.values.len, 30);
+    assert(list.values.len == 8 && list.values[3] == 10 && list.values[5] == 20 && list.values[7] == 30);
+    list.values.pop_n(6);
+    var calls = 0;
+    list.values.resize(list.values.len + (block { calls += 1; break 2; }), 9);
+    list.values.pop_n(2);
+    list.values.resize(list.values.len + (block { const local = 2; break local; }), 7);
+    list.values.pop_n(2);
+    const NEG: i64 = -2;
+    const DOUBLE: i64 = STEP + 1;
+    list.values.resize(list.values.len + (1 - NEG), 8);
+    list.values.resize(list.values.len + DOUBLE, 9);
+    list.values.pop_n(5);
+    const BYTE: u8 = 250;
+    list.values.resize(list.values.len + (BYTE + 10), 7);
+    list.values.pop_n(4);
+    list.values.resize(list.values.len + (260 as! u8), 8);
+    list.values.pop_n(4);
+    const DIVISOR: u8 = 2;
+    list.values.resize(list.values.len + (MASK / DIVISOR), 7);
+    assert(list.values.len == 127);
+    list.values.pop_n(125);
+    assert(calls == 1);
+    var other: i64[>..] = [];
+    fn extend(other: i64[>..]&) {
+        fn fill() -> i64 { other.push(17); return 33; }
+        list.values.resize(list.values.len + 1, fill());
+    }
+    extend(other);
+    list.values.pop();
+    assert(other.len == 1);
+    assert(list.values.len == 2 && list.focus .== list.values[1]);
+}
+
 fn extend() {
     var list = NumberList { values: [11, 22] };
     list.focus .= list.values[1];
@@ -334,6 +389,8 @@ fn resize_with_fill() {
     let limited: Node[] = limited_with_fill();
     assert(limited[0].next .== limited[1]);
     assert(calls == 1 && other.len == 1 && list.values[2] == 33 && list.focus .== list.values[1]);
+    list.values.pop();
+    assert(list.values.len == 2 && list.focus .== list.values[1]);
 }
 
 fn clear_node(node: Node&) { node.next .= null; }
@@ -369,6 +426,7 @@ fn deferred_clear(i: i64) {
 }
 
 fn main() {
+    pop_resized_slots();
     deferred_clear(0);
     clear_link(0);
     clear_link(1);

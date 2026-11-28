@@ -818,8 +818,51 @@ inline int64_t TypeCheck::KnownIndex(Node *n, const Val &v) {
     if (IntConsts(v, lo, hi) && lo == hi && lo >= 0 && ConstantBindings(v) == ConstantBinding::Immutable)
         return lo;
     if (auto literal = Is<IntLit>(n); literal && literal->val >= 0) return literal->val;
-    if (auto id = Is<Ident>(n); id && id->vdef) return id->vdef->constantindex;
+    if (auto id = Is<Ident>(n); id && id->vdef) return std::max<int64_t>(-1, id->vdef->fixedint.value_or(-1));
     return -1;
+}
+
+// Runtime arithmetic can have a fixed value even when a typed constant
+// cannot adapt like a literal. Fold the checked operands at their actual
+// widths and use their resolved bindings (including shadowing locals).
+inline std::optional<int64_t> TypeCheck::FixedCountOperand(Node *n) {
+    if (!n || !n->exprtype || !IsIntT(n->exprtype)) return {};
+    if (auto lit = Is<IntLit>(n)) return lit->val;
+    if (auto id = Is<Ident>(n); id && id->vdef && id->vdef->fixedint)
+        return WrapStorage(*id->vdef->fixedint, n->exprtype->intstorage);
+    if (auto d = Is<Dot>(n); d && (d->member == B_LEN || d->member == B_CAP)) {
+        auto t = d->obj->exprtype;
+        if (IsPlainRef(t)) t = t->ref->sub;
+        if (IsArrayKind(t, A_FIXED) && d->member == B_LEN) return ArraySize(t->arr);
+        if (IsArrayKind(t, A_LIMITED) && d->member == B_CAP && t->arr->sizeexpr) return ArraySize(t->arr);
+    }
+    if (auto b = Is<Block>(n)) return FixedCountOperand(b->tail);
+    if (auto b = Is<EarlyBlock>(n)) {
+        auto value = FixedCountOperand(b->body->tail);
+        if (b->body->tail && !value) return {};
+        for (auto br : b->breaks) {
+            auto k = FixedCountOperand(br->val);
+            if (!k || (value && k != value)) return {};
+            value = k;
+        }
+        return value;
+    }
+    int64_t result;
+    if (auto b = Is<Binary>(n)) {
+        auto l = FixedCountOperand(b->left);
+        if (!l) return {};
+        auto r = FixedCountOperand(b->right);
+        if (r && FoldIntOp(b->op, *l, *r, b->left->exprtype->intstorage, result)) return result;
+    } else if (auto u = Is<Unary>(n); u && (u->op == T_MINUS || u->op == T_BITNOT)) {
+        if (auto v = FixedCountOperand(u->child)) {
+            auto s = u->child->exprtype->intstorage;
+            if (u->op == T_BITNOT) return WrapStorage(~*v, s);
+            if (FoldIntOp(T_MINUS, 0, *v, s, result)) return result;
+        }
+    } else if (auto cast = Is<AsCast>(n)) {
+        if (auto v = FixedCountOperand(cast->child)) return WrapStorage(*v, cast->totype->intstorage);
+    }
+    return {};
 }
 
 // Does this type embed self-relative references at the value level (not

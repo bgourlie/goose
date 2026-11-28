@@ -2121,6 +2121,7 @@ struct TypeCheck {
     static bool ImplicitInt(IntStorage from, IntStorage to);
     Val CheckIntAny(Node *n);
     static int64_t KnownIndex(Node *n, const Val &v);
+    std::optional<int64_t> FixedCountOperand(Node *n);
     bool HasRelRefT(TypeExpr *t, bool inpool = false);
     bool BuiltWhereReceived(Node *n, size_t result);
     void NoRelRefCopy(Node *n, TypeExpr *t, size_t result = 0, const VarDecl *bind = nullptr,
@@ -3090,14 +3091,20 @@ struct TypeCheck {
 
     Val CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> &args, Val *precv);
     enum class SlotRemoval { None, ToCapacity, Possible, All, PreservesIfUnchanged, NamedZeroResize };
+    struct SlotChange {
+        SlotRemoval removal;
+        CountProof condition;
+        int64_t added = 0; // Guaranteed fresh slots on successful completion.
+    };
     const LinkField *ArrayHeader(const RefPlace &place, TypeExpr *array);
     const LinkField *ArrayHeader(const Val &value, TypeExpr *array) {
         return value.lvalue || IsPlainRef(value.type) ? ArrayHeader(value.refplace, array) : nullptr;
     }
-    bool MeasuresReceiver(Node *expr, Node *receiver, const Val &value, TypeExpr *array, BuiltinKind member);
-    SlotRemoval CountedRemoval(BuiltinKind op, const vector<Node *> &args, const Val &count,
-                               TypeExpr *array, const Val &receiver, CountProof &condition,
-                               CountProof fillpreserves = true);
+    bool MeasuresReceiver(Node *expr, Node *receiver, const Val &value, TypeExpr *array, BuiltinKind member,
+                          bool consecutive = true);
+    CountProof PreservesMeasuredLength(size_t since, Node *operand, const Val &receiver, TypeExpr *array);
+    SlotChange CountedSlots(BuiltinKind op, const vector<Node *> &args, const Val &count,
+                            TypeExpr *array, const Val &receiver, CountProof fillpreserves = true);
     void CheckByteOut(Call *c, Node *out, const string &form);
     // Later passes walk only the arguments that can execute. Overload
     // resolution on a subsequent check still needs the call as written.

@@ -49,6 +49,13 @@ inline VarDef *TypeCheck::SuffixOwner(VarDef *owner) {
 inline bool TypeCheck::SuffixOwnersOverlap(VarDef *a, bool aexact, VarDef *b, bool bexact) {
     a = SuffixOwner(a);
     b = SuffixOwner(b);
+    // Exact caller storage retains its local/global distinction and whether
+    // its whole type can hold a link, even when its name is out of scope.
+    if (a && b && aexact && bexact && a != b) {
+        if ((a->suffixlocal && b->isglobal) || (b->suffixlocal && a->isglobal)) return false;
+        if (!a->mayholdrel && b->type && HasRelRefT(LoadType(b->type))) return false;
+        if (!b->mayholdrel && a->type && HasRelRefT(LoadType(a->type))) return false;
+    }
     auto alias = MayAliasRoots(a, aexact, b, bexact);
     if (alias != AL_DEFER || !aexact || !bexact) return alias != AL_NO;
     for (auto frame = frames.rbegin(); frame != frames.rend(); ++frame) {
@@ -80,16 +87,21 @@ inline void TypeCheck::ClassifySuffixArgs(vector<RootArg> &roots, const MatchInf
     };
     for (size_t i = 0; i < types.size(); i++) {
         auto t = types[i];
-        if (!roots[i].mayholdrel || !IsRefOrSlice(t) || mi.sf->params[i].isvar ||
-            !args[i].Exact() || !args[i].Root()) continue;
+        if (!IsRefOrSlice(t) || mi.sf->params[i].isvar || !args[i].Exact() || !args[i].Root()) continue;
         auto array = IsAddressRef(t) && GrowOnlyTail(t->ref->sub);
         if (!array && !HasRelRefT(PointeeOf(t))) continue;
-        auto header = array ? CanonicalSuffixHeader(ArrayHeader(args[i], t->ref->sub)) : nullptr;
-        auto owner = SuffixOwner(args[i].Root());
-        if (visible(owner)) roots[i].suffixowner = owner;
-        if (header && visible(header->base)) roots[i].suffixouter = header;
+        const LinkField *header = nullptr;
+        if (roots[i].mayholdrel) {
+            if (array) header = CanonicalSuffixHeader(ArrayHeader(args[i], t->ref->sub));
+            auto owner = SuffixOwner(args[i].Root());
+            if (visible(owner)) roots[i].suffixowner = owner;
+            else if (owner)
+                roots[i].suffixlocal = owner->suffixlocal || (owner->type && owner->ownerspec && !owner->isglobal && !IsTemp(owner));
+            if (header && visible(header->base)) roots[i].suffixouter = header;
+        }
         for (auto [j, other] : places) {
-            if (!SuffixOwnersOverlap(args[i].Root(), true, args[j].Root(), true))
+            if ((roots[i].mayholdrel || roots[j].mayholdrel) &&
+                !SuffixOwnersOverlap(args[i].Root(), true, args[j].Root(), true))
                 roots[i].apartowners.push_back((int)j);
         }
         places.emplace_back(i, header);
@@ -114,40 +126,58 @@ inline void TypeCheck::ClassifySuffixArgs(vector<RootArg> &roots, const MatchInf
     }
 }
 
-inline bool TypeCheck::MeasuresReceiver(Node *expr, Node *receiver, const Val &value, TypeExpr *array, BuiltinKind member) {
+inline bool TypeCheck::MeasuresReceiver(Node *expr, Node *receiver, const Val &value, TypeExpr *array, BuiltinKind member,
+                                        bool consecutive) {
     auto d = Is<Dot>(expr);
-    return d && d->member == member && (SamePath(receiver, d->obj, PathInterval::ConsecutiveReads) ||
+    return d && d->member == member && ((consecutive && SamePath(receiver, d->obj, PathInterval::ConsecutiveReads)) ||
                                        (d->measuredarray && d->measuredarray == ArrayHeader(value, array)));
 }
 
+// Count operands and fill expressions may write to other storage. Only a
+// change to the measured header can make its length stale. A limited
+// header can also be replaced by an ordinary assignment.
+inline CountProof TypeCheck::PreservesMeasuredLength(size_t since, Node *operand, const Val &receiver, TypeExpr *array) {
+    if (receiver.unknown || receiver.None() || !ShrinkRootsKnown(receiver))
+        return EvalMeets(operand, EvalRequirement::ReadOnly);
+    auto limited = IsArrayKind(array, A_LIMITED);
+    if (limited && !EvalMeets(operand, EvalRequirement::LoggedGrowth)) return false;
+    CountProof preserves = true;
+    AliasingGrowsSince(since, receiver, array, [&](const GrowEvent &e, const RootAlt &target, Alias alias) {
+        if (e.stackonly) return;
+        if (!limited && !SuffixOwnersOverlap(e.root, e.exact, target.root, target.exact)) return;
+        if (alias == AL_YES) preserves = false;
+        else preserves = preserves.Both(DistinctGrowth(e.root, e.exact && target.exact, target.root));
+    });
+    return preserves;
+}
+
 // The count and, for resize, the fill have already been checked in evaluation order.
-inline TypeCheck::SlotRemoval TypeCheck::CountedRemoval(BuiltinKind op, const vector<Node *> &args,
-                                                        const Val &count, TypeExpr *array, const Val &receiver,
-                                                        CountProof &condition, CountProof fillpreserves) {
+inline TypeCheck::SlotChange TypeCheck::CountedSlots(BuiltinKind op, const vector<Node *> &args,
+                                                     const Val &count, TypeExpr *array, const Val &receiver,
+                                                     CountProof fillpreserves) {
     assert(op == B_POP_N || op == B_RESIZE);
-    auto preserves = [&](CountProof proof) {
-        condition = proof;
-        return proof.Unconditional() ? SlotRemoval::None : SlotRemoval::PreservesIfUnchanged;
+    auto preserves = [](CountProof proof, int64_t added = 0) -> SlotChange {
+        return { proof.Unconditional() ? SlotRemoval::None : SlotRemoval::PreservesIfUnchanged, proof, added };
     };
     if (op == B_RESIZE && IsArrayKind(array, A_LIMITED) && MeasuresReceiver(args[1], args[0], receiver, array, B_CAP))
-        return SlotRemoval::ToCapacity;
+        return { SlotRemoval::ToCapacity };
     if (MeasuresReceiver(args[1], args[0], receiver, array, B_LEN)) {
-        if (op == B_POP_N) return SlotRemoval::All;
+        if (op == B_POP_N) return { SlotRemoval::All };
         if (fillpreserves.Available()) return preserves(fillpreserves);
     }
     // On successful resize, adding a nonnegative i64 to .len cannot shrink:
     // any signed overflow gives a negative count, rejected before the write.
     if (auto sum = Is<Binary>(args[1]); op == B_RESIZE && sum && sum->op == T_PLUS &&
         count.type->intstorage == IS_I64) {
-        auto growth = [&](Node *prop, Node *offset) -> CountProof {
-            if (!MeasuresReceiver(prop, args[0], receiver, array, B_LEN)) return false;
+        auto nonnegative = [&](Node *offset) -> CountProof {
+            if (sum->lenoffset >= 0) return true;
             if (auto k = Is<IntLit>(offset)) return !k->uns && k->val >= 0;
             if (auto k = Is<Dot>(offset); k && (k->member == B_LEN || k->member == B_CAP))
                 return EvalMeets(k->obj, EvalRequirement::ReadOnly);
             if (auto id = Is<Ident>(offset); id && id->vdef) {
                 auto v = id->vdef;
-                if (v->constantindex >= 0 || (IsIntT(v->type) && IsUnsigned(v->type->intstorage) &&
-                                              IntBits(v->type->intstorage) < 64)) return true;
+                if (v->fixedint.value_or(-1) >= 0 || (IsIntT(v->type) && IsUnsigned(v->type->intstorage) &&
+                                                      IntBits(v->type->intstorage) < 64)) return true;
                 if (!v->nonneg) return false;
                 CountProof proof = true;
                 for (; v; v = v->nonnegfrom)
@@ -157,32 +187,46 @@ inline TypeCheck::SlotRemoval TypeCheck::CountedRemoval(BuiltinKind op, const ve
             }
             return false;
         };
+        auto growth = [&](Node *prop, Node *offset) -> CountProof {
+            auto first = prop == sum->left;
+            if (!MeasuresReceiver(prop, args[0], receiver, array, B_LEN, first || EvalMeets(offset, EvalRequirement::ReadOnly)))
+                return false;
+            auto proof = nonnegative(offset);
+            if (first && proof.Available())
+                proof = proof.Both(PreservesMeasuredLength(static_cast<Dot *>(prop)->measurementlog, offset, receiver, array));
+            return proof;
+        };
         auto proof = growth(sum->left, sum->right).Prefer(growth(sum->right, sum->left));
         proof = proof.Both(fillpreserves);
-        if (proof.Available()) return preserves(proof);
+        if (proof.Available()) {
+            // The no-fill form can only shrink. Conditional evidence can
+            // rule out removal without establishing an unconditional count.
+            auto added = args.size() == 3 && proof.Committed() ? std::max<int64_t>(sum->lenoffset, 0) : 0;
+            return preserves(proof, added);
+        }
     }
     auto zero = op == B_POP_N ? SlotRemoval::None : SlotRemoval::All;
     auto known = KnownIndex(args[1], count);
     if (known >= 0) {
         if (op == B_RESIZE && IsArrayKind(array, A_LIMITED)) {
             auto whole = receiver.Exact() ? LimitedPrefix(receiver.Root(), receiver.refplace, array) : nullptr;
-            if (known == LimitedCapacity(array, whole)) return SlotRemoval::ToCapacity;
+            if (known == LimitedCapacity(array, whole)) return { SlotRemoval::ToCapacity };
         }
-        return known == 0 ? zero : SlotRemoval::Possible;
+        return { known == 0 ? zero : SlotRemoval::Possible };
     }
     int64_t lo, hi;
     if (!IntConsts(count, lo, hi) || lo != 0 || hi != 0 || ConstantBindings(count) != ConstantBinding::Let)
-        return SlotRemoval::Possible;
+        return { SlotRemoval::Possible };
     // A helper may not know whether its caller retains a link. Keep the
     // zero count conditional until a shrink or conversion needs it.
-    condition = CountProof::IfUnchanged(ast.countconditions, count.constfrom);
-    if (op == B_POP_N && array->arr->akind != A_GROWSHRINK) return SlotRemoval::PreservesIfUnchanged;
+    auto condition = CountProof::IfUnchanged(ast.countconditions, count.constfrom);
+    if (op == B_POP_N && array->arr->akind != A_GROWSHRINK) return preserves(condition);
     auto ak = array->arr->akind;
     auto elem = array->arr->sub;
     if (op == B_RESIZE && ((ak == A_GROW && HasRelRefT(elem)) ||
                            (ak == A_LIMITED && (HasRelRefT(elem) || HoldsPlainRef(elem)))))
-        return SlotRemoval::NamedZeroResize;
-    return SlotRemoval::Possible;
+        return { SlotRemoval::NamedZeroResize, condition };
+    return { SlotRemoval::Possible };
 }
 
 // One entry for every builtin (builtins.h), for both spellings — f(a, b)
@@ -655,8 +699,9 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
         return dest;
     };
     // resize has two forms (§3.3); a target below zero is caught at runtime.
-    auto removal = SlotRemoval::None;
-    CountProof countcondition, savedlength;
+    SlotChange slots { SlotRemoval::None, {}, d.kind == B_PUSH ? 1 : 0 };
+    auto &[removal, countcondition, added] = slots;
+    CountProof savedlength;
     if (d.flags & BF_SHRINKS) removal = d.kind == B_CLEAR ? SlotRemoval::All : SlotRemoval::Possible;
     if (d.kind == B_RESIZE) {
         auto length = CheckIntAny(args[1]);
@@ -676,21 +721,7 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
         if (args.size() == 3) {
             auto beforefill = cur.growlog.size();
             ElemArg(args[2], elem, elementdest());
-            // Count and receiver have already been evaluated. Only a change
-            // to this header can make its measured length stale. Resizable
-            // writes are logged through calls; a fixed-capacity limited array
-            // can also be replaced by an ordinary assignment.
-            if (rv.unknown || rv.None() || !ShrinkRootsKnown(rv)) {
-                fillpreserves = EvalMeets(args[2], EvalRequirement::ReadOnly);
-            } else if (ak == A_LIMITED && !EvalMeets(args[2], EvalRequirement::LoggedGrowth)) {
-                fillpreserves = false;
-            } else {
-                AliasingGrowsSince(beforefill, rv, recvarr, [&](const GrowEvent &e, const RootAlt &target, Alias alias) {
-                    if (e.stackonly) return;
-                    if (alias == AL_YES) fillpreserves = false;
-                    else fillpreserves = fillpreserves.Both(DistinctGrowth(e.root, e.exact && target.exact, target.root));
-                });
-            }
+            fillpreserves = PreservesMeasuredLength(beforefill, args[2], rv, recvarr);
             // The fill value is built once and copied into every slot the
             // resize adds, so not even a literal is built in place (§3.9).
             if (HasRelRefT(elem) && (Is<StructLit>(args[2]) || Is<ArrayLit>(args[2])))
@@ -704,7 +735,7 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
             if (!key.binding->type->cq)
                 savedlength = savedlength.Both(CountProof::IfBindingUnchanged(ast.countconditions, key.binding));
         }
-        removal = CountedRemoval(d.kind, args, length, recvarr, rv, countcondition, fillpreserves);
+        slots = CountedSlots(d.kind, args, length, recvarr, rv, fillpreserves);
         if (countedgrowth && args.size() == 3 && reachable && KnownIndex(args[1], length) != 0 &&
             !(fillpreserves.Unconditional() && MeasuresReceiver(args[1], args[0], rv, recvarr, B_LEN))) grow();
         // A successful resize installs the evaluated count even when a fill ran.
@@ -814,7 +845,6 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
     }
     // Signature-driven arguments.
     auto beforestores = storeevents.size();
-    int64_t added = d.kind == B_PUSH ? 1 : 0;
     int64_t popped = d.kind == B_POP ? 1 : -1;
     auto base = (d.flags & BF_MEMBER) ? 1 : 0;
     for (auto i = 0; d.args[i]; i++) {
@@ -824,7 +854,7 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
                 auto count = CheckIntAny(an);
                 if (d.kind == B_POP_N) {
                     popped = KnownIndex(an, count);
-                    removal = CountedRemoval(d.kind, args, count, recvarr, rv, countcondition);
+                    slots = CountedSlots(d.kind, args, count, recvarr, rv);
                 }
                 break;
             }

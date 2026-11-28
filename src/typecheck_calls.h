@@ -3409,6 +3409,7 @@ inline void TypeCheck::CheckSpecBodyOnce(FnSpec *spec, vector<Val> *argvals, Lin
                     classroots[ra.cls] = rv;
                 }
                 classroots[ra.cls]->mayholdrel &= ra.mayholdrel;
+                classroots[ra.cls]->suffixlocal |= ra.suffixlocal;
                 ReachedThroughRefs(pt, classroots[ra.cls]->classreach);
                 // Members of one class share a root, so they agree on the
                 // pool; a member that names none settles it for all.

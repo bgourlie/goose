@@ -2397,6 +2397,18 @@ inline Val TypeCheck::CheckBinaryResult(Binary *b, Val &lv, Val &rv) {
     auto l = b->left, r = b->right;
     TypeExpr *ct = nullptr;
     auto v = NumericBinary(b, lv, rv, ct, false);
+    b->lenoffset = -1;
+    if (b->op == T_PLUS && IsIntT(v.type) && v.type->intstorage == IS_I64) {
+        auto offset = [&](Node *n, const Val &operand) {
+            auto k = KnownIndex(n, operand);
+            return k >= 0 ? k : FixedCountOperand(n).value_or(-1);
+        };
+        if (auto d = Is<Dot>(l); d && d->member == B_LEN) {
+            auto k = offset(r, rv);
+            if (k >= 0) b->lenoffset = k;
+        }
+        if (auto d = Is<Dot>(r); d && d->member == B_LEN && b->lenoffset < 0) b->lenoffset = offset(l, lv);
+    }
     JudgeBinaryCasts(b, l, r, lv, rv, v, ct);
     return v;
 }
@@ -3508,6 +3520,12 @@ inline bool TypeCheck::EvalMeets(Node *n, EvalRequirement requirement, map<FnSpe
         n->Children([&](Node *child) { ok = ok && safe(child); });
         return ok;
     };
+    // A local break contributes its value once. Only its operands can
+    // mutate storage before a read-only expression completes.
+    if (requirement == EvalRequirement::ReadOnly) {
+        if (auto block = Is<EarlyBlock>(n)) return safe(block->body);
+        if (auto br = Is<Break>(n)) return safe(br->val);
+    }
     // With no reordering, bounds and destination checks run in place.
     // Field defaults inserted by CheckInits are operands too.
     if (!reorder && (Is<Index>(n) || Is<SliceExpr>(n) || Is<StructLit>(n) || Is<ArrayLit>(n)))

@@ -1637,6 +1637,7 @@ NODE(Binary)
     BCE_WALK
     TType op;
     Node *left, *right;
+    int64_t lenoffset = -1; // Known nonnegative addend to a .len read in this sum.
     // Filled by typecheck for && and ||: optionals the right operand un-narrows.
     vector<VarDef *> rightkills;
     // Filled by BCE for && and || (BCE::ProbeRight): 1 where every bounds
@@ -1655,6 +1656,7 @@ NODE(Binary)
 NODE_END
 
 NODE(Dot)
+    size_t measurementlog = 0; // Growth log position just after reading this property.
     const LinkField *measuredarray = nullptr; // Exact array header read by a direct .len or .cap.
     TypeExpr *accessorowner = nullptr; // The concrete struct declaring a bound selector.
     BCE_MARK
@@ -2435,7 +2437,7 @@ struct VarDef {
     bool constlit = false;
     bool constuns = false;      // constval's bits are a u64 above i64.max (Val::uns).
     int64_t constval = 0;
-    int64_t constantindex = -1; // Known nonnegative value of an immutable integer binding, including typed constants.
+    std::optional<int64_t> fixedint; // Value of an immutable integer binding when known at its storage width.
     bool constnot = false;      // A constlit whose constval is `~c`, c >= 0 (Val::notconst).
     bool constflt = false;      // A float constant, of value constfval.
     double constfval = 0;
@@ -2455,6 +2457,7 @@ struct VarDef {
     // so references in a pool class are rooted outside the cycle and exempt
     // from the cycle store rule.
     VarDef *classfrom = nullptr;
+    bool suffixlocal = false; // This class names storage belonging to a local declaration.
     bool mayholdrel = true;   // Whether this class's owner can contain a self-relative link.
     bool poolclass = false;
     // The global pool, or owner of named pool components, every call site's
@@ -2698,6 +2701,7 @@ struct RootArg {
     const LinkField *suffixouter = nullptr; // Or a location already named in the lexical environment.
     const string *suffixpath = nullptr;     // Path from suffixparam's pointee.
     VarDef *suffixowner = nullptr;          // An owner already named in the lexical environment.
+    bool suffixlocal = false;               // Exact local storage, independent of which caller owns it.
     vector<int> apartowners;                // Earlier parameters with provably disjoint owners.
     bool mayholdrel = true;
     bool writable = true;
@@ -2792,7 +2796,7 @@ struct RootArg {
         return cls == o.cls && elementlinks == o.elementlinks &&
                ownerparam == o.ownerparam && ownerfield == o.ownerfield &&
                suffixparam == o.suffixparam && suffixpath == o.suffixpath && suffixouter == o.suffixouter &&
-               suffixowner == o.suffixowner && apartowners == o.apartowners && mayholdrel == o.mayholdrel &&
+               suffixowner == o.suffixowner && suffixlocal == o.suffixlocal && apartowners == o.apartowners && mayholdrel == o.mayholdrel &&
                writable == o.writable && reusable == o.reusable &&
                growshrink == o.growshrink && gsvia == o.gsvia && slotread == o.slotread &&
                byteview == o.byteview && pool == o.pool && heldexact == o.heldexact &&

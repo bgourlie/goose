@@ -651,6 +651,7 @@ inline VarDef *TypeCheck::RootComponent(VarDef *owner, TypeExpr *t, int field) {
     c->depth = owner->depth;
     c->ownerspec = owner->ownerspec;
     c->isglobal = owner->isglobal;
+    c->suffixlocal = owner->suffixlocal;
     c->isvar = owner->isvar;
     c->assigned = c->maybeassigned = true;
     // A recursive back edge can record a class use before the body first
@@ -3356,8 +3357,13 @@ inline void TypeCheck::CheckVarDecl(VarDecl *vd, bool global) {
         d->constfval = v.fval;
         d->constfrom = d->constlit ? v.constfrom : nullptr;
         Finish(d, ann ? ann : v.type, &v, vd->inits[i]);
-        if (!d->isvar && d->type->cq && IsIntT(d->type))
-            d->constantindex = KnownIndex(vd->inits[i], v);
+        if (!d->isvar && d->type->cq && IsIntT(d->type)) {
+            int64_t lo, hi;
+            if (IntConsts(v, lo, hi) && lo == hi && ConstantBindings(v) == ConstantBinding::Immutable)
+                d->fixedint = WrapStorage(lo, d->type->intstorage);
+            else if (auto k = FixedCountOperand(vd->inits[i]))
+                d->fixedint = WrapStorage(*k, d->type->intstorage);
+        }
         auto len = Is<Dot>(vd->inits[i]);
         if (!vd->isvar && !global && len && len->member == B_LEN &&
             d->type->kind == TY_INT && d->type->intstorage == IS_I64) {
