@@ -589,9 +589,19 @@ inline Val TypeCheck::CheckSlice(SliceExpr *se, LVal lv) {
     // A comparison's view reads no link out of what it compares (§4.5).
     if (lv.intemp && !se->cmpview) NoRelRefTempRead(se->obj, lv.type, elem);
     NoteSequenceElement(SliceElements { se }, se->obj, lv, lv.place, lv.type);
-    if (se->lo) CheckIntAny(se->lo);
-    if (se->hi) CheckIntAny(se->hi);
+    auto lo = se->lo ? KnownIndex(se->lo, CheckIntAny(se->lo)) : 0;
+    auto hi = se->hi ? KnownIndex(se->hi, CheckIntAny(se->hi)) : 0;
+    auto loend = se->lo_from_end, hiend = !se->hi || se->hi_from_end;
+    if (loend != hiend && IsArrayKind(lv.type, A_FIXED)) {
+        auto length = ArraySize(lv.type->arr);
+        if (loend && lo >= 0) lo = length - lo;
+        if (hiend && hi >= 0) hi = length - hi;
+        loend = hiend = false;
+    }
     Val v;
+    // Two offsets from the same end give a length even for a dynamic array.
+    if (lo >= 0 && hi >= 0 && loend == hiend)
+        v.extent.length = std::max<int64_t>(-1, loend ? lo - hi : hi - lo);
     v.type = ast.SliceOf(elem, se->line);
     v.sliceplace = lv.place.Inside(ast.places, IsArrayKind(lv.type, A_GROW));
     v.SetProv(lv);

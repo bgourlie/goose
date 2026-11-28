@@ -7,14 +7,16 @@ enum E { One { n: i64 = tick() }, Two }
 
 fn finish() -> i64 { return 42 from make; }
 struct Exits { n: i64 = finish() }
-fn make() -> i64 {
+fn empty_run(pool: Exits[>..]&) -> Exits[:] { pool[0..0] }
+fn make(reallocate: bool) -> i64 {
     const ONE: i64 = 1;
     reusable[] var pool: Exits[>..] = [];
-    pool.alloc_slice(ONE);
+    if reallocate { pool.realloc_slice(empty_run(pool), ONE); }
+    else { pool.alloc_slice(ONE); }
 }
 
 fn main() {
-    assert(make() == 42);
+    assert(make(true) == 42 && make(false) == 42);
     let seed = 99;
     fn tick() -> i64 { 999 }
     let a = S<u8> { middle: ::tick() };
@@ -36,4 +38,7 @@ fn main() {
     reusable[] var skips: Exits[>..] = [];
     let skipped = skips.alloc_slice(ONE - 1);
     assert(skipped.len == 0);
+    reusable[] var kept: Exits[>..] = [Exits { n: 7 }, Exits { n: 8 }];
+    let first = kept.realloc_slice(kept[^2..], 1);
+    assert(first.len == 1 && first[0].n == 7);
 }

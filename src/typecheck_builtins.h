@@ -800,13 +800,16 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
         }
     }
     bool writesduringargs = false;
+    int64_t slicelength = -1;
     // A slice pool's operations (§5.4). A slice handed back must be one of
     // the pool's own, by the same exact root index_of needs, so that the
     // position it starts at is a whole index inside the length; the
     // elements an operation adds are default values.
     if (d.kind == B_ALLOC_SLICE || d.kind == B_REALLOC_SLICE || d.kind == B_FREE_SLICE) {
+        int64_t oldlength = 0;
         if (d.kind != B_ALLOC_SLICE) {
             auto sv = CheckV(args[1], nullptr);
+            oldlength = sv.extent.length;
             args[1]->exprtype = sv.type;
             if (sv.type->kind != TY_SLICE || !TypeEq(sv.type->sub, elem))
                 Error(c, cat(".", d.name, " takes a slice of ", TypeStr(rv.type), ", got ",
@@ -843,8 +846,11 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
             } else if (auto count = FixedCountOperand(args.back())) {
                 lo = hi = std::max<int64_t>(0, *count);
             }
-            // Reallocation only defaults the portion beyond the old length.
-            if (d.kind == B_REALLOC_SLICE) lo = 0;
+            if (lo == hi) slicelength = lo;
+            // Only the newly added slots run defaults. An unknown old slice
+            // may already contain the entire requested run.
+            lo = oldlength < 0 ? 0 : std::max<int64_t>(0, lo - oldlength);
+            if (hi >= 0 && oldlength >= 0) hi = std::max<int64_t>(0, hi - oldlength);
             if (!hi) c->defaultinit = nullptr;
             CheckElementRuns(c, { lo, hi }, [&] {
                 if (!c->defaultinit) c->defaultinit = DefaultCall(elem, c->line);
@@ -1091,6 +1097,7 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
             c->rettypes.push_back(v.type);
             break;
         case 's':
+            v.extent.length = slicelength;
             v.type = ast.SliceOf(elem, c->line);
             v.sliceplace = elementplace;
             v.TakeAlts(rv);
