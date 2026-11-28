@@ -4521,26 +4521,26 @@ inline bool TypeCheck::ReadBackwardSlot(const LVal &slot) {
     return true;
 }
 
-// Each inline fixed-array subscript identifies an element at its own level.
+// Each inline array subscript identifies an element at its own level.
 // Keep it as well as the enclosing element: an alias may name either array.
 inline TypeCheck::ElementPath TypeCheck::InlineElementPath(Node *n, bool destination) {
     ElementPath path;
-    bool insidefixed = false;
+    bool insidearray = false;
     bool consecutive = true;
     while (auto obj = PathObject(n)) {
         auto t = obj->exprtype;
         if (!t) return path;
         if (auto ix = Is<Index>(n)) {
-            path.push_back({ ix, insidefixed, consecutive });
-            if (!IsArrayKind(IsPlainRef(t) ? t->ref->sub : t, A_FIXED)) return path;
-            insidefixed = true;
+            path.push_back({ ix, insidearray, consecutive });
+            if (!HasStaticArrayCapacity(IsPlainRef(t) ? t->ref->sub : t)) return path;
+            insidearray = true;
             // A destination's inner subscript runs between the two outer index reads.
             if (destination) consecutive &= EvalMeets(ix->idx, EvalRequirement::ReadOnly);
         }
         n = obj;
         if (IsRefOrSlice(t)) break; // The pointee has its own storage.
     }
-    if (Is<Ident>(n) || Is<Call>(n)) path.push_back({ n, insidefixed, consecutive });
+    if (Is<Ident>(n) || Is<Call>(n)) path.push_back({ n, insidearray, consecutive });
     return path;
 }
 
@@ -4550,9 +4550,9 @@ inline bool TypeCheck::BackwardElementOrder(const ElementPosition &slot, const E
     auto source = Is<Ident>(slot.base), targetref = Is<Ident>(target.base);
     auto binding = targetref ? targetref->vdef : nullptr;
     if (binding && source && source->vdef == binding && !binding->isvar && IsAddressRef(binding->type)) {
-        // If both endpoints are in this binding's fixed array, its own
+        // If both endpoints are in this binding's inline array, its own
         // element order still matters when the array is used on its own.
-        if (!slot.insidefixed || !target.insidefixed || !IsArrayKind(binding->type->ref->sub, A_FIXED)) return true;
+        if (!slot.insidearray || !target.insidearray || !HasStaticArrayCapacity(binding->type->ref->sub)) return true;
     }
     auto call = Is<Call>(slot.base);
     auto appended = call && call->builtin == B_PUSH ? call->appendedarray : nullptr;

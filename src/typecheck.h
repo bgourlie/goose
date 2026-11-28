@@ -3436,7 +3436,7 @@ struct TypeCheck {
     bool ReadBackwardSlot(const LVal &slot);
     struct ElementPosition {
         Node *base;
-        bool insidefixed; // An inline fixed-array subscript lies between the slot and this base.
+        bool insidearray; // A subscript of an inline array lies between the slot and this base.
         bool consecutive; // Inner subscripts preserved the values read at this position.
     };
     using ElementPath = small_vector<ElementPosition, 2>;

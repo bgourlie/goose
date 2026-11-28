@@ -78,6 +78,7 @@ struct InlineLink { target: i64&<u32>? }
 struct InlineNode { values: i64[2] = [3, 7], links: InlineLink[2] = [InlineLink {}; 2] }
 struct RowCell { value: i64 = 3, link: i64&<u32>? }
 struct Row { cells: RowCell[2] = [RowCell {}; 2] }
+struct LimitedRow { selected: i64&<u32>?, values: i64[..3] }
 
 fn point_within(node: InlineNode&) { node.links[1].target .= node.values[1]; }
 fn point_within_row(row: Row&) { row.cells[0].link .= row.cells[1].value; }
@@ -125,6 +126,10 @@ fn copy_indexed(nodes: LinkedPair[>..]&, i: i64) {
 }
 
 fn copied_links() {
+    var rows: LimitedRow[>..] = [LimitedRow { values: [3, 7] }; 2];
+    rows[0].selected .= rows[0].values[1];
+    rows.pop();
+    assert(rows[0].selected .== rows[0].values[1]);
     fixed_array_elements();
     fixed_array_alias(false);
     fixed_array_alias(true);

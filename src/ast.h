@@ -357,6 +357,9 @@ inline bool IsSelfRelRef(const TypeExpr *t) { return IsRelRef(t) && !t->ref->poo
 inline bool IsArrayKind(const TypeExpr *t, ArrayKind k) {
     return t->kind == TY_ARRAY && t->arr->akind == k;
 }
+inline bool HasStaticArrayCapacity(const TypeExpr *t) {
+    return IsArrayKind(t, A_FIXED) || (IsArrayKind(t, A_LIMITED) && t->arr->sizeexpr);
+}
 // Whether a variable or parameter of this type bound to a reusable pool is a
 // pool reference (§5.4), carrying the pool's freelist beside the address (a
 // gs_pref in the generated C): a plain reference to a grow-only array. One of
