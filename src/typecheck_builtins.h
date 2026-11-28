@@ -4405,6 +4405,8 @@ inline void TypeCheck::NoteShrinkOrder(const LinkShrink &shrink) {
                 o.required = -1;
                 if (known && shrink.popheader && shrink.popped > 0) {
                     auto paths = cur.links.suffixeffects.PathsFor(*this, shrink.popheader, SuffixOwner(root));
+                    if (cur.elementprefix)
+                        paths = SuffixEffects::Sequence(cur.elementprefix->PathsFor(*this, shrink.popheader, SuffixOwner(root)), paths);
                     o.required = SuffixEffects::Required(paths, shrink.popped);
                     if (o.required > 0) o.popheader = shrink.popheader;
                 }

@@ -1928,7 +1928,8 @@ inline void TypeCheck::CheckLoopBody(Block *body) {
 // leaves the loop in the join of the states it exits in, its breaks'
 // among them (JoinBreakFlow).
 inline TypeCheck::Scope TypeCheck::CheckLoopPasses(Node *x, FlowState &head,
-                                                   const function<void()> &pass) {
+                                                   const function<void()> &pass,
+                                                   const function<void(FlowState &)> &boundhead) {
     auto entry = head;
     auto firstbase = storeevents.size();
     auto warnbase = cur.pendingwarnings.size();
@@ -1959,6 +1960,7 @@ inline TypeCheck::Scope TypeCheck::CheckLoopPasses(Node *x, FlowState &head,
         auto lp = cur.looppasses.back();
         cur.looppasses.pop_back();
         auto next = sc.backedges ? JoinFlow(entry, sc.backedge, true) : entry;
+        if (sc.backedges && boundhead) boundhead(next);
         auto changed = lp.changed || !SameFlow(next, head);
         head = next;
         if (changed) continue;
@@ -1985,10 +1987,54 @@ inline void TypeCheck::CheckElementRuns(Node *at, int64_t mincount, int64_t maxc
         MergeFlow(head, SaveFlow());
         return;
     }
-    auto loop = CheckLoopPasses(at, head, element);
-    if (mincount > 0) {
-        if (loop.backedges) RestoreFlow(loop.backedge);
-        else reachable = false;
+    if (maxcount < 0) {
+        auto loop = CheckLoopPasses(at, head, element);
+        if (mincount > 0) {
+            if (loop.backedges) RestoreFlow(loop.backedge);
+            else reachable = false;
+        }
+        return;
+    }
+    const auto entry = head;
+    const auto depth = CurDepth();
+    std::optional<SuffixEffects> step;
+    auto applyruns = [&](FlowState &state, int64_t lo, int64_t hi) {
+        state.links.fresh = entry.links.fresh;
+        state.links.suffixeffects = entry.links.suffixeffects;
+        state.links.ApplySuffixes(*this, step->OverRuns(*this, lo, hi));
+    };
+    int64_t backedges = 0;
+    auto loop = CheckLoopPasses(at, head, [&] {
+        auto prefix = BodySuffixes();
+        auto before = std::move(cur.links.suffixeffects);
+        cur.links.suffixeffects = {};
+        {
+            Saved<const SuffixEffects *> recording(cur.elementprefix, &prefix);
+            element();
+        }
+        if (reachable) {
+            // A temporary made by this element expires before the next.
+            cur.links.suffixeffects.ForgetBindings([&](VarDef *v) { return Depth(v) > depth; });
+            if (!step) step = cur.links.suffixeffects;
+            else step->Combine(*this, cur.links.suffixeffects, [](const auto &a, const auto &b) {
+                return SuffixEffects::Join(a, b, false);
+            });
+        }
+        before.Combine(*this, cur.links.suffixeffects, SuffixEffects::Sequence);
+        cur.links.suffixeffects = std::move(before);
+    }, [&](FlowState &next) {
+        // The last element has no successor. Only earlier elements can
+        // contribute a new input state to another check of the hook.
+        if (++backedges >= maxcount) next = head;
+        applyruns(next, 0, maxcount - 1);
+    });
+    if (loop.backedges) {
+        auto exit = mincount ? loop.backedge : JoinFlow(entry, loop.backedge);
+        applyruns(exit, mincount, maxcount);
+        RestoreFlow(exit);
+    } else {
+        RestoreFlow(entry);
+        if (mincount) reachable = false;
     }
 }
 
@@ -2474,6 +2520,7 @@ inline TypeCheck::DeferEffects TypeCheck::CheckDeferredBody(Defer *d) {
     effects.statement = d;
     {
         Saved collecting(cur.deferring, &effects);
+        Saved<const SuffixEffects *> prefix(cur.elementprefix, nullptr);
         Saved<Rebuild *> active(cur.rebuild, nullptr); // Checked now, executed on scope exit.
         cur.links = {};
         cur.links.borrowedindices = saved.links.borrowedindices;
@@ -2544,6 +2591,7 @@ inline TypeCheck::LinkEffects TypeCheck::CurrentLinkEffects() {
     LinkEffects effects;
     for (auto &k : cur.kills) if (k.relative) effects.overwrites.push_back(k);
     effects.writes = cur.links;
+    if (cur.elementprefix) effects.writes.suffixeffects = BodySuffixes();
     return effects;
 }
 
@@ -2563,7 +2611,9 @@ inline void TypeCheck::ApplyLinkEffects(const LinkEffects &effects) {
         storeevents.back().indexed = part.indexed;
         cur.links.Add(storeevents.back(), storeevents.size() - 1, write);
     }
-    cur.links.ApplySuffixes(*this, effects.writes);
+    cur.links.ApplySuffixes(*this, effects.writes.suffixeffects);
+    for (auto &[header, value] : effects.writes.fresh)
+        cur.links.fresh[header] = { value.owner, std::max(cur.links.FreshCount(header, value.owner), value.count) };
     cur.links.borrowedindices.insert(effects.writes.borrowedindices.begin(), effects.writes.borrowedindices.end());
     for (auto &[v, fact] : effects.writes.prefixes.arrays) cur.links.prefixes.Establish(v, fact);
 }

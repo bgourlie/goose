@@ -3120,6 +3120,14 @@ struct SuffixEffects {
     int invaliddepth = -1; // Storage an expired inexact owner could reach (§9.2).
     bool operator==(const SuffixEffects &) const = default;
     bool Empty() const { return changes.empty() && invalidated.empty() && invaliddepth < 0; }
+    template<typename F> void ForgetBindings(F expired) {
+        erase_if(changes, [&](const auto &p) { return expired(p.first->base) || expired(p.second.owner); });
+        erase_if(invalidated, [&](const auto &p) {
+            if (!expired(p.first)) return false;
+            if (!p.second) invaliddepth = std::max(invaliddepth, RootDepth(p.first));
+            return true;
+        });
+    }
     static int64_t Add(int64_t a, int64_t b) {
         if (a == discarded || b == discarded || (b < 0 && a < INT64_MIN - b)) return discarded;
         return b > 0 && a > INT64_MAX - b ? INT64_MAX : a + b;
@@ -3146,6 +3154,47 @@ struct SuffixEffects {
         Paths result;
         for (auto p : first) for (auto q : next) result.push_back(p.Then(q));
         return Normalize(std::move(result));
+    }
+    // Compose a single element's effect over a known number of elements.
+    // Doubling composes the effect without visiting each slot.
+    SuffixEffects Repeated(int64_t count) const {
+        if (!count) return {};
+        auto result = *this;
+        for (auto &[header, change] : result.changes) {
+            auto power = change.paths;
+            // Different orderings of conditional effects can have a distinct
+            // floor/offset tradeoff for every slot. Keep the power bounded:
+            // adjacent normalized paths are ordered by increasing floor and
+            // decreasing offset, so the lower of each bounds both paths.
+            auto limit = std::max<size_t>(32, power.size());
+            auto compose = [&](const Paths &a, const Paths &b) {
+                auto combined = Sequence(a, b);
+                if (combined.size() <= limit) return combined;
+                auto width = 1 + (combined.size() - 1) / limit;
+                Paths bounds;
+                for (size_t i = 0; i < combined.size(); i += width) {
+                    auto last = std::min(i + width, combined.size()) - 1;
+                    bounds.push_back({ combined[i].floor, combined[last].delta });
+                }
+                return bounds;
+            };
+            Paths paths {{ 0, 0 }};
+            for (auto n = count; n; n /= 2) {
+                if (n % 2) paths = compose(paths, power);
+                if (n > 1) power = compose(power, power);
+            }
+            change.paths = std::move(paths);
+        }
+        return result;
+    }
+    template<typename TC> SuffixEffects OverRuns(TC &tc, int64_t lo, int64_t hi) const {
+        auto result = Repeated(lo);
+        // Each header's transfer is monotone. Starting at any given count,
+        // iterating it moves in one direction, so the endpoints suffice.
+        if (lo < hi) result.Combine(tc, Repeated(hi), [](const Paths &a, const Paths &b) {
+            return Join(a, b, false);
+        });
+        return result;
     }
     // Incoming slots needed to cover a pop on every path. A discarded
     // incoming suffix cannot discharge a larger pop than the local floor.

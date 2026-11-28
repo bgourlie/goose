@@ -329,17 +329,20 @@ struct TypeCheck {
             return it != fresh.end() && it->second.owner == owner ? it->second.count : 0;
         }
         SuffixEffects suffixeffects;
-        void ApplySuffixes(TypeCheck &tc, const LinkFlow &body) {
+        void ApplySuffixes(TypeCheck &tc, const SuffixEffects &effects) {
             for (auto it = fresh.begin(); it != fresh.end();) {
                 auto &value = it->second;
-                auto paths = body.suffixeffects.PathsFor(tc, it->first, value.owner);
+                auto paths = effects.PathsFor(tc, it->first, value.owner);
                 value.count = SuffixEffects::Guaranteed(paths, value.count);
                 if (value.count <= 0) it = fresh.erase(it);
                 else ++it;
             }
-            for (auto &[header, value] : body.fresh)
-                fresh[header] = { value.owner, std::max(FreshCount(header, value.owner), value.count) };
-            suffixeffects.Combine(tc, body.suffixeffects, SuffixEffects::Sequence);
+            for (auto &[header, change] : effects.changes) {
+                auto floor = SuffixEffects::Guaranteed(change.paths, 0);
+                if (floor > 0)
+                    fresh[header] = { change.owner, std::max(FreshCount(header, change.owner), floor) };
+            }
+            suffixeffects.Combine(tc, effects, SuffixEffects::Sequence);
         }
         using LengthKey = ArrayLengthKey;
         using Measurement = ArrayLengthBound;
@@ -453,12 +456,7 @@ struct TypeCheck {
         // Once a binding expires, its outstanding writes still belong to
         // the enclosing field. A fresh iteration can bind a different slot.
         template<typename F> void ForgetBindings(F expired) {
-            erase_if(suffixeffects.changes, [&](const auto &p) { return expired(p.first->base) || expired(p.second.owner); });
-            erase_if(suffixeffects.invalidated, [&](const auto &p) {
-                if (!expired(p.first)) return false;
-                if (!p.second) suffixeffects.invaliddepth = std::max(suffixeffects.invaliddepth, Depth(p.first));
-                return true;
-            });
+            suffixeffects.ForgetBindings(expired);
             erase_if(fresh, [&](const auto &p) { return expired(p.first->base) || expired(p.second.owner); });
             erase_if(lengths, [&](const auto &p) {
                 return expired(p.first.binding) || expired(p.first.header->base) || p.second.owners.Any([&](auto &a) { return expired(a.root); });
@@ -2742,7 +2740,8 @@ struct TypeCheck {
     Val CheckMatch(MatchExpr *m, TypeExpr *expected, bool wantvalue);
     Val CheckEarlyBlock(EarlyBlock *x, TypeExpr *expected, bool wantvalue);
     void CheckLoopBody(Block *body);
-    Scope CheckLoopPasses(Node *x, FlowState &head, const function<void()> &pass);
+    Scope CheckLoopPasses(Node *x, FlowState &head, const function<void()> &pass,
+                          const function<void(FlowState &)> &boundhead = {});
     void CheckElementRuns(Node *at, int64_t mincount, int64_t maxcount, const function<void()> &element);
     Val CheckLoop(LoopExpr *x, TypeExpr *expected, bool wantvalue);
     void CheckWhile(While *x);
@@ -3214,11 +3213,17 @@ struct TypeCheck {
     const LinkField *CanonicalSuffixHeader(const LinkField *header);
     void ClassifySuffixArgs(vector<RootArg> &roots, const MatchInfo &mi, const vector<Val> &args);
     bool TracksSuffix(VarDef *owner, bool exact) {
-        if (cur.deferring) return true;
+        if (cur.deferring || cur.elementprefix) return true;
         auto spec = CurRealFrame().spec;
         if (!spec || spec->isfunval || spec->sf->isrec || spec->incycle) return false;
         if (!exact || !owner) return true;
         return owner->ownerspec != spec && (owner->type ? HasRelRefT(LoadType(owner->type)) : owner->mayholdrel);
+    }
+    SuffixEffects BodySuffixes() {
+        if (!cur.elementprefix) return cur.links.suffixeffects;
+        auto result = *cur.elementprefix;
+        result.Combine(*this, cur.links.suffixeffects, SuffixEffects::Sequence);
+        return result;
     }
     const LinkField *CallerSuffixHeader(FnSpec *spec, const vector<Val> &args, const LinkField *header,
                                        VarDef *owner, const Roots &mapped);
@@ -3553,6 +3558,9 @@ struct TypeCheck {
     // from the summary. A function value's body is checked in its call's
     // statement and keeps it (CheckFunValCall).
     struct BodyState {
+        // While measuring one implicit element, suffixeffects starts at that
+        // element. Shrink obligations and function exits need the body's prefix.
+        const SuffixEffects *elementprefix = nullptr;
         // Operand types needed to choose an evaluation order. The chosen
         // call or initializer checks the storage effects in that order.
         // A newly specialized callee still checks and records its own body.

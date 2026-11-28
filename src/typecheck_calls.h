@@ -2133,7 +2133,7 @@ inline void TypeCheck::NoteExit(int tf, Node *at, vector<RetRoot> results,
         auto spec = frames[current].spec;
         FnRecord::ExitLinks exit { CallerKills(spec, true), cur.links.ClassStores(), cur.links.prefixes };
         if (spec && !spec->incycle && !spec->sf->isrec) {
-            exit.suffixes = cur.links.suffixeffects;
+            exit.suffixes = BodySuffixes();
             erase_if(exit.suffixes.changes, [&](const auto &p) {
                 auto base = p.first->base;
                 return (base->ownerspec == spec && !base->isparam) || p.second.owner->ownerspec == spec;
