@@ -3288,12 +3288,16 @@ struct RetainedSlots {
 struct RetainedLength {
     const LinkField *header = nullptr;
     SuffixEffects::Paths length, headroom;
+    // Incoming headroom sufficient for a resize to leave every old slot live.
+    // Each caller discharges the requirement or translates it to its own entry.
+    int64_t requiredheadroom = -1;
     bool operator==(const RetainedLength &) const = default;
 
-    static RetainedLength After(const LinkField *header, int64_t resized, int64_t popped) {
+    static RetainedLength After(const LinkField *header, std::optional<IntegerBounds> resize, int64_t popped) {
         if (!header) return {};
-        if (resized >= 0)
-            return { header, {{ resized, SuffixEffects::discarded }}, {{ INT64_MAX - resized, SuffixEffects::discarded }} };
+        if (resize)
+            return { header, {{ resize->lo, SuffixEffects::discarded }},
+                     {{ INT64_MAX - resize->hi, SuffixEffects::discarded }}, INT64_MAX - resize->lo };
         if (popped > 0) return { header, {{ 0, -popped }}, {{ popped, popped }} };
         return {};
     }
@@ -3302,6 +3306,8 @@ struct RetainedLength {
         if (!header) return;
         length = SuffixEffects::Join(std::move(length), other.length, false);
         headroom = SuffixEffects::Join(std::move(headroom), other.headroom, false);
+        requiredheadroom = requiredheadroom < 0 || other.requiredheadroom < 0
+                           ? -1 : std::max(requiredheadroom, other.requiredheadroom);
     }
     RetainedSlots Bounds() const {
         if (!header) return {};

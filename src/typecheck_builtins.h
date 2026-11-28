@@ -750,10 +750,13 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
     auto &[removal, countcondition, added] = slots;
     CountProof savedlength;
     if (d.flags & BF_SHRINKS) removal = d.kind == B_CLEAR ? SlotRemoval::All : SlotRemoval::Possible;
-    int64_t resized = -1;
+    std::optional<IntegerBounds> resizebounds;
+    ArrayLengthKey resizedkey {};
+    bool resizegrows = false;
     if (d.kind == B_RESIZE) {
         auto length = CheckIntAny(args[1]);
-        resized = KnownIndex(args[1], length);
+        resizebounds = KnownIntegerBounds(args[1], length);
+        if (resizebounds && (resizebounds->lo < 0 || resizebounds->hi < 0)) resizebounds.reset();
         auto [key, bound] = SavedLengthBound(args[1], rv, recvarr);
         CountProof fillpreserves = true;
         if (args.size() == 3) {
@@ -770,10 +773,10 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
         }
         savedlength = bound.Both(fillpreserves);
         slots = CountedSlots(d.kind, args, length, recvarr, rv, fillpreserves);
-        if (countedgrowth && args.size() == 3 && reachable && KnownIndex(args[1], length) != 0 &&
-            !(fillpreserves.Unconditional() && MeasuresReceiver(args[1], args[0], rv, recvarr, B_LEN))) grow();
-        // A successful resize installs the evaluated count even when a fill ran.
-        if (key.header && reachable) cur.links.lengths[key] = { LinkFlow::MeasuredOwners(rv) };
+        resizegrows = countedgrowth && args.size() == 3 && reachable &&
+                      !(resizebounds && resizebounds->hi == 0) &&
+                      !(fillpreserves.Unconditional() && MeasuresReceiver(args[1], args[0], rv, recvarr, B_LEN));
+        resizedkey = key;
     }
     // index_of recovers the element index a reference stands for (§3.3).
     // The reference must be an element of this very array, which is what
@@ -1008,7 +1011,7 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
     // it (§5.1); pop, pop_n and resize also need an element the shrink can
     // find, which a sequential array has not got.
     auto shrink = (d.flags & BF_SHRINKS) != 0;
-    auto header = ak == A_GROW && rv.Exact() && (added > 0 || popped > 0 || resized >= 0) && reachable && !cur.probingtypes
+    auto header = ak == A_GROW && rv.Exact() && (added > 0 || popped > 0 || resizebounds) && reachable && !cur.probingtypes
                       ? CanonicalSuffixHeader(ArrayHeader(rv, recvarr)) : nullptr;
     auto suffixowner = header ? SuffixOwner(rv.Root()) : nullptr;
     auto fresh = cur.links.FreshCount(header, suffixowner);
@@ -1023,10 +1026,12 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
     if (push && reachable) grow();
     if (countedgrowth && d.kind == B_APPEND) grow(!reachable || added == 0);
     if (ak == A_GROW && shrink) {
-        auto retained = RetainedLength::After(header, resized, popped);
+        auto retained = RetainedLength::After(header, resizebounds, popped);
         CheckGrowShrink(c, d, args[0], rv, preserves, empties, header, popped, retained);
+        // Judge the removal after the operands, before accounting for the resize's own growth.
+        if (resizegrows) grow();
         if (!beforelength.empty()) {
-            if (resized >= 0) {
+            if (resizebounds) {
                 cur.links.counts.length.changes[header] = { suffixowner, retained.length };
                 cur.links.counts.headroom.changes[header] = { suffixowner, retained.headroom };
             } else if (popped > 0) {
@@ -1041,8 +1046,10 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
             Error(c, cat(".", d.name, " needs fixed-size elements: ", TypeStr(rv.type),
                          " is sequential (§3.3)"));
     }
+    if (ak != A_GROW && resizegrows) grow();
+    if (resizedkey.header && reachable) cur.links.lengths[resizedkey] = { LinkFlow::MeasuredOwners(rv) };
     if (header && added > 0) {
-        if (!beforelength.empty() && resized < 0)
+        if (!beforelength.empty() && !resizebounds)
             cur.links.counts.length.Shift(header, suffixowner, beforelength, added);
         if (!beforeheadroom.empty() && (push || d.kind == B_APPEND))
             cur.links.counts.headroom.Shift(header, suffixowner, beforeheadroom, -added);
@@ -2712,14 +2719,19 @@ inline void TypeCheck::CheckLinkShrink(LinkShrink s) {
     auto &retained = s.effect.retained;
     if (retained.header) {
         auto owner = SuffixOwner(s.owner);
-        auto prepend = [&](auto member, SuffixEffects::Paths after) {
+        auto prefix = [&](auto member) {
             auto before = (cur.links.counts.*member).PathsFor(*this, retained.header, owner);
             if (cur.iterationprefix)
                 before = SuffixEffects::Sequence((cur.iterationprefix->*member).PathsFor(*this, retained.header, owner), before);
-            return SuffixEffects::Sequence(before, after);
+            return before;
         };
-        retained.length = prepend(&ArrayCountEffects::length, std::move(retained.length));
-        retained.headroom = prepend(&ArrayCountEffects::headroom, std::move(retained.headroom));
+        auto headroom = prefix(&ArrayCountEffects::headroom);
+        if (retained.requiredheadroom >= 0) {
+            retained.requiredheadroom = SuffixEffects::Required(headroom, retained.requiredheadroom);
+            if (!retained.requiredheadroom) s.effect.keepslinks = true;
+        }
+        retained.length = SuffixEffects::Sequence(prefix(&ArrayCountEffects::length), retained.length);
+        retained.headroom = SuffixEffects::Sequence(headroom, retained.headroom);
     }
     auto bounds = retained.Bounds();
     GlobalSlots slots;
