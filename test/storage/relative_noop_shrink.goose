@@ -103,6 +103,20 @@ fn restore_measurement(cells: Cells&) {
     cells.data.resize(size, 0);
 }
 
+fn add_nothing(cells: Cells&) {
+    cells.data.append([]);
+    cells.data.resize(cells.data.len, 0);
+}
+
+fn keep_after_empty_operations(cells: Cells&) {
+    const size = cells.data.len;
+    cells.data.append([]);
+    cells.data.resize(size);
+    cells.data.resize(cells.data.len, 0);
+    add_nothing(cells);
+    cells.data.resize(size);
+}
+
 fn keep_through_alias(nodes: Node[>..]&) {
     let other .= nodes;
     nodes.resize(other.len);
@@ -234,6 +248,7 @@ fn main() {
     assert(unlinked.len == 0);
     var cells = Cells { data: [1, 2] };
     cells.head .= cells.data[1];
+    keep_after_empty_operations(cells);
     restore_measurement(cells);
     var other_cells = Cells { data: [3, 4] };
     other_cells.head .= other_cells.data[1];

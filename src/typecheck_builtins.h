@@ -22,34 +22,34 @@ inline const LinkField *TypeCheck::ArrayHeader(const RefPlace &place, TypeExpr *
     return type && TopConstEq(type, array) ? ast.places.Bound(field.base, string(field.Path())) : nullptr;
 }
 
+inline bool TypeCheck::MeasuresReceiver(Node *expr, Node *receiver, const Val &value, TypeExpr *array, BuiltinKind member) {
+    auto d = Is<Dot>(expr);
+    return d && d->member == member && (SamePath(receiver, d->obj, PathInterval::ConsecutiveReads) ||
+                                       (d->measuredarray && d->measuredarray == ArrayHeader(value, array)));
+}
+
 // The count and, for resize, the fill have already been checked in evaluation order.
 inline TypeCheck::SlotRemoval TypeCheck::CountedRemoval(BuiltinKind op, const vector<Node *> &args,
                                                         const Val &count, TypeExpr *array, const Val &receiver,
                                                         CountProof &condition, CountProof fillpreserves, CountProof savedlength) {
     assert(op == B_POP_N || op == B_RESIZE);
-    auto matches = [&](Dot *d) {
-        return SamePath(args[0], d->obj, PathInterval::ConsecutiveReads) ||
-               (d->measuredarray && d->measuredarray == ArrayHeader(receiver, array));
-    };
     auto preserves = [&](CountProof proof) {
         condition = proof;
         return proof.Unconditional() ? SlotRemoval::None : SlotRemoval::PreservesIfUnchanged;
     };
     if (auto proof = savedlength.Both(fillpreserves); proof.Available()) return preserves(proof);
-    if (auto d = Is<Dot>(args[1]); d && matches(d)) {
-        if (d->member == B_CAP && op == B_RESIZE && IsArrayKind(array, A_LIMITED)) return SlotRemoval::ToCapacity;
-        if (d->member == B_LEN) {
-            if (op == B_POP_N) return SlotRemoval::All;
-            if (fillpreserves.Available()) return preserves(fillpreserves);
-        }
+    if (op == B_RESIZE && IsArrayKind(array, A_LIMITED) && MeasuresReceiver(args[1], args[0], receiver, array, B_CAP))
+        return SlotRemoval::ToCapacity;
+    if (MeasuresReceiver(args[1], args[0], receiver, array, B_LEN)) {
+        if (op == B_POP_N) return SlotRemoval::All;
+        if (fillpreserves.Available()) return preserves(fillpreserves);
     }
     // On successful resize, adding a nonnegative i64 to .len cannot shrink:
     // any signed overflow gives a negative count, rejected before the write.
     if (auto sum = Is<Binary>(args[1]); op == B_RESIZE && sum && sum->op == T_PLUS &&
         count.type->intstorage == IS_I64) {
         auto growth = [&](Node *prop, Node *offset) -> CountProof {
-            auto d = Is<Dot>(prop);
-            if (!d || d->member != B_LEN || !matches(d)) return false;
+            if (!MeasuresReceiver(prop, args[0], receiver, array, B_LEN)) return false;
             if (auto k = Is<IntLit>(offset)) return !k->uns && k->val >= 0;
             if (auto k = Is<Dot>(offset); k && (k->member == B_LEN || k->member == B_CAP))
                 return EvalMeets(k->obj, EvalRequirement::ReadOnly);
@@ -516,12 +516,13 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
                 measured = {};
         }
     }
-    // The receiver grows (§1.3(4)): logged ahead of the arguments, so that
-    // a value built in place among them is checked against the growths
-    // within it alone.
-    bool shrinkonly = d.kind == B_RESIZE && ak == A_GROW && args.size() == 2;
-    if (*d.grows && !(d.flags & BF_OUTARG) && !shrinkonly)
-        NoteGrow(c, rv, cat(d.grows, " ", ExprStr(args[0])), recvarr);
+    // For counted operations the operands determine whether the receiver
+    // can grow. Growth within an operand is logged by the operand itself.
+    auto grow = [&](bool stackonly = false) {
+        RecordGrowth(c, rv, cat(d.grows, " ", ExprStr(args[0])), SoleResizableIn(recvarr), stackonly);
+    };
+    bool countedgrowth = ak == A_GROW && (d.kind == B_APPEND || d.kind == B_RESIZE);
+    if (*d.grows && !(d.flags & BF_OUTARG) && !countedgrowth) grow();
     // The serialization pair (docs/design/serialization.md §4). to_bytes
     // builds the image -- a varint byte count then the element region --
     // either as a fresh u8[>..] or appended to a builder the caller owns, so
@@ -593,6 +594,7 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
                 fillpreserves = false;
             } else {
                 AliasingGrowsSince(beforefill, rv, recvarr, [&](const GrowEvent &e, const RootAlt &target, Alias alias) {
+                    if (e.stackonly) return;
                     if (alias == AL_YES) fillpreserves = false;
                     else fillpreserves = fillpreserves.Both(DistinctGrowth(e.root, e.exact && target.exact, target.root));
                 });
@@ -612,6 +614,8 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
                 savedlength = savedlength.Both(CountProof::IfUnchanged(ast.countconditions, sizebinding));
         }
         removal = CountedRemoval(d.kind, args, length, recvarr, rv, countcondition, fillpreserves, savedlength);
+        if (countedgrowth && args.size() == 3 && reachable && KnownIndex(args[1], length) != 0 &&
+            !(fillpreserves.Unconditional() && MeasuresReceiver(args[1], args[0], rv, recvarr, B_LEN))) grow();
         // A successful resize installs the evaluated count even when a fill ran.
         if (measured.header && reachable) cur.links.lengths[sizebinding] = { measured.header, measured.owner };
     }
@@ -811,6 +815,9 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
             default: assert(false);
         }
     }
+    // An appended result can occupy the receiving stack while under
+    // construction even when its final live element count is zero.
+    if (countedgrowth && d.kind == B_APPEND) grow(!reachable || added == 0);
     // Record a write even if its count preserves every limited-array slot.
     if (d.flags & BF_WRITE) {
         auto preserves = removal == SlotRemoval::None || removal == SlotRemoval::ToCapacity;
@@ -5490,22 +5497,22 @@ inline void TypeCheck::InvalidateLengths(VarDef *owner, bool exact, TypeExpr *ar
     }
 }
 
-inline void TypeCheck::RecordGrowth(Node *at, const Roots &roots, const string &what, TypeExpr *arr) {
+inline void TypeCheck::RecordGrowth(Node *at, const Roots &roots, const string &what, TypeExpr *arr, bool stackonly) {
     if (cur.probingtypes) return;
-    bool changeslength = !arr || IsArrayKind(arr, A_GROW);
+    bool changeslength = !stackonly && (!arr || IsArrayKind(arr, A_GROW));
     if (changeslength && roots.unknown) InvalidateLengths(nullptr, false, arr);
     for (auto &a : roots.alts) {
         auto root = a.root;
         if (changeslength && (root || !a.exact)) InvalidateLengths(root, a.exact, arr);
         if (!root || IsTemp(root)) continue;
-        cur.growlog.push_back({ at, root, a.exact, what, false, arr });
+        cur.growlog.push_back({ at, root, a.exact, what, false, arr, stackonly });
         auto note = [&](vector<FnRecord::Growth> &growths) {
             for (auto &g : growths)
-                if (!g.array == !arr && (!arr || TypeEq(g.array, arr))) {
+                if (g.stackonly == stackonly && !g.array == !arr && (!arr || TypeEq(g.array, arr))) {
                     g.exact &= a.exact;
                     return;
                 }
-            growths.push_back({ arr, a.exact });
+            growths.push_back({ arr, a.exact, stackonly });
         };
         NoteRootEvent(root, [&](FnSpec *s, int i) { note(s->record.growparams[i]); },
                       [&](FnSpec *s, VarDef *r) { note(s->record.growexternals[r]); });
@@ -5572,7 +5579,7 @@ inline void TypeCheck::ApplyCalleeGrows(Node *at, FnSpec *spec, vector<Val> &arg
         auto root = roots.Root();
         if (!root || IsTemp(root)) return;
         if (!growth.exact) roots.Weaken();
-        RecordGrowth(at, roots, cat("call ", name, ", which ", how, " ", root->name), growth.array);
+        RecordGrowth(at, roots, cat("call ", name, ", which ", how, " ", root->name), growth.array, growth.stackonly);
     };
     if (spec->sf->isextern) {
         for (size_t i = 0; i < spec->argtypes.size(); i++) {
@@ -5592,7 +5599,7 @@ inline void TypeCheck::ApplyCalleeGrows(Node *at, FnSpec *spec, vector<Val> &arg
         for (auto growth : arrs) {
             auto roots = MapClass(spec, vd, argvals);
             if (!growth.exact) roots.Weaken();
-            RecordGrowth(at, roots, cat("call ", name, ", which grows ", vd->name), growth.array);
+            RecordGrowth(at, roots, cat("call ", name, ", which grows ", vd->name), growth.array, growth.stackonly);
         }
 }
 

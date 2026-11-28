@@ -3171,6 +3171,7 @@ struct TypeCheck {
     const LinkField *ArrayHeader(const Val &value, TypeExpr *array) {
         return value.lvalue || IsPlainRef(value.type) ? ArrayHeader(value.refplace, array) : nullptr;
     }
+    bool MeasuresReceiver(Node *expr, Node *receiver, const Val &value, TypeExpr *array, BuiltinKind member);
     SlotRemoval CountedRemoval(BuiltinKind op, const vector<Node *> &args, const Val &count,
                                TypeExpr *array, const Val &receiver, CountProof &condition,
                                CountProof fillpreserves = true, CountProof savedlength = false);
@@ -3566,6 +3567,7 @@ struct TypeCheck {
         // The type of the resizable array grown or shrunk (SoleResizableIn),
         // null where the checker cannot tell.
         TypeExpr *arr = nullptr;
+        bool stackonly = false;
     };
 
     // A whole resizable assignment remains open while its RHS is checked.
@@ -3698,7 +3700,7 @@ struct TypeCheck {
         }
     };
     // Each takes the type of the storage grown, shrunk or built in.
-    void RecordGrowth(Node *at, const Roots &roots, const string &what, TypeExpr *array);
+    void RecordGrowth(Node *at, const Roots &roots, const string &what, TypeExpr *array, bool stackonly = false);
     void InvalidateLengths(VarDef *owner, bool exact, TypeExpr *array, const LinkFlow *exit = nullptr);
     CountProof DistinctGrowth(VarDef *writer, bool exact, VarDef *measured);
     void NoteGrow(Node *at, const Roots &roots, const string &what, TypeExpr *t);

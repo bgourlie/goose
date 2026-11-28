@@ -3146,6 +3146,7 @@ struct FnRecord {
     struct Growth {
         TypeExpr *array;
         bool exact; // False if this owner only bounds the storage that grew.
+        bool stackonly = false; // Construction can occupy the top without publishing any elements.
     };
     map<VarDef *, vector<Growth>> growexternals;
     map<int, vector<Growth>> growparams;

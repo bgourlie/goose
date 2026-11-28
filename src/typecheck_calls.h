@@ -3211,7 +3211,8 @@ inline bool TypeCheck::SameRecord(const FnRecord &a, const FnRecord &b, const Fn
         for (auto i = x.begin(), j = y.begin(); i != x.end(); ++i, ++j) {
             if (i->first != j->first || i->second.size() != j->second.size()) return false;
             for (size_t k = 0; k < i->second.size(); k++)
-                if (i->second[k].exact != j->second[k].exact || !sametype(i->second[k].array, j->second[k].array))
+                if (i->second[k].exact != j->second[k].exact || i->second[k].stackonly != j->second[k].stackonly ||
+                    !sametype(i->second[k].array, j->second[k].array))
                     return false;
         }
         return true;
