@@ -347,6 +347,25 @@ how far checking got. For example, `cycle_local_store.goose` warns about its
 recursive call's `&local` before the error that the call reveals, at the
 store on the line above.
 
+### Known fixture failures
+
+Keep the intended result in the usual place (`// error:` for a rejection,
+`test/expected/<name>.out` for program output). A temporary first-line marker
+records the current compiler behavior.
+
+| First line | Outcome counted as an expected failure |
+| --- | --- |
+| `// xfail: accepts-invalid` | An `errors_tc/` fixture parses and typechecks successfully. |
+| `// xfail: typecheck <diagnostic>` | A positive fixture roundtrips, then the typechecker emits one error starting with this text. |
+| `// xfail: codegen <diagnostic>` | A positive fixture typechecks, then emitting C reports the specified codegen diagnostic at both -O0 and -O2. |
+| `// xfail: stdout-O2 <line>` | The program exits successfully and prints this single line at -O2. Its other tested levels use the ordinary expected output. |
+
+Use a diagnostic prefix long enough to identify the bug. Compile-time probes stop
+at the affected phase. A different failure still fails the suite. When the phase
+succeeds as intended, the runner reports `XPASS` and fails the build. Remove the
+marker with the compiler fix to run the fixture normally. Each section counts
+expected failures (`XFAIL`) separately. Use `-v` to list them individually.
+
 ## Additional compiler checks
 
 The runner checks more than exit status and runtime output:

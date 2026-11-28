@@ -114,6 +114,15 @@ def first_line(path):
         return f.readline()
 
 
+def xfail_marker(path):
+    """A first-line marker records the one known incorrect outcome."""
+    line = first_line(path).rstrip()
+    if line.startswith("// xfail:"):
+        stage, _, detail = line[len("// xfail:"):].strip().partition(" ")
+        return stage, detail
+    return None
+
+
 def debug_fixture(f, line):
     """Whether a fixture also runs with GS_DEBUG: codegen_exec.goose and
     those whose first line asks for it."""
@@ -265,7 +274,7 @@ class Section:
 
     def __init__(self, title, verbose, github):
         self.title, self.verbose, self.github = title, verbose, github
-        self.oks, self.fails, self.failures = 0, [], 0
+        self.oks, self.xfails, self.fails, self.failures = 0, 0, [], 0
         # "title": the title is on a line not yet ended; "group": a GitHub
         # group is open; None: at the start of a line, outside a group.
         if github:
@@ -280,7 +289,10 @@ class Section:
         self.failures += out.failures
         for line in "".join(out.text).splitlines():
             if line.startswith("ok   "):
-                self.oks += 1
+                if line.startswith("ok   XFAIL "):
+                    self.xfails += 1
+                else:
+                    self.oks += 1
                 if self.github:
                     if self.state != "group":
                         sys.stdout.write(f"::group::{self.title} (continued)\n")
@@ -298,7 +310,9 @@ class Section:
     def close(self):
         # A failure that printed no FAIL line still counts.
         fails = max(len(self.fails), self.failures)
-        counts = f"{self.oks} ok" + (f", {fails} FAIL" if fails else "")
+        counts = f"{self.oks} ok" + (f", {self.xfails} XFAIL" if self.xfails else "")
+        if fails:
+            counts += f", {fails} FAIL"
         if self.state == "title":
             sys.stdout.write(f": {counts}\n")
         else:
@@ -349,6 +363,7 @@ class Runner:
         # number of files and jobs.
         self.batch = 0
         self.fronts = {}
+        self.xfail_outputs = {}
         # Slots shown before any section print as they are.
         self.sections = [(None, [])]
         self.gpulock = None
@@ -600,16 +615,72 @@ class Runner:
                 return False
         return True
 
-    def check_stdout(self, name, label, out):
+    def check_stdout(self, name, label, out, known=None):
         expfile = HERE / "expected" / f"{name}.out"
         if not expfile.exists():
             self.fail(f"missing expected-output {label}")
             return False
         want = joined(tc.decode(expfile.read_bytes()))
+        if known is not None:
+            if out == want:
+                self.fail(f"XPASS {label}: remove the xfail marker")
+                return False
+            if out == known:
+                self.ok(f"XFAIL {label}")
+                return True
         if out != want:
             self.fail(f"expected-output {label}", f"--- got:\n{out}\n--- want:\n{want}")
             return False
         return True
+
+    def check_outputs(self, f, label, runs):
+        marker = self.xfail_outputs.get(f)
+        if marker is not None:
+            for level, out in runs.items():
+                if not self.check_stdout(f.stem, f"{label} -O{level} {f.name}", out,
+                                         known=marker if level == "2" else None):
+                    return False
+            return True
+        if len(set(runs.values())) != 1:
+            self.fail(f"{label}-output-differs-by-O {f.name}")
+            return False
+        return self.check_stdout(f.stem, f"{label} {f.name}", runs["2"])
+
+    def known_compile_failure(self, f, stage, detail):
+        """Check the failing compiler phase without scheduling dependent builds or runs."""
+        for level in (("0", "2") if stage == "codegen" else (None,)):
+            args = ["--check"] if level is None else [
+                f"-O{level}", "-o", self.gendir / f"{f.stem}-xfail-O{level}.c"]
+            code, out, err = self.goose("--roundtrip", *args, f)
+            log = out + err
+            label = f"{stage} {f.name}" if level is None else f"{stage} -O{level} {f.name}"
+            diagnostic = "error" if stage == "typecheck" else "codegen"
+            headers = re.findall(r"^(\S.*?):\d+(?::\d+)?: (error|codegen): (.+)$", err, re.M)
+            if code == 0:
+                self.fail(f"XPASS {label}: remove the xfail marker")
+            elif (code != 1 or not re.search(r"^roundtrip ok:", log, re.M) or
+                  (stage == "codegen" and not re.search(r"^typechecked ok:", log, re.M)) or
+                  len(headers) != 1 or Path(headers[0][0]) != f or
+                  headers[0][1] != diagnostic or not headers[0][2].startswith(detail)):
+                self.fail(f"unexpected failure {label}", log)
+            elif self.check_warnings(f, out, err):
+                self.ok(f"XFAIL {label}")
+
+    def typecheck_error(self, f, result):
+        code, out, err = self.screened(f, result)
+        marker = xfail_marker(f)
+        if not re.search(r"^parsed ok:", out + err, re.M):
+            self.fail(f"tc-error-parses {f.name}", out + err)
+        elif marker is not None and (marker != ("accepts-invalid", "") or not error_markers(f)):
+            self.fail(f"invalid xfail marker or missing // error: in {f.name}")
+        elif marker and code == 0 and re.search(r"^typechecked ok:", out + err, re.M):
+            if self.check_warnings(f, out, err):
+                self.ok(f"XFAIL typecheck {f.name}")
+        elif self.check_error(f, "expected-tc-error", code, out, err):
+            if marker:
+                self.fail(f"XPASS typecheck {f.name}: remove the xfail marker")
+            else:
+                self.ok(f"tc-error {f.name}")
 
     def check_error(self, path, label, code, out, err):
         # CompileError exits with 1. Signals, access violations and assertion
@@ -884,11 +955,8 @@ class Runner:
                         bad = True
                         continue
                     runs[ol] = out
-                if not bad:
-                    if len(set(runs.values())) != 1:
-                        self.fail(f"cgen-output-differs-by-O {f.name}")
-                    elif self.check_stdout(name, f.name, runs["2"]):
-                        self.ok(f"cgen+run {f.name}")
+                if not bad and self.check_outputs(f, "cgen", runs):
+                    self.ok(f"cgen+run {f.name}")
 
         if not self.jit:
             return
@@ -920,9 +988,7 @@ class Runner:
                 runs[ol] = out
             if bad:
                 return
-            if len(set(runs.values())) != 1:
-                self.fail(f"jit-output-differs-by-O {f.name}")
-            elif self.check_stdout(name, f"jit {f.name}", runs["2"]):
+            if self.check_outputs(f, "jit", runs):
                 self.ok(f"jit {f.name}")
 
     def dump_program(self, f, res, argv):
@@ -1533,6 +1599,20 @@ def main():
     # is a rejection test, kept beside what it rejects (for gfx, shaders).
     native_errors = [f for f in tests if f.parent.name in native and error_markers(f)]
     tests = [f for f in tests if f not in native_errors]
+
+    compile_failures = {}
+    for f in tests:
+        marker = xfail_marker(f)
+        if marker is None:
+            continue
+        stage, detail = marker
+        if stage in ("typecheck", "codegen") and detail:
+            compile_failures[f] = marker
+        elif stage == "stdout-O2" and detail:
+            r.xfail_outputs[f] = detail
+        else:
+            ap.error(f"invalid xfail marker in {f}")
+    tests = [f for f in tests if f not in compile_failures]
 
     # The generated programs below take long to check; they start before the
     # fixtures. Their files are written here, before any job reads them.
@@ -3027,15 +3107,13 @@ def main():
     tc_errors = sorted((HERE / "errors_tc").glob("*.goose")) + native_errors
     tc_runs = r.goose_each(["--check"], tc_errors)
 
-    def tc_error(f):
-        code, out, err = r.screened(f, tc_runs[f]())
-        if not re.search(r"^parsed ok:", out + err, re.M):
-            r.fail(f"tc-error-parses {f.name}", out + err)
-        elif r.check_error(f, "expected-tc-error", code, out, err):
-            r.ok(f"tc-error {f.name}")
     r.section("typecheck errors (errors_tc/ and native modules' rejection tests)")
     for f in tc_errors:
-        r.show_later(tc_error, f)
+        r.show_later(lambda f=f: r.typecheck_error(f, tc_runs[f]()))
+
+    r.section("known compiler failures in positive fixtures")
+    for f, (stage, detail) in compile_failures.items():
+        r.show_task(r.known_compile_failure, f, stage, detail)
 
     # Recovery fixtures: several errors each, which the parser and the
     # checker go on past (docs/design/language_server.md §5 D), reported in
